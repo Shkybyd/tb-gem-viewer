@@ -9,6 +9,9 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <PublishSingleFile Condition="'$(Configuration)' != 'Debug'">true</PublishSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- ImGui.NET has no strong name, while this app is signed to see the internals of the renderer.
+         The runtime does not check strong names, so referencing it is fine. -->
+    <NoWarn>$(NoWarn);CS8002</NoWarn>
     <ApplicationIcon>..\Misc\Icons\source2viewer.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
