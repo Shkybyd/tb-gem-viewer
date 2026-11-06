@@ -1,0 +1,94 @@
+using ValveResourceFormat.Utils;
+
+namespace ValveResourceFormat.Serialization.VfxEval
+{
+    /// <summary>
+    /// Implementations for built in VFXEval functions
+    /// </summary>
+    public static class VfxEvalFunctions
+    {
+        // Normalized to unit length for axis-angle rotation
+        private static readonly Vector3 LuminanceCoefficientsNormalised = Vector3.Normalize(MathUtils.LuminanceWeights);
+
+        // Rotation taking the luminance axis onto the Z axis
+        private static readonly Matrix4x4 LuminanceRotation = CreateLuminanceRotation();
+
+        private static Matrix4x4 CreateLuminanceRotation()
+        {
+            var cross = Vector3.Cross(LuminanceCoefficientsNormalised, Vector3.UnitZ);
+            var angle = MathF.Atan2(cross.Length(), Vector3.Dot(LuminanceCoefficientsNormalised, Vector3.UnitZ));
+            return Matrix4x4.CreateFromAxisAngle(Vector3.Normalize(cross), angle);
+        }
+
+        private static float RgbSaturation(Vector3 rgb)
+        {
+            var max = rgb.MaxComponent();
+            var min = rgb.MinComponent();
+            return max == 0f ? 0f : (max - min) / max;
+        }
+
+        /// <summary>
+        /// Builds a 4x4 color correction matrix that applies contrast, saturation, and brightness adjustments.
+        /// </summary>
+        /// <param name="CSB">Color correction parameters: X = contrast, Y = saturation, Z = brightness.</param>
+        /// <param name="colorOffset">Pivot point for the contrast adjustment.</param>
+        public static Matrix4x4 MatrixColorCorrect2(Vector3 CSB, Vector3 colorOffset)
+        {
+            var rotation = LuminanceRotation;
+
+            // T(-offset) * Scale(contrast) * T(offset) * Scale(brightness) * Scale(lum) * R * Scale(sat,sat,1) * R^-1 * Scale(1/lum)
+            var result = Matrix4x4.CreateTranslation(-colorOffset) * Matrix4x4.CreateScale(CSB.X) * Matrix4x4.CreateTranslation(colorOffset);
+            result *= Matrix4x4.CreateScale(CSB.Z);
+            result *= Matrix4x4.CreateScale(LuminanceCoefficientsNormalised);
+            result *= rotation;
+            result *= Matrix4x4.CreateScale(CSB.Y, CSB.Y, 1f);
+            result *= Matrix4x4.Transpose(rotation);
+            result *= Matrix4x4.CreateScale(Vector3.One / LuminanceCoefficientsNormalised);
+
+            return Matrix4x4.Transpose(result);
+        }
+
+        /// <summary>
+        /// Builds a luminance-preserving saturation adjustment matrix in RGB space.
+        /// </summary>
+        /// <param name="rgb">Reference color used to derive hue and saturation.</param>
+        /// <param name="strength">Saturation adjustment strength.</param>
+        public static Matrix4x4 MatrixColorTint2(Vector3 rgb, float strength)
+        {
+            var saturation = RgbSaturation(rgb);
+
+            var rotation = LuminanceRotation;
+            var lumScale = Matrix4x4.CreateScale(LuminanceCoefficientsNormalised);
+            var gray = Vector3.Transform(rgb, lumScale * rotation);
+
+            var desatXY = 1f - saturation;
+            var satFactor = 1f - saturation * saturation * strength;
+
+            // Scale(lum) * R * T(-gray) * Scale(desatXY,desatXY,satFactor) * T(gray') * R^-1 * Scale(1/lum)
+            var result = lumScale * rotation;
+            result *= Matrix4x4.CreateTranslation(-gray.X, -gray.Y, 0f);
+            result *= Matrix4x4.CreateScale(desatXY, desatXY, satFactor);
+            result *= Matrix4x4.CreateTranslation(gray.X, gray.Y, (1f - satFactor) * gray.Z);
+            result *= Matrix4x4.Transpose(rotation);
+            result *= Matrix4x4.CreateScale(Vector3.One / LuminanceCoefficientsNormalised);
+
+            return Matrix4x4.Transpose(result);
+        }
+
+        /// <summary>
+        /// Builds a color tint matrix using one of the tint modes exposed by newer shaders.
+        /// </summary>
+        /// <param name="rgb">Tint color, in linear space.</param>
+        /// <param name="strength">Saturation adjustment strength, used by the luminance preserving mode.</param>
+        /// <param name="mode">0 = multiply, 1 = preserve luminance, 2 = mod2x.</param>
+        public static Matrix4x4 MatrixColorTint3(Vector3 rgb, float strength, int mode)
+        {
+            return mode switch
+            {
+                1 => MatrixColorTint2(rgb, strength),
+                2 => Matrix4x4.CreateScale(rgb * 2f),
+                _ => Matrix4x4.CreateScale(rgb),
+            };
+        }
+    }
+}

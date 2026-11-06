@@ -1,0 +1,706 @@
+using Datamodel.Format;
+using DMElement = Datamodel.Element;
+
+namespace ValveResourceFormat.IO.ContentFormats.DmxModel;
+
+/// <summary>
+/// Root element of a model content file, holding the scene graph and the bind pose.
+/// </summary>
+[CamelCaseProperties]
+public class DmeModel : DMElement
+{
+    /// <summary>
+    /// Transform of the model root.
+    /// </summary>
+    public DmeTransform Transform { get; init; } = [];
+
+    /// <summary>
+    /// Shape attached to the model root, usually null.
+    /// </summary>
+    public DMElement? Shape { get; init; }
+
+    /// <summary>
+    /// Whether the model is visible.
+    /// </summary>
+    public bool Visible { get; set; } = true;
+
+    /// <summary>
+    /// List of <see cref="DmeDag"/> elements forming the scene graph.
+    /// </summary>
+    public Datamodel.ElementArray Children { get; } = [];
+
+    /// <summary>
+    /// List of <see cref="DmeDag"/> elements, one per bone, in skinning order.
+    /// </summary>
+    public Datamodel.ElementArray JointList { get; init; } = [];
+
+    /// <summary>
+    /// List of <see cref="DmeTransformsList"/> elements.
+    /// </summary>
+    public Datamodel.ElementArray BaseStates { get; init; } = [];
+
+    /// <summary>
+    /// Axis convention the model was authored in.
+    /// </summary>
+    public DmeAxisSystem AxisSystem { get; init; } = [];
+}
+
+/// <summary>
+/// Represents an abstract shape
+/// </summary>
+[CamelCaseProperties]
+public class DmeShape : DMElement
+{
+    /// <summary>
+    /// Gets or sets a value indicating whether this shape is visible.
+    /// </summary>
+    public bool Visible { get; set; } = true;
+}
+
+/// <summary>
+/// Represents a transformation element with position and orientation.
+/// </summary>
+[CamelCaseProperties]
+public class DmeTransform : DMElement
+{
+    /// <summary>
+    /// Gets or sets the position in 3D space.
+    /// </summary>
+    public Vector3 Position { get; set; } = Vector3.Zero;
+
+    /// <summary>
+    /// Gets or sets the orientation as a quaternion.
+    /// </summary>
+    public Quaternion Orientation { get; set; } = Quaternion.Identity;
+}
+
+/// <summary>
+/// Represents the axis system configuration for the model.
+/// </summary>
+[CamelCaseProperties]
+public class DmeAxisSystem : DMElement
+{
+    /// <summary>
+    /// Gets or sets the up axis.
+    /// </summary>
+    public int UpAxis { get; set; } = 3;
+
+    /// <summary>
+    /// Gets or sets the forward parity.
+    /// </summary>
+    public int ForwardParity { get; set; } = 1;
+
+    /// <summary>
+    /// Gets or sets the coordinate system.
+    /// </summary>
+    public int CoordSys { get; set; }
+}
+
+/// <summary>
+/// Represents a list of transform elements.
+/// </summary>
+[CamelCaseProperties]
+public class DmeTransformsList : DMElement
+{
+    /// <summary>
+    /// List of <see cref="DmeTransform"/> elements.
+    /// </summary>
+    public Datamodel.ElementArray Transforms { get; } = [];
+}
+
+/// <summary>
+/// Represents a directed acyclic graph node for model hierarchy.
+/// </summary>
+[CamelCaseProperties]
+public class DmeDag : DMElement
+{
+    /// <summary>
+    /// Gets the transform of this DAG node.
+    /// </summary>
+    public DmeTransform Transform { get; } = [];
+
+    /// <summary>
+    /// Gets or sets the mesh shape of this DAG node. Null for joints, which carry no geometry;
+    /// emitting an empty shape makes Blender Source Tools reject the DMX on import.
+    /// </summary>
+    public DmeShape? Shape { get; init; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether this node is visible.
+    /// </summary>
+    public bool Visible { get; set; } = true;
+
+    /// <summary>
+    /// Gets the child DAG nodes.
+    /// </summary>
+    public Datamodel.ElementArray Children { get; } = [];
+}
+
+/// <summary>
+/// Represents a skeletal joint in the model hierarchy.
+/// </summary>
+[CamelCaseProperties] public class DmeJoint : DmeDag;
+
+/// <summary>
+/// Represents a mesh with vertex data and face sets.
+/// </summary>
+[CamelCaseProperties]
+public class DmeMesh : DmeShape
+{
+    /// <summary>
+    /// Gets or sets the bind state of the mesh.
+    /// </summary>
+    public DMElement? BindState { get; init; }
+
+    /// <summary>
+    /// Gets or sets the current state of the mesh.
+    /// </summary>
+    public DMElement? CurrentState { get; init; }
+
+    /// <summary>
+    /// Gets the base states of the mesh.
+    /// </summary>
+    public Datamodel.ElementArray BaseStates { get; } = [];
+
+    /// <summary>
+    /// Gets the delta states for morph targets.
+    /// </summary>
+    public Datamodel.ElementArray DeltaStates { get; } = [];
+
+    /// <summary>
+    /// Gets the face sets that define material groups.
+    /// </summary>
+    public Datamodel.ElementArray FaceSets { get; } = [];
+
+    /// <summary>
+    /// Gets the delta state weights for morph targets.
+    /// </summary>
+    public Datamodel.Vector2Array DeltaStateWeights { get; } = [];
+
+    /// <summary>
+    /// Gets the lagged delta state weights for morph targets.
+    /// </summary>
+    public Datamodel.Vector2Array DeltaStateWeightsLagged { get; } = [];
+}
+
+/// <summary>
+/// Represents a face set with associated material.
+/// </summary>
+[CamelCaseProperties]
+public class DmeFaceSet : DMElement
+{
+    /// <summary>
+    /// Gets the array of face indices.
+    /// </summary>
+    public Datamodel.IntArray Faces { get; } = [];
+
+    /// <summary>
+    /// Gets the material definition associated with this face set.
+    /// </summary>
+    public DmeMaterial Material { get; } = new() { Name = "material" };
+
+    /// <summary>
+    /// Represents a material reference.
+    /// </summary>
+    public class DmeMaterial : DMElement
+    {
+        /// <summary>
+        /// Gets or sets the material name.
+        /// </summary>
+        [DMProperty(name: "mtlName")]
+        public string MaterialName { get; set; } = string.Empty;
+    }
+}
+
+/// <summary>
+/// Represents vertex data with multiple streams.
+/// </summary>
+[CamelCaseProperties]
+public class DmeVertexData : DMElement
+{
+    /// <summary>
+    /// Gets the vertex format specification.
+    /// </summary>
+    public Datamodel.StringArray VertexFormat { get; } = [];
+
+    /// <summary>
+    /// Gets or sets the number of joints for skinning.
+    /// </summary>
+    public int JointCount { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether to flip V texture coordinates.
+    /// </summary>
+    public bool FlipVCoordinates { get; set; }
+
+    /// <summary>
+    /// Adds a vertex data stream.
+    /// </summary>
+    public void AddStream<T>(string name, T[] data)
+    {
+        VertexFormat.Add(name);
+        this[name] = ToDatamodelArray(data);
+    }
+
+    /// <summary>
+    /// Adds an indexed vertex data stream.
+    /// </summary>
+    public void AddIndexedStream<T>(string name, T[] data, int[] indices)
+    {
+        VertexFormat.Add(name);
+        this[name] = ToDatamodelArray(data);
+        this[name + "Indices"] = new Datamodel.IntArray(indices);
+    }
+
+    // The binary codec writes datamodel arrays as one block of memory, but boxes every item of a plain array
+    private static object ToDatamodelArray<T>(T[] data) => data switch
+    {
+        int[] ints => new Datamodel.IntArray(ints),
+        float[] floats => new Datamodel.FloatArray(floats),
+        Vector2[] vectors => new Datamodel.Vector2Array(vectors),
+        Vector3[] vectors => new Datamodel.Vector3Array(vectors),
+        Vector4[] vectors => new Datamodel.Vector4Array(vectors),
+        _ => data,
+    };
+}
+
+/// <summary>
+/// Per-vertex deltas of one morph target, stored sparsely against the mesh's bind state.
+/// </summary>
+[CamelCaseProperties]
+public class DmeVertexDeltaData : DmeVertexData
+{
+    /// <summary>
+    /// Gets or sets a value indicating whether the deltas are already relative to the bind state.
+    /// </summary>
+    public bool Corrected { get; set; } = true;
+}
+
+/// <summary>
+/// One flex controller, naming the morph targets it drives.
+/// </summary>
+[CamelCaseProperties]
+public class DmeCombinationInputControl : DMElement
+{
+    /// <summary>
+    /// Gets the morph target names this control drives. A control with two entries is a split
+    /// control, negative side first.
+    /// </summary>
+    public Datamodel.StringArray RawControlNames { get; } = [];
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the control is split left and right by the balance map.
+    /// </summary>
+    public bool Stereo { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the control drives eyelid tracking.
+    /// </summary>
+    public bool Eyelid { get; set; }
+
+    /// <summary>
+    /// Gets or sets the lowest value the control takes.
+    /// </summary>
+    public float FlexMin { get; set; }
+
+    /// <summary>
+    /// Gets or sets the highest value the control takes.
+    /// </summary>
+    public float FlexMax { get; set; } = 1f;
+
+    /// <summary>
+    /// Gets the wrinkle scale of each raw control.
+    /// </summary>
+    public Datamodel.FloatArray WrinkleScales { get; } = [];
+}
+
+/// <summary>
+/// One rule of a <see cref="DmeFlexRules"/> set, giving a morph target its weight as an expression
+/// over the flex controllers.
+/// </summary>
+[CamelCaseProperties]
+public class DmeFlexRuleExpression : DMElement
+{
+    /// <summary>
+    /// Gets or sets the last evaluated weight.
+    /// </summary>
+    public float Result { get; set; }
+
+    /// <summary>
+    /// Gets or sets the expression that drives the morph target this rule is named after.
+    /// </summary>
+    [DMProperty("expr")]
+    public string Expression { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// The rules driving one mesh's morph targets. A combination operator that targets these instead of
+/// the meshes themselves gets its flex rules from them rather than one per morph target.
+/// </summary>
+[CamelCaseProperties]
+public class DmeFlexRules : DMElement
+{
+    /// <summary>
+    /// Gets or sets the mesh whose morph targets these rules drive.
+    /// </summary>
+    public DMElement? Target { get; init; }
+
+    /// <summary>
+    /// Gets the rules, one per morph target.
+    /// </summary>
+    public Datamodel.ElementArray DeltaStates { get; } = [];
+
+    /// <summary>
+    /// Gets the weight of each rule.
+    /// </summary>
+    public Datamodel.Vector2Array DeltaStateWeights { get; } = [];
+}
+
+/// <summary>
+/// Maps flex controller values onto the delta states of the meshes it targets.
+/// </summary>
+[CamelCaseProperties]
+public class DmeCombinationOperator : DMElement
+{
+    /// <summary>
+    /// Gets the list of <see cref="DmeCombinationInputControl"/> elements.
+    /// </summary>
+    public Datamodel.ElementArray Controls { get; } = [];
+
+    /// <summary>
+    /// Gets the current value of each control, as default, minimum and balance.
+    /// </summary>
+    public Datamodel.Vector3Array ControlValues { get; } = [];
+
+    /// <summary>
+    /// Gets the lagged counterpart of <see cref="ControlValues"/>.
+    /// </summary>
+    public Datamodel.Vector3Array ControlValuesLagged { get; } = [];
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the lagged values are used.
+    /// </summary>
+    public bool UsesLaggedValues { get; set; }
+
+    /// <summary>
+    /// Gets the domination rules. The compiler rebuilds suppression from the flex rule expressions,
+    /// so this is written empty.
+    /// </summary>
+    public Datamodel.ElementArray Dominators { get; } = [];
+
+    /// <summary>
+    /// Gets the meshes this operator drives.
+    /// </summary>
+    public Datamodel.ElementArray Targets { get; } = [];
+}
+
+/// <summary>
+/// Represents a list of animations.
+/// </summary>
+[CamelCaseProperties]
+public class DmeAnimationList : DMElement
+{
+    /// <summary>
+    /// Gets the array of animations.
+    /// </summary>
+    public Datamodel.ElementArray Animations { get; } = [];
+}
+
+/// <summary>
+/// Represents an animation clip with channels.
+/// </summary>
+[CamelCaseProperties]
+public class DmeChannelsClip : DMElement
+{
+    /// <summary>
+    /// Gets the time frame of the clip.
+    /// </summary>
+    public DmeTimeFrame TimeFrame { get; } = [];
+
+    /// <summary>
+    /// Gets or sets the color for display purposes.
+    /// </summary>
+    public Datamodel.Color Color { get; set; }
+
+    /// <summary>
+    /// Gets or sets the text description.
+    /// </summary>
+    public string Text { get; set; } = "";
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the clip is muted.
+    /// </summary>
+    public bool Mute { get; set; }
+
+    /// <summary>
+    /// Gets the track groups.
+    /// </summary>
+    public Datamodel.ElementArray TrackGroups { get; } = [];
+
+    /// <summary>
+    /// Gets or sets the display scale.
+    /// </summary>
+    public float DisplayScale { get; set; } = 1f;
+
+    /// <summary>
+    /// Gets the animation channels.
+    /// </summary>
+    public Datamodel.ElementArray Channels { get; } = [];
+
+    /// <summary>
+    /// Gets or sets the frame rate in frames per second.
+    /// </summary>
+    public float FrameRate { get; set; } = 30f;
+}
+
+/// <summary>
+/// Represents a time frame for animations.
+/// </summary>
+[CamelCaseProperties]
+public class DmeTimeFrame : DMElement
+{
+    /// <summary>
+    /// Gets or sets the start time.
+    /// </summary>
+    public TimeSpan Start { get; set; }
+
+    /// <summary>
+    /// Gets or sets the duration.
+    /// </summary>
+    public TimeSpan Duration { get; set; }
+
+    /// <summary>
+    /// Gets or sets the time offset.
+    /// </summary>
+    public TimeSpan Offset { get; set; }
+
+    /// <summary>
+    /// Gets or sets the time scale.
+    /// </summary>
+    public float Scale { get; set; } = 1f;
+}
+
+/// <summary>
+/// Represents an animation channel connecting source and target elements.
+/// </summary>
+[CamelCaseProperties]
+public class DmeChannel : DMElement
+{
+    /// <summary>
+    /// Gets or sets the source element.
+    /// </summary>
+    public DMElement? FromElement { get; init; }
+
+    /// <summary>
+    /// Gets or sets the source attribute name.
+    /// </summary>
+    public string FromAttribute { get; set; } = "";
+
+    /// <summary>
+    /// Gets or sets the source index.
+    /// </summary>
+    public int FromIndex { get; set; }
+
+    /// <summary>
+    /// Gets or sets the target element.
+    /// </summary>
+    public DMElement? ToElement { get; init; }
+
+    /// <summary>
+    /// Gets or sets the target attribute name.
+    /// </summary>
+    public string ToAttribute { get; set; } = "";
+
+    /// <summary>
+    /// Gets or sets the target index.
+    /// </summary>
+    public int ToIndex { get; set; }
+
+    /// <summary>
+    /// Gets or sets the channel mode.
+    /// </summary>
+    public int Mode { get; set; }
+
+    /// <summary>
+    /// Gets or sets the animation log data.
+    /// </summary>
+    public DmeLog? Log { get; init; }
+}
+
+/// <summary>
+/// Base class for animation logs, which hold their keyframe data in layers.
+/// </summary>
+[CamelCaseProperties]
+public abstract class DmeLog : DMElement
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DmeLog"/> class.
+    /// </summary>
+    /// <param name="valueTypeName">Lowercase name of the logged value type, such as "vector3".</param>
+    protected DmeLog(string valueTypeName)
+    {
+        Name = $"{valueTypeName} log";
+    }
+
+    /// <summary>
+    /// Gets or sets the log layers containing keyframe data.
+    /// </summary>
+    [DMProperty("layers")]
+    public Datamodel.ElementArray Layers { get; init; } = [];
+
+    /// <summary>
+    /// Gets or sets the curve interpolation information.
+    /// </summary>
+    [DMProperty("curveinfo")]
+    public DMElement? CurveInfo { get; init; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether to use the default value.
+    /// </summary>
+    [DMProperty("usedefaultvalue")]
+    public bool UseDefaultValue { get; set; }
+
+    /// <summary>
+    /// Gets the X-axis bookmarks.
+    /// </summary>
+    public Datamodel.TimeSpanArray BookmarksX { get; } = [];
+
+    /// <summary>
+    /// Gets the Y-axis bookmarks.
+    /// </summary>
+    public Datamodel.TimeSpanArray BookmarksY { get; } = [];
+
+    /// <summary>
+    /// Gets the Z-axis bookmarks.
+    /// </summary>
+    public Datamodel.TimeSpanArray BookmarksZ { get; } = [];
+}
+
+/// <summary>
+/// Represents an animation log of float values.
+/// </summary>
+public class DmeFloatLog : DmeLog
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DmeFloatLog"/> class.
+    /// </summary>
+    public DmeFloatLog() : base("float") { }
+
+    /// <summary>
+    /// Gets or sets the default value.
+    /// </summary>
+    [DMProperty("defaultvalue")]
+    public float DefaultValue { get; set; }
+}
+
+/// <summary>
+/// Represents an animation log of vector values.
+/// </summary>
+public class DmeVector3Log : DmeLog
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DmeVector3Log"/> class.
+    /// </summary>
+    public DmeVector3Log() : base("vector3") { }
+
+    /// <summary>
+    /// Gets or sets the default value.
+    /// </summary>
+    [DMProperty("defaultvalue")]
+    public Vector3 DefaultValue { get; set; }
+}
+
+/// <summary>
+/// Represents an animation log of quaternion values.
+/// </summary>
+public class DmeQuaternionLog : DmeLog
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DmeQuaternionLog"/> class.
+    /// </summary>
+    public DmeQuaternionLog() : base("quaternion") { }
+
+    /// <summary>
+    /// Gets or sets the default value.
+    /// </summary>
+    [DMProperty("defaultvalue")]
+    public Quaternion DefaultValue { get; set; }
+}
+
+/// <summary>
+/// Base class for a layer of keyframe data in an animation log.
+/// </summary>
+[CamelCaseProperties]
+public abstract class DmeLogLayer : DMElement
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DmeLogLayer"/> class.
+    /// </summary>
+    /// <param name="valueTypeName">Lowercase name of the logged value type, such as "vector3".</param>
+    protected DmeLogLayer(string valueTypeName)
+    {
+        Name = $"{valueTypeName} log";
+    }
+
+    /// <summary>
+    /// Gets or sets the keyframe times.
+    /// </summary>
+    public Datamodel.TimeSpanArray Times { get; } = [];
+
+    /// <summary>
+    /// Gets the curve interpolation types for each keyframe.
+    /// </summary>
+    [DMProperty("curvetypes")]
+    public Datamodel.IntArray CurveTypes { get; } = [];
+}
+
+/// <summary>
+/// Represents a layer of float keyframes.
+/// </summary>
+public class DmeFloatLogLayer : DmeLogLayer
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DmeFloatLogLayer"/> class.
+    /// </summary>
+    public DmeFloatLogLayer() : base("float") { }
+
+    /// <summary>
+    /// Gets or sets the keyframe values.
+    /// </summary>
+    [DMProperty("values")]
+    public float[] LayerValues { get; set; } = [];
+}
+
+/// <summary>
+/// Represents a layer of vector keyframes.
+/// </summary>
+public class DmeVector3LogLayer : DmeLogLayer
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DmeVector3LogLayer"/> class.
+    /// </summary>
+    public DmeVector3LogLayer() : base("vector3") { }
+
+    /// <summary>
+    /// Gets or sets the keyframe values.
+    /// </summary>
+    [DMProperty("values")]
+    public Vector3[] LayerValues { get; set; } = [];
+}
+
+/// <summary>
+/// Represents a layer of quaternion keyframes.
+/// </summary>
+public class DmeQuaternionLogLayer : DmeLogLayer
+{
+    /// <summary>
+    /// Initializes a new instance of the <see cref="DmeQuaternionLogLayer"/> class.
+    /// </summary>
+    public DmeQuaternionLogLayer() : base("quaternion") { }
+
+    /// <summary>
+    /// Gets or sets the keyframe values.
+    /// </summary>
+    [DMProperty("values")]
+    public Quaternion[] LayerValues { get; set; } = [];
+}

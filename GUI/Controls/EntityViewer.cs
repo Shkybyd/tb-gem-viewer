@@ -1,0 +1,644 @@
+using System.Drawing;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using GUI.Forms;
+using GUI.Utils;
+using SkiaSharp;
+using ValveResourceFormat.IO.Fgd;
+using ValveResourceFormat.Renderer.Editor.Entities;
+using ValveResourceFormat.Renderer.Editor.Helpers;
+using ValveResourceFormat.ResourceTypes;
+using ValveResourceFormat.Serialization.KeyValues;
+using static ValveResourceFormat.ResourceTypes.EntityLump;
+
+namespace GUI.Types.Viewers
+{
+    public partial class EntityViewer : UserControl
+    {
+        private readonly SearchDataClass SearchData = new();
+        private readonly List<Entity> Entities = [];
+        private readonly Action<Entity>? SelectEntityFunc;
+        private readonly VrfGuiContext GuiContext;
+
+        private HashSet<string>? pendingIconClassnames;
+
+        // Classes and their icons are looked up in the game of this viewer, so icons are only kept per viewer
+        private readonly ImageList EntityIconImageList;
+        private readonly Dictionary<string, int> IconIndexByClassname = [];
+        private readonly Dictionary<string, int> IconIndexByMaterial = new(StringComparer.OrdinalIgnoreCase);
+
+        private static int GetDefaultIconIndexForEntity(Entity entity)
+        {
+            if (entity.ContainsKey("model"))
+            {
+                return 1;
+            }
+
+            if (entity.ContainsKey("effect_name"))
+            {
+                return 2;
+            }
+
+            // Return number matches the order of EntityIconImageList.Images.Add calls
+            return 0;
+        }
+
+        private static ImageList CreateImageList()
+        {
+            var imageList = new ImageList
+            {
+                ColorDepth = ColorDepth.Depth32Bit,
+                ImageSize = AppIcons.ImageList.ImageSize,
+            };
+
+            if (AppIcons.ExtensionIcons.TryGetValue("ents", out var entsIconIndex) &&
+                AppIcons.ImageList.Images[entsIconIndex] is Bitmap entsIcon)
+            {
+                imageList.Images.Add(entsIcon);
+            }
+
+            if (AppIcons.ExtensionIcons.TryGetValue("mdl", out var mdlIconIndex) &&
+                AppIcons.ImageList.Images[mdlIconIndex] is Bitmap mdlIcon)
+            {
+                imageList.Images.Add(mdlIcon);
+            }
+
+            if (AppIcons.ExtensionIcons.TryGetValue("pcf", out var pcfIconIndex) &&
+                AppIcons.ImageList.Images[pcfIconIndex] is Bitmap pcfIcon)
+            {
+                imageList.Images.Add(pcfIcon);
+            }
+
+            return imageList;
+        }
+
+        public enum ObjectsToInclude
+        {
+            Everything,
+            MeshEntities,
+            PointEntities
+        }
+
+        protected override void OnCreateControl()
+        {
+            base.OnCreateControl();
+
+            BackColor = Themer.CurrentThemeColors.AppMiddle;
+        }
+
+        public class SearchDataClass
+        {
+            public ObjectsToInclude ObjectsToInclude { get; set; } = ObjectsToInclude.Everything;
+
+            public string Class { get; set; } = string.Empty;
+            public string Key { get; set; } = string.Empty;
+            public string Value { get; set; } = string.Empty;
+        }
+
+        internal EntityViewer(VrfGuiContext guiContext, List<Entity> entities, Action<Entity>? selectAndFocusEntity = null)
+        {
+            Dock = DockStyle.Fill;
+            InitializeComponent();
+
+            GuiContext = guiContext;
+            Entities = entities;
+            SelectEntityFunc = selectAndFocusEntity;
+            EntityInfo.LinkedResourceActivated += OnLinkedResourceActivated;
+            EntityViewerGrid.OwnerDraw = true;
+
+            EntityIconImageList = CreateImageList();
+            EntityViewerGrid.SmallImageList = EntityIconImageList;
+
+            var allClassnames = Entities
+                .Select(static e => e.GetStringProperty("classname", string.Empty))
+                .Where(static cn => !string.IsNullOrEmpty(cn))
+                .ToHashSet();
+
+            // defer icon loading until the control is actually shown
+            if (allClassnames.Count > 0)
+            {
+                pendingIconClassnames = allClassnames;
+                VisibleChanged += EntityViewer_VisibleChanged;
+            }
+
+            UpdateGrid();
+        }
+
+        private void EntityViewer_VisibleChanged(object? sender, EventArgs e)
+        {
+            if (Visible && pendingIconClassnames is { Count: > 0 } classnames)
+            {
+                // detach so the load only happens once
+                VisibleChanged -= EntityViewer_VisibleChanged;
+
+                pendingIconClassnames = null;
+                Task.Factory.StartNew(() => LoadEntityIcons(classnames)).ContinueWith(t =>
+                {
+                    if (t.Exception != null)
+                    {
+                        Log.Error(nameof(EntityViewer), $"Failed to load entity icons for \"{GuiContext.DisplayPath}\": {t.Exception}");
+                    }
+                });
+            }
+        }
+
+        private void UpdateGrid()
+        {
+            var filteredEntities = new List<(Entity Entity, string Classname, string Targetname)>(Entities.Count);
+
+            var isKeyEmpty = string.IsNullOrEmpty(SearchData.Key);
+            var isValueEmpty = string.IsNullOrEmpty(SearchData.Value);
+
+            foreach (var entity in Entities)
+            {
+                var classname = entity.GetStringProperty("classname", string.Empty);
+
+                if (!string.IsNullOrEmpty(SearchData.Class))
+                {
+                    if (!classname.Contains(SearchData.Class, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                }
+
+                switch (SearchData.ObjectsToInclude)
+                {
+                    case ObjectsToInclude.Everything:
+                        break;
+
+                    case ObjectsToInclude.MeshEntities:
+                        if (!entity.ContainsKey("model"))
+                        {
+                            continue;
+                        }
+                        break;
+
+                    case ObjectsToInclude.PointEntities:
+                        if (entity.ContainsKey("model"))
+                        {
+                            continue;
+                        }
+                        break;
+                }
+
+                // match key and value together
+                if (!isKeyEmpty && !isValueEmpty)
+                {
+                    if (!ContainsKeyValue(entity, SearchData.Key, SearchData.Value))
+                    {
+                        continue;
+                    }
+                }
+                // search only by key
+                else if (!isKeyEmpty)
+                {
+                    if (!ContainsKey(entity, SearchData.Key))
+                    {
+                        continue;
+                    }
+                }
+                // search only by value
+                else if (!isValueEmpty)
+                {
+                    if (!ContainsValue(entity, SearchData.Value))
+                    {
+                        continue;
+                    }
+                }
+
+                var targetname = entity.TargetName ?? string.Empty;
+                filteredEntities.Add((entity, classname, targetname));
+            }
+
+            EntityViewerGrid.BeginUpdate();
+            EntityViewerGrid.Items.Clear();
+
+            if (filteredEntities.Count > 0)
+            {
+                var items = filteredEntities
+                    .OrderBy(static e => e.Classname, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(static e => e.Targetname, StringComparer.OrdinalIgnoreCase)
+                    .Select(e =>
+                    {
+                        var (entity, classname, targetname) = e;
+                        var item = new ListViewItem(classname);
+                        item.SubItems.Add(targetname);
+                        item.Tag = entity;
+
+                        if (IconIndexByClassname.TryGetValue(classname, out var iconIndex))
+                        {
+                            item.ImageIndex = iconIndex;
+                        }
+                        else
+                        {
+                            item.ImageIndex = GetDefaultIconIndexForEntity(entity);
+                        }
+
+                        return item;
+                    })
+                    .ToArray();
+
+                EntityViewerGrid.Items.AddRange(items);
+            }
+
+            EntityViewerGrid.EndUpdate();
+
+            // when search changes set first entity as selected in entity props
+            if (filteredEntities.Count > 0)
+            {
+                ShowEntityProperties(filteredEntities[0].Entity);
+            }
+        }
+
+        private static bool ContainsKey(Entity entity, string key)
+        {
+            foreach (var prop in entity.Children)
+            {
+                if (prop.Key.Contains(key, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool ContainsValue(Entity entity, string value)
+        {
+            foreach (var prop in entity.Children)
+            {
+                var stringValue = prop.Value.ToString() ?? string.Empty;
+
+                if (KeyValue_MatchWholeValue.Checked)
+                {
+                    if (stringValue == value)
+                    {
+                        return true;
+                    }
+                }
+                else
+                {
+                    if (stringValue.Contains(value, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private bool ContainsKeyValue(Entity entity, string key, string value)
+        {
+            foreach (var prop in entity.Children)
+            {
+                var stringValue = prop.Value.ToString() ?? string.Empty;
+
+                if (prop.Key.Contains(key, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (KeyValue_MatchWholeValue.Checked)
+                    {
+                        if (stringValue == value)
+                        {
+                            return true;
+                        }
+                    }
+                    else
+                    {
+                        if (stringValue.Contains(value, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private void ObjectsToInclude_PointEntities_CheckedChanged(object sender, EventArgs e)
+        {
+            if (((RadioButton)sender).Checked)
+            {
+                SearchData.ObjectsToInclude = ObjectsToInclude.PointEntities;
+
+                UpdateGrid();
+            }
+        }
+
+        private void ObjectsToInclude_MeshEntities_CheckedChanged(object sender, EventArgs e)
+        {
+            if (((RadioButton)sender).Checked)
+            {
+                SearchData.ObjectsToInclude = ObjectsToInclude.MeshEntities;
+
+                UpdateGrid();
+            }
+        }
+
+        private void ObjectsToInclude_Everything_CheckedChanged(object sender, EventArgs e)
+        {
+            if (((RadioButton)sender).Checked)
+            {
+                SearchData.ObjectsToInclude = ObjectsToInclude.Everything;
+
+                UpdateGrid();
+            }
+        }
+
+        private void ObjectsToInclude_ClassTextBox_TextChanged(object sender, EventArgs e)
+        {
+            SearchData.Class = ((TextBox)sender).Text;
+            UpdateGrid();
+        }
+
+        private void KeyValue_Key_TextChanged(object sender, EventArgs e)
+        {
+            SearchData.Key = ((TextBox)sender).Text;
+            UpdateGrid();
+        }
+
+        private void KeyValue_Value_TextChanged(object sender, EventArgs e)
+        {
+            SearchData.Value = ((TextBox)sender).Text;
+            UpdateGrid();
+        }
+
+        private void KeyValue_MatchWholeValue_CheckedChanged(object sender, EventArgs e)
+        {
+            UpdateGrid();
+        }
+
+        private void EntityViewerGrid_SelectionChanged(object? sender, EventArgs e)
+        {
+            if (EntityViewerGrid.SelectedItems.Count > 0)
+            {
+                if (EntityViewerGrid.SelectedItems[0].Tag is Entity entity)
+                {
+                    ShowEntityProperties(entity);
+                }
+            }
+        }
+
+        private void EntityViewerGrid_CellDoubleClick(object? sender, EventArgs e)
+        {
+            if (EntityViewerGrid.SelectedItems.Count > 0)
+            {
+                if (EntityViewerGrid.SelectedItems[0].Tag is Entity entity)
+                {
+                    var classname = entity.GetStringProperty("classname", string.Empty);
+                    if (classname == "worldspawn")
+                    {
+                        return;
+                    }
+
+                    SelectEntityFunc?.Invoke(entity);
+                }
+            }
+        }
+
+        private void ShowEntityProperties(Entity entity)
+        {
+            EntityInfo.Clear();
+            EntityInfo.PopulateFromEntity(Entities, entity);
+            EntityInfo.ShowPopulatedTabs();
+
+            var groupBoxName = "Entity Properties";
+
+            var targetname = entity.GetStringProperty("targetname", string.Empty);
+            var classname = entity.GetStringProperty("classname", string.Empty);
+
+            if (!string.IsNullOrEmpty(targetname))
+            {
+                groupBoxName += $" - {targetname}";
+            }
+            else if (!string.IsNullOrEmpty(classname))
+            {
+                groupBoxName += $" - {classname}";
+            }
+
+            if (entity.ParentLump.Resource is { } parentResource)
+            {
+                groupBoxName += $" - Entity Lump: {parentResource.FileName}";
+            }
+
+            EntityPropertiesGroup.Text = groupBoxName;
+        }
+
+        private void OnLinkedResourceActivated(object? sender, LinkedResource link)
+        {
+            switch (link)
+            {
+                case LinkedEntities { Entities: var entities }:
+                    ShowLinkedEntities(entities);
+                    break;
+
+                case LinkedFile { Path: var path }:
+                    Resource.OpenExternalReference(GuiContext, path);
+                    break;
+            }
+        }
+
+        private void ShowLinkedEntities(IReadOnlyList<Entity> entities)
+        {
+            var targets = entities.ToHashSet();
+            ListViewItem? firstItem = null;
+
+            EntityViewerGrid.SelectedIndexChanged -= EntityViewerGrid_SelectionChanged;
+
+            try
+            {
+                EntityViewerGrid.SelectedItems.Clear();
+
+                foreach (ListViewItem item in EntityViewerGrid.Items)
+                {
+                    if (item.Tag is Entity entity && targets.Contains(entity))
+                    {
+                        item.Selected = true;
+                        firstItem ??= item;
+                    }
+                }
+            }
+            finally
+            {
+                EntityViewerGrid.SelectedIndexChanged += EntityViewerGrid_SelectionChanged;
+            }
+
+            if (firstItem is not { Tag: Entity firstEntity })
+            {
+                // Filtered out of the list
+                ShowEntityProperties(entities[0]);
+                return;
+            }
+
+            firstItem.Focused = true;
+            firstItem.EnsureVisible();
+            ShowEntityProperties(firstEntity);
+        }
+
+        private void EntityViewerGrid_Resize(object sender, EventArgs e)
+        {
+            EntityViewerGrid.SuspendLayout();
+            var half = EntityViewerGrid.ClientSize.Width / 2;
+            EntityViewerGrid.Columns[0].Width = half;
+            EntityViewerGrid.Columns[1].Width = half;
+            EntityViewerGrid.ResumeLayout();
+        }
+
+        private void EntityViewerGrid_DrawColumnHeader(object sender, DrawListViewColumnHeaderEventArgs e)
+        {
+            System.Windows.Forms.TextRenderer.DrawText(e.Graphics, e.Header?.Text ?? "", e.Font,
+                e.Bounds, ForeColor,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+        }
+
+        private void EntityViewerGrid_DrawItem(object sender, DrawListViewItemEventArgs e)
+        {
+            e.DrawDefault = true;
+
+            if (e.ItemIndex % 2 == 0)
+            {
+                e.Item.BackColor = Themer.CurrentThemeColors.AppSoft;
+            }
+            else
+            {
+                e.Item.BackColor = Themer.CurrentThemeColors.AppMiddle;
+            }
+        }
+
+        private static readonly string[] ToolSpriteTextureKeys = ["g_tColorA", "g_tColorB", "g_tColorC", "g_tColor"];
+
+        private static string? GetTextureFromMaterial(Material material)
+        {
+            foreach (var key in ToolSpriteTextureKeys)
+            {
+                if (material.TextureParams.TryGetValue(key, out var texturePath) && !string.IsNullOrEmpty(texturePath))
+                {
+                    return texturePath;
+                }
+            }
+
+            return null;
+        }
+
+        private Bitmap? LoadIconBitmap(string iconPath)
+        {
+            var materialResource = GuiContext.LoadFileCompiled(iconPath);
+            if (materialResource?.DataBlock is not Material material)
+            {
+                return null;
+            }
+
+            var texturePath = GetTextureFromMaterial(material);
+            if (string.IsNullOrEmpty(texturePath))
+            {
+                return null;
+            }
+
+            var textureResource = GuiContext.LoadFileCompiled(texturePath);
+            if (textureResource?.DataBlock is not Texture texture)
+            {
+                return null;
+            }
+
+            using var skBitmap = texture.GenerateBitmap();
+            if (skBitmap == null)
+            {
+                return null;
+            }
+
+            if (skBitmap.Width != EntityIconImageList.ImageSize.Width ||
+                skBitmap.Height != EntityIconImageList.ImageSize.Height)
+            {
+                using var resized = skBitmap.Resize(
+                    new SKImageInfo(EntityIconImageList.ImageSize.Width, EntityIconImageList.ImageSize.Height),
+                    new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear)
+                );
+                return resized?.ToBitmap();
+            }
+
+            return skBitmap.ToBitmap();
+        }
+
+        private int AddBitmapToImageList(Bitmap bitmap)
+        {
+            var index = -1;
+
+            InvokeWorkaround(() =>
+            {
+                index = EntityIconImageList.Images.Count;
+                AppIcons.AddFixedImageToImageList(bitmap, EntityIconImageList);
+            });
+
+            return index;
+        }
+
+        private int LoadEntityIcon(string classname)
+        {
+            if (EntityClassCatalog.Get(GuiContext, VrfGuiContext.Logger).FindClass(classname) is not { } entityClass)
+            {
+                return -1;
+            }
+
+            foreach (var helper in entityClass.Helpers)
+            {
+                if (!helper.Name.Equals("iconsprite", StringComparison.OrdinalIgnoreCase) || IconHelper.GetDeclaredMaterialName(helper) is not { } iconPath)
+                {
+                    continue;
+                }
+
+                if (IconIndexByMaterial.TryGetValue(iconPath, out var cachedIndex))
+                {
+                    return cachedIndex;
+                }
+
+                using var bitmap = LoadIconBitmap(iconPath);
+                if (bitmap != null)
+                {
+                    var index = AddBitmapToImageList(bitmap);
+                    IconIndexByMaterial[iconPath] = index;
+                    return index;
+                }
+            }
+
+            return -1;
+        }
+
+        private void LoadEntityIcons(HashSet<string> classnames)
+        {
+            foreach (var classname in classnames)
+            {
+                var iconIndex = LoadEntityIcon(classname);
+
+                InvokeWorkaround(() =>
+                {
+                    if (iconIndex >= 0)
+                    {
+                        IconIndexByClassname[classname] = iconIndex;
+                    }
+
+                    foreach (ListViewItem item in EntityViewerGrid.Items)
+                    {
+                        if (item.Tag is Entity entity && entity.GetStringProperty("classname", string.Empty) == classname)
+                        {
+                            item.ImageIndex = iconIndex >= 0 ? iconIndex : GetDefaultIconIndexForEntity(entity);
+                        }
+                    }
+                });
+            }
+        }
+
+        private void InvokeWorkaround(Action action)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(action);
+            }
+            else
+            {
+                action();
+            }
+        }
+    }
+}

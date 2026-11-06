@@ -1,0 +1,372 @@
+using System.IO;
+using System.Linq;
+using ValveKeyValue;
+using ValveResourceFormat.ResourceTypes;
+using ValveResourceFormat.ResourceTypes.ModelData;
+using ValveResourceFormat.Serialization.KeyValues;
+
+namespace ValveResourceFormat.Renderer
+{
+    /// <summary>
+    /// Scene node for instanced rendering of aggregated world geometry.
+    /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/worldrenderer/AggregateSceneObject_t">AggregateSceneObject_t</seealso>
+    public class SceneAggregate : SceneNode
+    {
+        /// <summary>Gets the shared renderable mesh for all fragments in this aggregate.</summary>
+        public RenderableMesh RenderMesh { get; }
+
+        /// <summary>Gets the list of drawable fragments that make up this aggregate.</summary>
+        public List<Fragment> Fragments { get; private set; } = [];
+
+        /// <summary>Gets or sets the byte offset into the indirect draw buffer for this aggregate's draws.</summary>
+        public int IndirectDrawByteOffset { get; set; }
+
+        /// <summary>Gets or sets the number of indirect draw commands for this aggregate.</summary>
+        public int IndirectDrawCount { get; set; }
+
+        /// <summary>Gets or sets the compaction buffer index used for GPU-driven draw count, or -1 if not compacted.</summary>
+        public int CompactionIndex { get; set; } = -1;
+
+        /// <summary>Gets the per-instance transform matrices used for instanced drawing.</summary>
+        public List<OpenTK.Mathematics.Matrix3x4> InstanceTransforms { get; } = [];
+
+        /// <summary>Gets or sets whether this aggregate can use GPU indirect drawing.</summary>
+        public bool CanDrawIndirect { get; set; }
+
+        /// <summary>Gets or sets the combined object type flags across all fragments (bitwise AND).</summary>
+        public ObjectTypeFlags AllFlags { get; set; }
+
+        /// <summary>Gets or sets the combined object type flags across all fragments (bitwise OR).</summary>
+        public ObjectTypeFlags AnyFlags { get; set; }
+
+        /// <summary>Baked LOD switching data for one cluster of aggregated instances.</summary>
+        /// <param name="Origin">World-space point the camera distance is measured to.</param>
+        /// <param name="MaxObjectScale">Largest instance scale in the cluster, scales the projected size metric.</param>
+        /// <param name="SwitchDistances">Ascending per-level thresholds, first entry 0, compared against a
+        /// screen-size derived distance metric rather than raw world distance.</param>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/worldrenderer/AggregateLODSetup_t">AggregateLODSetup_t</seealso>
+        public readonly record struct LodSetup(Vector3 Origin, float MaxObjectScale, float[] SwitchDistances);
+
+        /// <summary>Gets the baked per-cluster LOD setups, empty when this aggregate has no LOD switching.</summary>
+        public LodSetup[] LodSetups { get; private set; } = [];
+
+        private int[] activeLodLevels = [];
+
+        /// <summary>Gets or sets where this aggregate's setups start in the scene's active LOD level bits.</summary>
+        public int LodSetupBase { get; set; }
+
+        /// <summary>
+        /// Single drawable fragment within an aggregate with independent bounds.
+        /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/worldrenderer/AggregateMeshInfo_t">AggregateMeshInfo_t</seealso>
+        public sealed class Fragment : SceneNode
+        {
+            /// <summary>Gets the aggregate that owns this fragment.</summary>
+            public new required SceneAggregate Parent { get; init; }
+
+            /// <summary>Gets the shared renderable mesh used to issue this fragment's draw call.</summary>
+            public required RenderableMesh RenderMesh { get; init; }
+
+            /// <summary>Gets the specific draw call within the mesh that renders this fragment.</summary>
+            public required DrawCall DrawCall { get; init; }
+
+            /// <summary>Gets the LOD levels this fragment belongs to, one bit per level; 0 means always drawn.</summary>
+            public uint LodGroupMask { get; init; }
+
+            /// <summary>Gets the index into the parent's <see cref="LodSetups"/> that governs this fragment.</summary>
+            public int LodSetupIndex { get; init; }
+
+            /// <summary>Initializes a new fragment of the given aggregate with the specified local bounds.</summary>
+            /// <param name="scene">Owning scene.</param>
+            /// <param name="parent">The scene aggregate this fragment belongs to.</param>
+            /// <param name="bounds">The local bounding box of the fragment.</param>
+            public Fragment(Scene scene, SceneAggregate parent, AABB bounds) : base(scene)
+            {
+                Parent = parent;
+                LocalBoundingBox = bounds;
+                Name = parent.Name;
+                Layers = parent.Layers;
+            }
+        }
+
+        /// <summary>Initializes the scene aggregate with replacements for the materials of its model.</summary>
+        /// <param name="scene">Owning scene.</param>
+        /// <param name="model">Model resource providing the embedded or referenced mesh.</param>
+        /// <param name="materialTable">Maps materials of the model to the ones drawn instead, or <see langword="null"/> to draw the model's own.</param>
+        /// <param name="shaderArguments">Shader combos set on every draw call, or <see langword="null"/> for the scene's.</param>
+        public SceneAggregate(Scene scene, Model model, Dictionary<string, string>? materialTable = null, IReadOnlyDictionary<string, byte>? shaderArguments = null)
+            : base(scene)
+        {
+            var embeddedMeshes = model.GetEmbeddedMeshes().ToList();
+
+            // TODO: Perhaps use ModelSceneNode.LoadMeshes
+            if (embeddedMeshes.Count != 0)
+            {
+                RenderMesh = new RenderableMesh(embeddedMeshes.First().Mesh, 0, Scene, model, materialTable, isAggregate: true, shaderArguments: shaderArguments);
+
+                if (embeddedMeshes.Count > 1)
+                {
+                    throw new NotImplementedException("More than one embedded mesh");
+                }
+            }
+            else
+            {
+                var refMeshes = model.GetReferenceMeshNamesForLod(model.LodInfo.LowestLevel).ToList();
+                var refMesh = refMeshes.First();
+
+                if (refMeshes.Count > 1)
+                {
+                    throw new NotImplementedException("More than one referenced mesh");
+                }
+
+                var newResource = Scene.RendererContext.FileLoader.LoadFileCompiled(refMesh.MeshName);
+
+                if (newResource == null || newResource.DataBlock is not Mesh meshData)
+                {
+                    throw new InvalidDataException($"Failed to load {refMesh.MeshName}");
+                }
+
+                RenderMesh = new RenderableMesh(meshData, refMesh.MeshIndex, Scene, model, materialTable, isAggregate: true, shaderArguments: shaderArguments);
+            }
+
+            LocalBoundingBox = RenderMesh.BoundingBox;
+        }
+
+        /// <summary>Expands the aggregate's bounding box to cover the entire scene, preventing it from being frustum-culled.</summary>
+        public void SetInfiniteBoundingBox()
+        {
+            LocalBoundingBox = new AABB(Vector3.NegativeInfinity, Vector3.PositiveInfinity);
+        }
+
+        /// <summary>Parses fragment data from the scene object and adds each fragment to the scene.</summary>
+        /// <param name="aggregateSceneObject">KV3 object describing the aggregate's fragment list.</param>
+        /// <param name="rootTransform">Where the world node this aggregate belongs to is placed.</param>
+        /// <param name="worldNode">The world node this aggregate belongs to, which holds precomputed fragment visibility.</param>
+        public void LoadFragments(KVObject aggregateSceneObject, Matrix4x4 rootTransform, WorldNode? worldNode = null)
+        {
+            LoadLodSetups(aggregateSceneObject, rootTransform);
+            Fragments.AddRange(CreateFragments(aggregateSceneObject, rootTransform, worldNode));
+            foreach (var fragment in Fragments)
+            {
+                Scene.Add(fragment, false);
+            }
+
+            if (Fragments.Count > 0)
+            {
+                // The root transform is applied to the fragments, this node only provides culling bounds
+                var bounds = Fragments[0].BoundingBox;
+
+                foreach (var fragment in Fragments)
+                {
+                    bounds = bounds.Union(fragment.BoundingBox);
+                }
+
+                LocalBoundingBox = bounds;
+            }
+        }
+
+        private void LoadLodSetups(KVObject aggregateSceneObject, Matrix4x4 rootTransform)
+        {
+            var lodSetups = aggregateSceneObject.GetArray("m_lodSetups");
+
+            if (lodSetups == null || lodSetups.Count == 0)
+            {
+                return;
+            }
+
+            LodSetups = new LodSetup[lodSetups.Count];
+
+            for (var i = 0; i < lodSetups.Count; i++)
+            {
+                LodSetups[i] = new LodSetup(
+                    Vector3.Transform(lodSetups[i].GetSubCollection("m_vLODOrigin").ToVector3(), rootTransform),
+                    lodSetups[i].GetFloatProperty("m_fMaxObjectScale"),
+                    lodSetups[i].GetFloatArray("m_fSwitchDistances")
+                );
+            }
+
+            activeLodLevels = new int[LodSetups.Length];
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Picks the active LOD level per setup from the projected screen size of the cluster at the camera's
+        /// distance to the setup origin: metric = 100 * distance / (maxObjectScale * pixelsPerUnitAtUnitDistance),
+        /// active level = highest index whose switch distance the metric exceeds.
+        /// </remarks>
+        public override void Update(Scene.UpdateContext context)
+        {
+            if (LodSetups.Length == 0)
+            {
+                return;
+            }
+
+            var camera = context.Camera;
+            var projectionScale = camera.WindowSize.Y * camera.ProjectionMatrix.M22;
+
+            if (projectionScale <= 0f)
+            {
+                return;
+            }
+
+            var cameraPosition = camera.Location;
+
+            for (var i = 0; i < LodSetups.Length; i++)
+            {
+                var setup = LodSetups[i];
+                var distance = Vector3.Distance(cameraPosition, setup.Origin);
+                var metric = 100f * distance / (setup.MaxObjectScale * projectionScale);
+                var level = 0;
+
+                for (var j = 1; j < setup.SwitchDistances.Length; j++)
+                {
+                    if (metric > setup.SwitchDistances[j])
+                    {
+                        level = j;
+                    }
+                }
+
+                activeLodLevels[i] = level;
+            }
+        }
+
+        internal void WriteActiveLodBits(Span<uint> sceneLodBits)
+        {
+            for (var i = 0; i < activeLodLevels.Length; i++)
+            {
+                sceneLodBits[LodSetupBase + i] = 1u << activeLodLevels[i];
+            }
+        }
+
+        /// <summary>
+        /// Returns whether a fragment is part of the currently active LOD level of its setup.
+        /// Fragments with no LOD mask are always visible.
+        /// </summary>
+        /// <param name="fragment">The fragment to test.</param>
+        public bool IsFragmentInActiveLod(Fragment fragment)
+        {
+            if (fragment.LodGroupMask == 0 || activeLodLevels.Length == 0)
+            {
+                return true;
+            }
+
+            if (fragment.LodSetupIndex < 0 || fragment.LodSetupIndex >= activeLodLevels.Length)
+            {
+                return true;
+            }
+
+            return ModelLodInfo.IsInLevel(fragment.LodGroupMask, activeLodLevels[fragment.LodSetupIndex]);
+        }
+
+        /// <summary>Appends a meshlet covering an entire draw call.</summary>
+        private void CreateDrawMeshlet(DrawCall drawCall)
+        {
+            drawCall.FirstMeshlet = RenderMesh.Meshlets.Count;
+            drawCall.NumMeshlets = 1;
+
+            // Packed bounds are normalized to the draw bounds, so min 0 and max 1023 in every component
+            // unpack to the draw call's own box.
+            const uint PackedBoundsMax = (1023u << 20) | (1023u << 10) | 1023u;
+
+            RenderMesh.Meshlets.Add(new Meshlet
+            {
+                PackedAABB = new Meshlet.MeshletBounds { Min = 0, Max = PackedBoundsMax, },
+                CullingData = new Meshlet.MeshletCone { ConeCutoff = 127, },
+                VertexOffset = 0,
+                VertexCount = drawCall.VertexCount,
+                TriangleOffset = (int)(drawCall.StartIndex / drawCall.IndexSizeInBytes) / 3,
+                TriangleCount = (uint)(drawCall.IndexCount / 3),
+            });
+        }
+
+        private IEnumerable<Fragment> CreateFragments(KVObject aggregateSceneObject, Matrix4x4 rootTransform, WorldNode? worldNode)
+        {
+            var aggregateMeshes = aggregateSceneObject.GetArray("m_aggregateMeshes");
+
+            // Aperture Desk Job goes from draw call -> aggregate mesh
+            if (aggregateMeshes.Count > 0 && !aggregateMeshes[0].ContainsKey("m_nDrawCallIndex"))
+            {
+                var createDrawMeshlets = RenderMesh.Meshlets.Count == 0;
+                CanDrawIndirect = RenderMesh.DrawCallsOpaque.Count > 0 && createDrawMeshlets;
+
+                foreach (var drawCall in RenderMesh.DrawCallsOpaque)
+                {
+                    var fragmentData = aggregateMeshes[drawCall.MeshId];
+                    var lightProbeVolumeHandshake = fragmentData.GetInt32Property("m_nLightProbeVolumePrecomputedHandshake");
+                    var worldBounds = fragmentData.GetArray("m_vWorldBounds");
+                    var flags = fragmentData.GetEnumValue<ObjectTypeFlags>("m_objectFlags", normalize: true);
+
+                    drawCall.DrawBounds = new AABB(worldBounds[0].ToVector3(), worldBounds[1].ToVector3());
+
+                    if (createDrawMeshlets)
+                    {
+                        CreateDrawMeshlet(drawCall);
+                    }
+
+                    var fragment = new Fragment(Scene, this, drawCall.DrawBounds.Value)
+                    {
+                        DrawCall = drawCall,
+                        RenderMesh = RenderMesh,
+                        Parent = this,
+                        LightingCache = SceneNodeLightingCache.FromHandshakes(new PrecomputedLightingHandshakes(0, lightProbeVolumeHandshake)),
+                        Flags = flags,
+                        Transform = rootTransform,
+                        PrecomputedVisClusters = worldNode?.GetAggregateMeshVisClusters(fragmentData),
+                    };
+
+                    yield return fragment;
+                }
+
+                yield break;
+            }
+
+            var transformIndex = 0;
+            var fragmentTransforms = aggregateSceneObject.GetArray("m_fragmentTransforms");
+
+            CanDrawIndirect = RenderMesh.DrawCallsOpaque.Count > 0;
+
+            // CS2 goes from aggregate mesh -> draw call (many meshes can share one draw call)
+            foreach (var fragmentData in aggregateMeshes)
+            {
+                var lightProbeVolumeHandshake = fragmentData.GetInt32Property("m_nLightProbeVolumePrecomputedHandshake");
+                var drawCallIndex = fragmentData.GetInt32Property("m_nDrawCallIndex");
+                var drawCall = RenderMesh.DrawCallsOpaque[drawCallIndex];
+                var drawBounds = drawCall.DrawBounds ?? throw new InvalidDataException("Draw call bounds must exist for all new format fragments");
+                var tintColor = fragmentData.GetSubCollection("m_vTintColor").ToVector3();
+                var flags = fragmentData.GetEnumValue<ObjectTypeFlags>("m_objectFlags", normalize: true);
+                var lodGroupMask = fragmentData.GetUInt32Property("m_nLODGroupMask");
+                var fragmentTransform = fragmentData.GetBooleanProperty("m_bHasTransform") ? fragmentTransforms[transformIndex++]
+                    : null;
+                // The compiler writes -1 for fragments that no setup governs
+                var lodSetupIndex = fragmentData.GetInt32Property("m_nLODSetupIndex", -1);
+
+                var fragment = new Fragment(Scene, this, drawBounds)
+                {
+                    DrawCall = drawCall,
+                    RenderMesh = RenderMesh,
+                    Tint = tintColor / 255f,
+                    Parent = this,
+                    LightingCache = SceneNodeLightingCache.FromHandshakes(new PrecomputedLightingHandshakes(0, lightProbeVolumeHandshake)),
+                    Flags = flags,
+                    LodGroupMask = lodGroupMask,
+                    LodSetupIndex = lodSetupIndex,
+                    PrecomputedVisClusters = worldNode?.GetAggregateMeshVisClusters(fragmentData),
+                    Transform = fragmentTransform != null
+                        ? fragmentTransform.ToMatrix4x4() * rootTransform
+                        : rootTransform,
+                };
+
+                yield return fragment;
+            }
+        }
+
+        /// <inheritdoc/>
+        public override IEnumerable<string> GetSupportedRenderModes() => RenderMesh.GetSupportedRenderModes();
+
+#if DEBUG
+        /// <inheritdoc/>
+        public override void UpdateVertexArrayObjects() => RenderMesh.UpdateVertexArrayObjects();
+#endif
+    }
+}

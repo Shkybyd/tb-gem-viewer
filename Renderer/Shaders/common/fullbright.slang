@@ -1,0 +1,29 @@
+#version 460
+
+#ifndef VRF_FULLBRIGHT_INCLUDE
+#define VRF_FULLBRIGHT_INCLUDE
+
+#include "utils.slang"
+
+float GetFullbrightAxisLight(vec3 normal)
+{
+    float XtraLight1 = dot(vec3(0.6, 0.4, 1.0), pow2(saturate(normal)));
+    float XtraLight2 = dot(vec3(0.6, 0.4, 0.2), pow2(saturate(-normal)));
+    return XtraLight1 + XtraLight2;
+}
+
+vec3 CalculateFullbrightLighting(vec3 albedo, vec3 normal, vec3 viewVector)
+{
+    float flFakeDiffuseLighting = saturate(dot(normal, viewVector)) * 0.7 + 0.3;
+
+    // Highlights where the surface faces the camera
+    vec3 vReflectionDirWs = reflect(-viewVector, normal);
+
+    float flFakeSpecularLighting = pow2(pow2(saturate(dot(viewVector, vReflectionDirWs)))) * 0.05;
+
+    float xtraLight = GetFullbrightAxisLight(normal);
+
+    return xtraLight * albedo * flFakeDiffuseLighting + flFakeSpecularLighting;
+}
+
+#endif

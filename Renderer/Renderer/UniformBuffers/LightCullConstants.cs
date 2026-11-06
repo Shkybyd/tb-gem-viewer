@@ -1,0 +1,67 @@
+using System.Runtime.InteropServices;
+
+namespace ValveResourceFormat.Renderer.Buffers
+{
+    /// <summary>Layout of one scene's cull masks, plus the view they were built against.</summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 16)]
+    public struct LightCullConstants
+    {
+        /// <summary>Index of the first word of the barn light screen tile mask region.</summary>
+        public uint LightTileBase;
+        /// <summary>Index of the first word of the barn light depth slice mask region.</summary>
+        public uint LightSliceBase;
+        /// <summary>Number of 32 bit words each barn light tile and slice mask occupies this frame.</summary>
+        public uint LightCullWords;
+        /// <summary>Right shift converting a pixel coordinate into a tile coordinate.</summary>
+        public uint LightTileShift;
+
+        /// <summary>Number of tile columns.</summary>
+        public uint LightTileCols;
+        /// <summary>Number of tile rows.</summary>
+        public uint LightTileRows;
+        /// <summary>Number of depth slices in the slice mask region.</summary>
+        public uint LightSliceCount;
+        /// <summary>First word of the env map tile mask region.</summary>
+        public uint EnvMapTileBase;
+
+        /// <summary>First word of the env map depth bin mask region.</summary>
+        public uint EnvMapBinBase;
+        /// <summary>Words per env map tile and bin mask this frame.</summary>
+        public uint EnvMapCullWords;
+        /// <summary>
+        /// Env map probe slots the shading pass may iterate. Bits past it exist in the last mask word but
+        /// name nothing, and the all ones masks written when binning is off do not distinguish them.
+        /// </summary>
+        public uint EnvMapCount;
+        /// <summary>Padding to maintain 16-byte struct alignment.</summary>
+        public uint _Padding0;
+
+        /// <summary>First word of the light probe volume tile mask region.</summary>
+        public uint LightProbeTileBase;
+        /// <summary>First word of the light probe volume depth bin mask region.</summary>
+        public uint LightProbeBinBase;
+        /// <summary>Words per light probe volume tile and bin mask this frame.</summary>
+        public uint LightProbeCullWords;
+        /// <summary>Light probe volume slots the shading pass may iterate. Zero outside probe atlas scenes.</summary>
+        public uint LightProbeCount;
+
+        /// <summary>Depth slice mapping: X slices per world unit, Y the last slice index.</summary>
+        public Vector4 LightDepthSliceParams;
+
+        /// <summary>
+        /// Maps this pass's pixel to the one the same ray occupies in the view the masks were built for:
+        /// xy scale, zw bias. Identity for the view that produced them.
+        /// </summary>
+        public Vector4 LightCullPixelRemap;
+
+        /// <summary>World-space position of the camera the masks were built for.</summary>
+        public Vector3 LightCullCameraPosition;
+        /// <summary>Padding to maintain 16-byte struct alignment.</summary>
+        public float _Padding1;
+
+        /// <summary>World-space forward direction of the camera the masks were built for.</summary>
+        public Vector3 LightCullCameraDir;
+        /// <summary>Padding to maintain 16-byte struct alignment.</summary>
+        public float _Padding2;
+    }
+}

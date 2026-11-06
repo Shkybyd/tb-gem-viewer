@@ -1,0 +1,53 @@
+using System.IO;
+using ValveResourceFormat.CompiledShader;
+
+namespace ValveResourceFormat.IO
+{
+    /// <summary>
+    /// Interface for loading compiled game resources.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Loads compiled resources (models, textures, materials) as <see cref="Resource"/> objects.
+    /// Implementations resolve paths across VPK packages and loose files.
+    /// </para>
+    /// </remarks>
+    public interface IFileLoader
+    {
+        /// <summary>
+        /// Loads a compiled resource file.
+        /// </summary>
+        /// <remarks>
+        /// To read raw file bytes from a VPK package, use <c>Package.ReadEntry</c> instead.
+        /// </remarks>
+        /// <param name="file">Path to the resource file to load.</param>
+        /// <returns>Loaded resource, or <c>null</c> if not found.</returns>
+        public Resource? LoadFile(string file);
+
+        /// <summary>
+        /// Same as <see cref="LoadFile"/> but appends <b>"_c"</b> to the end of the string.
+        /// </summary>
+        /// <param name="file">Path to the file to load (without _c suffix).</param>
+        /// <returns>Loaded compiled resource, or null if not found.</returns>
+        public Resource? LoadFileCompiled(string file);
+
+        /// <summary>
+        /// Loads a shader collection by name.
+        /// </summary>
+        /// <param name="shaderName">Name of the shader to load.</param>
+        /// <returns>Loaded shader collection, or null if not found.</returns>
+        public ShaderCollection? LoadShader(string shaderName);
+
+        /// <summary>
+        /// Opens a stream for reading a raw (uncompiled) file, such as a loose script text file.
+        /// </summary>
+        /// <param name="file">Path to the file to read.</param>
+        /// <returns>A readable stream, or null if not found.</returns>
+        public Stream? GetFileStream(string file);
+
+        /// <summary>
+        /// Gets the <c>gameinfo.gi</c> of the game the loaded files belong to, or <see cref="IO.GameInfo.Empty"/> when it is unknown.
+        /// </summary>
+        public GameInfo GameInfo => GameInfo.Empty;
+    }
+}

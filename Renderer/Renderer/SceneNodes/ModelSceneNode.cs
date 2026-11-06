@@ -1,0 +1,691 @@
+using System.Buffers;
+using System.Diagnostics;
+using System.Linq;
+using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
+using ValveResourceFormat.Particles;
+using ValveResourceFormat.Renderer.Materials;
+using ValveResourceFormat.ResourceTypes;
+using ValveResourceFormat.ResourceTypes.ModelAnimation;
+using ValveResourceFormat.ResourceTypes.ModelAnimation2;
+using ValveResourceFormat.ResourceTypes.ModelData.Attachments;
+using ValveResourceFormat.Serialization.KeyValues;
+
+namespace ValveResourceFormat.Renderer.SceneNodes
+{
+    /// <summary>
+    /// Scene node for rendering animated models with skeletal animation and morph targets.
+    /// </summary>
+    public partial class ModelSceneNode : MeshCollectionNode
+    {
+        /// <summary>Gets the model resource this node renders.</summary>
+        internal Model Model { get; }
+
+        /// <summary>Gets the animation controller managing skeletal pose and flex data for this model.</summary>
+        public AnimationController AnimationController { get; }
+
+        /// <summary>
+        /// A collection of animations available for playback on this model.
+        /// </summary>
+        public Dictionary<string, AnimationBase> Animations { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Gets the name of the currently active material group (skin).</summary>
+        public string ActiveMaterialGroup => activeMaterialGroup.Name;
+
+        /// <summary>Gets whether this model has at least one mesh renderer loaded.</summary>
+        public bool HasMeshes => meshRenderers.Count > 0;
+
+        private readonly List<RenderableMesh> meshRenderers = [];
+
+        internal override List<RenderableMesh> AllRenderableMeshes => meshRenderers;
+
+        private (string Name, string[] Materials) activeMaterialGroup;
+        private Dictionary<string, string>? materialTable;
+
+        private readonly (string Name, string[] Materials)[] materialGroups;
+
+        /// <summary>Gets the animation graphs the model is bound to, by identifier and resource name. The first is the default.</summary>
+        public IReadOnlyList<(string Identifier, string GraphPath)> AnimationGraphReferences { get; }
+
+        /// <summary>
+        /// Loads the model's meshes and animations.
+        /// </summary>
+        /// <param name="scene">The scene this node belongs to.</param>
+        /// <param name="model">The model resource to render.</param>
+        /// <param name="skin">The material group (skin) name to activate, or <see langword="null"/> for the default.</param>
+        /// <param name="isWorldPreview">When <see langword="true"/>, only embedded animations are loaded.</param>
+        public ModelSceneNode(Scene scene, Model model, string? skin = null, bool isWorldPreview = false)
+            : base(scene)
+        {
+            Model = model;
+            materialGroups = model.GetMaterialGroups().ToArray();
+            AnimationGraphReferences = model.AnimGraph2References;
+            meshGroups = model.MeshGroups;
+            lod = new ModelLodSelector(model.LodInfo);
+            referenceMeshes = model.GetReferenceMeshNamesAndLoD().ToList();
+
+            boneCount = model.Skeleton.Bones.Length;
+            remappingTable = model.BoneRemapTable.Table;
+            slotInverseBindPose = new Matrix4x4[remappingTable.Length];
+
+            if (skin != null)
+            {
+                SetMaterialGroup(skin);
+            }
+
+            Name = model.Name;
+
+            LoadMeshes(model);
+
+            AnimationController = new(model.Skeleton, model.FlexControllers, model.ClothRootPins);
+
+            foreach (var skeletonName in model.NmSkeletonRefs)
+            {
+                if (Skeleton.FromSkeletonResource(Scene.RendererContext.FileLoader, skeletonName) is { } skeleton)
+                {
+                    AnimationController.RegisterExternalSkeleton(skeletonName, skeleton);
+                }
+            }
+
+            UpdateBoundingBox();
+            LoadAnimations(model, embeddedAnimationsOnly: isWorldPreview);
+
+            SetCharacterEyeRenderParams();
+
+            // Read after LoadMeshes, which fills them in from external meshes.
+            Attachments = model.Attachments;
+            LightingOriginAttachment = Attachments.GetValueOrDefault("lighting_origin");
+            AnimationController.BoneConstraints = new BoneConstraintSolver(model);
+
+            // GetChildFrame already falls back to this node's own world Transform for an empty/
+            // unmatched name - AnimationController.Transform is not it (see its doc comment), so route through here.
+            AnimationController.ResolvePosition = attachmentName => GetChildFrame(attachmentName).Translation;
+            AnimationController.AnimationLookup = animationName => Animations.GetValueOrDefault(animationName);
+        }
+
+        readonly struct CharacterEyeParameters
+        {
+            public int LeftEyeBoneIndex { get; }
+            public Vector3 LeftEyePosition { get; }
+            public Vector3 LeftEyeForwardVector { get; } = Vector3.UnitX;
+            public Vector3 LeftEyeUpVector { get; } = Vector3.UnitZ;
+
+            public int RightEyeBoneIndex { get; }
+            public Vector3 RightEyePosition { get; }
+            public Vector3 RightEyeForwardVector { get; } = Vector3.UnitX;
+            public Vector3 RightEyeUpVector { get; } = Vector3.UnitZ;
+
+            public int TargetBoneIndex { get; }
+            public Vector3 TargetPosition { get; }
+
+            public bool AreValid => LeftEyeBoneIndex != -1 && RightEyeBoneIndex != -1 && TargetBoneIndex != -1;
+
+            public CharacterEyeParameters(AnimationController animationController)
+            {
+                var skeleton = animationController.FrameCache.Skeleton;
+
+                LeftEyeBoneIndex = skeleton.Bones.FirstOrDefault(b => b.Name == "eyeball_l")?.Index ?? -1;
+                RightEyeBoneIndex = skeleton.Bones.FirstOrDefault(b => b.Name == "eyeball_r")?.Index ?? -1;
+                TargetBoneIndex = skeleton.Bones.FirstOrDefault(b => b.Name == "eye_target")?.Index ?? -1;
+
+                if (!AreValid)
+                {
+                    return;
+                }
+
+                LeftEyePosition = animationController.BindPose[LeftEyeBoneIndex].Translation;
+                RightEyePosition = animationController.BindPose[RightEyeBoneIndex].Translation;
+                TargetPosition = animationController.BindPose[TargetBoneIndex].Translation;
+            }
+        }
+
+        /// <summary>
+        /// Detects eye materials on this model and injects bone index and bind-pose uniforms for eyeball rendering.
+        /// </summary>
+        private void SetCharacterEyeRenderParams()
+        {
+            var eyeEnablingMaterials = new List<(RenderableMesh Mesh, RenderMaterial Material)>();
+
+            foreach (var mesh in meshRenderers)
+            {
+                foreach (var drawCall in mesh.DrawCallsOpaque)
+                {
+                    if (drawCall.Material.IntParams.GetValueOrDefault("F_EYEBALLS") == 1)
+                    {
+                        eyeEnablingMaterials.Add((mesh, drawCall.Material));
+                    }
+                }
+            }
+
+            if (eyeEnablingMaterials.Count == 0)
+            {
+                return;
+            }
+
+            var eyes = new CharacterEyeParameters(AnimationController);
+
+            if (!eyes.AreValid)
+            {
+                return;
+            }
+
+            foreach (var (mesh, material) in eyeEnablingMaterials)
+            {
+                var materialData = material;
+
+                materialData.IntParams["g_nEyeLBindIdx"] = GetMeshBoneIndex(eyes.LeftEyeBoneIndex, mesh);
+                materialData.IntParams["g_nEyeRBindIdx"] = GetMeshBoneIndex(eyes.RightEyeBoneIndex, mesh);
+                materialData.IntParams["g_nEyeTargetBindIdx"] = GetMeshBoneIndex(eyes.TargetBoneIndex, mesh);
+
+                materialData.VectorParams["g_vEyeLBindPos"] = new Vector4(eyes.LeftEyePosition, 0);
+                materialData.VectorParams["g_vEyeLBindFwd"] = new Vector4(eyes.LeftEyeForwardVector, 0);
+                materialData.VectorParams["g_vEyeLBindUp"] = new Vector4(eyes.LeftEyeUpVector, 0);
+
+                materialData.VectorParams["g_vEyeRBindPos"] = new Vector4(eyes.RightEyePosition, 0);
+                materialData.VectorParams["g_vEyeRBindFwd"] = new Vector4(eyes.RightEyeForwardVector, 0);
+                materialData.VectorParams["g_vEyeRBindUp"] = new Vector4(eyes.RightEyeUpVector, 0);
+
+                materialData.VectorParams["g_vEyeTargetBindPos"] = new Vector4(eyes.TargetPosition, 0);
+            }
+        }
+
+        /// <inheritdoc/>
+        public override void Delete()
+        {
+            foreach (var mesh in meshRenderers)
+            {
+                if (mesh.FlexStateManager is { } flexStateManager)
+                {
+                    Scene.RendererContext.MorphAtlas.Release(flexStateManager.MorphComposite);
+                    flexStateManager.MorphComposite.Delete();
+                }
+            }
+
+            base.Delete();
+        }
+
+        /// <summary>
+        /// Gets or sets whether a thin model, such as a pane or a door, is lit from the side that faces the camera.
+        /// Its lighting origin moves off the center of the model toward that side.
+        /// </summary>
+        public bool FixupLightingOriginToViewer { get; set; }
+
+        // How far the lighting origin may leave the center of the model
+        private const float MaxViewerLightingOriginOffset = 18f;
+
+        /// <summary>Gets or sets the closed pose of a door, which it is lit from on the camera side.</summary>
+        public (Vector3 Position, Vector3 Normal)? DoorLightingPose { get; set; }
+
+        // The side only changes once the camera is past both the closed plane and a margin around the door as it stands
+        private const float DoorLightingSideMargin = 16f;
+
+        private void UpdateLightingOrigin(Vector3 viewer)
+        {
+            if (FixupLightingOriginToViewer)
+            {
+                UpdateLightingOriginToViewer(viewer);
+            }
+            else if (DoorLightingPose is { } doorPose)
+            {
+                UpdateDoorLightingOrigin(doorPose, viewer);
+            }
+
+            if (LightingOriginAttachment is { } attachment)
+            {
+                LightingOrigin = GetAttachmentTransform(attachment).Translation;
+            }
+        }
+
+        private void UpdateDoorLightingOrigin((Vector3 Position, Vector3 Normal) pose, Vector3 viewer)
+        {
+            var closedSide = Vector3.Dot(viewer - pose.Position, pose.Normal);
+            var doorSide = Vector3.Dot(viewer - BoundingBox.Center, pose.Normal);
+
+            var inFront = LightingOrigin is not { } current
+                ? closedSide > 0f
+                : Vector3.Dot(current - pose.Position, pose.Normal) > 0f
+                    ? closedSide >= 0f || doorSide >= -DoorLightingSideMargin
+                    : closedSide > 0f && doorSide > DoorLightingSideMargin;
+
+            LightingOrigin = pose.Position + pose.Normal * (inFront ? MaxViewerLightingOriginOffset : -MaxViewerLightingOriginOffset);
+        }
+
+        // Where a thin model is lit from. The origin sits in front of the center, along the thinnest axis, on the
+        // viewer's side. Close to the plane, within half its thickness, the side stays as it was so it does not flicker.
+        private void UpdateLightingOriginToViewer(Vector3 viewer)
+        {
+            var localBounds = LocalBoundingBox;
+            var size = localBounds.Max - localBounds.Min;
+            var extents = new Vector3(
+                size.X * Transform.AxisScale(0),
+                size.Y * Transform.AxisScale(1),
+                size.Z * Transform.AxisScale(2));
+
+            var axis = 2;
+
+            if (extents.X < extents.Y)
+            {
+                if (extents.Z > extents.X)
+                {
+                    axis = 0;
+                }
+            }
+            else if (extents.Z > extents.Y)
+            {
+                axis = 1;
+            }
+
+            var localNormal = Vector3.Zero;
+            localNormal[axis] = 1f;
+
+            var normal = Vector3.Normalize(Vector3.TransformNormal(localNormal, Transform));
+            var center = Vector3.Transform(localBounds.Center, Transform);
+            var side = Vector3.Dot(viewer - center, normal);
+            var deadZone = LightingOrigin.HasValue ? extents[axis] * 0.5f : -1f;
+
+            float direction;
+
+            if (side > deadZone)
+            {
+                direction = 1f;
+            }
+            else if (side < -deadZone)
+            {
+                direction = -1f;
+            }
+            else
+            {
+                return;
+            }
+
+            var otherExtent = MathF.Min(extents[(axis + 1) % 3], extents[(axis + 2) % 3]);
+            var offset = MathF.Min(otherExtent * 0.5f, MaxViewerLightingOriginOffset);
+            var origin = center + normal * (direction * offset);
+
+            LightingOrigin = new Vector3(MathF.Floor(origin.X + 0.5f), MathF.Floor(origin.Y + 0.5f), MathF.Floor(origin.Z + 0.5f));
+        }
+
+        /// <inheritdoc/>
+        public override void Update(Scene.UpdateContext context)
+        {
+            UpdateLightingOrigin(context.Camera.Location);
+            UpdateAutoLod(context.Camera);
+            var animationUpdated = AnimationController.Update(context.Timestep);
+
+            if (!animationUpdated)
+            {
+                return;
+            }
+
+            if (IsAnimated)
+            {
+                Scene.UpdateSkinningTransforms(this);
+                UpdateAnimatedBoundingBox();
+            }
+
+            if (AnimationController.AnimationFrame != null)
+            {
+                UpdateFlexControllers();
+            }
+        }
+
+        /// <summary>
+        /// Pushes the frame's flex controller values, with the constraint driven morphs applied, to every mesh that morphs.
+        /// </summary>
+        private void UpdateFlexControllers()
+        {
+            var datas = AnimationController.FlexValues!;
+
+            foreach (var renderableMesh in RenderableMeshes)
+            {
+                if (renderableMesh.FlexStateManager == null)
+                {
+                    continue;
+                }
+
+                if (renderableMesh.FlexStateManager.SetControllerValues(datas))
+                {
+                    renderableMesh.FlexStateManager.UpdateComposite();
+                    Scene.RendererContext.MorphAtlas.Queue(renderableMesh.FlexStateManager.MorphComposite);
+                }
+            }
+        }
+
+        /// <inheritdoc/>
+        public override IEnumerable<string> GetSupportedRenderModes()
+            => meshRenderers.SelectMany(static renderer => renderer.GetSupportedRenderModes());
+
+        /// <summary>
+        /// Activates the named material group (skin), remapping all mesh materials accordingly.
+        /// </summary>
+        public void SetMaterialGroup(string name)
+        {
+            if (materialGroups.Length == 0)
+            {
+                return;
+            }
+
+            if (materialTable is null)
+            {
+                var @default = materialGroups[0];
+                activeMaterialGroup = @default;
+                materialTable = new(materialGroups[0].Materials.Length);
+
+                if (name == @default.Name)
+                {
+                    return;
+                }
+            }
+
+            foreach (var materialGroup in materialGroups)
+            {
+                if (name == materialGroup.Name)
+                {
+                    materialTable.Clear();
+
+                    foreach (var (Active, Replacement) in activeMaterialGroup.Materials.Zip(materialGroup.Materials))
+                    {
+                        materialTable[Active] = Replacement;
+                    }
+
+                    activeMaterialGroup = materialGroup;
+
+                    foreach (var mesh in meshRenderers)
+                    {
+                        mesh.ReplaceMaterials(materialTable);
+                    }
+                }
+            }
+        }
+
+        private IEnumerable<AnimationBase> GetAllAnimations(Model model)
+        {
+            if (model.Resource.FileName is not { } fileName)
+            {
+                return LoadAllAnimations(model);
+            }
+
+            return Scene.RendererContext.ModelAnimations
+                .GetOrAdd(fileName, _ => new Lazy<List<AnimationBase>>(() => [.. LoadAllAnimations(model)]))
+                .Value;
+        }
+
+        private IEnumerable<AnimationBase> LoadAllAnimations(Model model)
+        {
+            var fileLoader = Scene.RendererContext.FileLoader;
+
+            try
+            {
+                return model.GetAllAnimations(fileLoader);
+            }
+            catch (Exception e) when (model.AnimGraph2References.Count > 0)
+            {
+                Scene.RendererContext.Logger.LogError(e, "Failed to load the animation graph clips of '{Model}', loading it without them", model.Name);
+                return model.GetAllAnimations(fileLoader, includeAnimationGraphClips: false);
+            }
+        }
+
+        private void LoadAnimations(Model model, bool embeddedAnimationsOnly)
+        {
+            var animations = (embeddedAnimationsOnly
+                ? model.GetEmbeddedAnimations()
+                : GetAllAnimations(model)).ToList();
+
+            animations.RemoveAll(animation => !AnimationController.IsPlayable(animation));
+
+            AddAnimations(animations);
+
+            var sequenceGroup = model.SequenceGroup;
+
+            foreach (var (name, boneWeights) in sequenceGroup.GetBoneMasks())
+            {
+                AnimationController.RegisterBoneMask(name, boneWeights);
+            }
+
+            foreach (var (name, morphWeights) in sequenceGroup.GetMorphMasks(model.FlexControllers))
+            {
+                AnimationController.RegisterMorphMask(name, morphWeights);
+            }
+
+            foreach (var poseParameter in sequenceGroup.GetPoseParameters())
+            {
+                AnimationController.RegisterPoseParameter(poseParameter);
+            }
+
+            if (Animations.Count != 0)
+            {
+                SetupSkinning();
+            }
+        }
+
+        /// <summary>
+        /// Adds the given animations to the collection of available animations for this model,
+        /// prewarming any sound events they can fire so first playback stays allocation-free.
+        /// </summary>
+        private void AddAnimations(List<AnimationBase> animations)
+        {
+            Animations.EnsureCapacity(animations.Count);
+            foreach (var anim in animations)
+            {
+                Animations[anim.Name] = anim;
+                AnimationPlayer.PrewarmAnimationSounds(anim);
+            }
+        }
+
+        /// <summary>
+        /// Loads an animgraph2 clip from the given <see cref="AnimationClip"/> instance and makes it available for playback on this model.
+        /// </summary>
+        public void LoadAnimationClip(AnimationClip clip)
+        {
+            var anim = new ClipAnimation(clip);
+            Animations[anim.Name] = anim;
+            AnimationPlayer.PrewarmAnimationSounds(anim);
+            SetupSkinning();
+        }
+
+        /// <summary>
+        /// Loads an animgraph2 clip from the file system and makes it available for playback on this model.
+        /// </summary>
+        /// <param name="clipName">Clip resource name.</param>
+        /// <returns><see langword="true"/> if the clip was found and loaded; otherwise <see langword="false"/>.</returns>
+        public bool LoadAnimationClip(string clipName)
+        {
+            if (!clipName.EndsWith(".vnmclip", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException($"Clip must be a {ResourceType.NmClip} resource.", nameof(clipName));
+            }
+
+            if (Animations.ContainsKey(clipName))
+            {
+                return true;
+            }
+
+            var clipResource = Scene.RendererContext.FileLoader.LoadFileCompiled(clipName);
+            if (clipResource?.DataBlock is not AnimationClip clip)
+            {
+                return false;
+            }
+
+            LoadAnimationClip(clip);
+            return true;
+        }
+
+        private void LoadMeshes(Model model)
+        {
+            var modelInverseBindPose = BindPoseModelObject.GetInverseBindPose(model);
+
+            // All LoD levels are loaded; the active one is picked at render time.
+            foreach (var embeddedMesh in model.GetEmbeddedMeshes())
+            {
+                embeddedMesh.Mesh.LoadExternalMorphData(Scene.RendererContext.FileLoader);
+                model.SetExternalMorphData(embeddedMesh.Mesh.MorphData);
+
+                meshRenderers.Add(new RenderableMesh(embeddedMesh.Mesh, embeddedMesh.MeshIndex, Scene, model, materialTable, embeddedMesh.Mesh.MorphData));
+                SetSlotInverseBindPose(model, embeddedMesh.Mesh, embeddedMesh.MeshIndex, modelInverseBindPose);
+            }
+
+            foreach (var refMesh in referenceMeshes)
+            {
+                var newResource = Scene.RendererContext.FileLoader.LoadFileCompiled(refMesh.MeshName);
+                if (newResource?.DataBlock is not Mesh mesh)
+                {
+                    continue;
+                }
+
+                mesh.LoadExternalMorphData(Scene.RendererContext.FileLoader);
+                model.SetExternalMeshData(mesh);
+
+                meshRenderers.Add(new RenderableMesh(mesh, refMesh.MeshIndex, Scene, model, materialTable));
+                SetSlotInverseBindPose(model, mesh, refMesh.MeshIndex, modelInverseBindPose);
+            }
+
+            SetActiveMeshGroups(model.MeshGroups.Defaults);
+        }
+
+        /// <summary>Activates the animation with the given name, or stops animation if not found.</summary>
+        public void SetAnimationByName(string animationName, float blendTime = 0f, bool warp = false)
+        {
+            Animations.TryGetValue(animationName, out var activeAnimation);
+            SetAnimation(activeAnimation, blendTime, warp);
+        }
+
+        /// <summary>
+        /// Activates the named animation for world preview mode.
+        /// </summary>
+        /// <returns><see langword="true"/> if the animation was found and activated; otherwise <see langword="false"/>.</returns>
+        public bool SetAnimationForWorldPreview(string animationName)
+        {
+            AnimationBase? activeAnimation = null;
+
+            if (animationName != null)
+            {
+                Animations.TryGetValue(animationName, out activeAnimation);
+            }
+
+            // TODO: CS2 falls back to the first animation, but other games seemingly do not.
+            //activeAnimation ??= animations.FirstOrDefault(); // Fallback to the first animation
+
+            if (activeAnimation != null)
+            {
+                SetAnimation(activeAnimation);
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>Finds the first sequence that is not hidden and plays the named activity.</summary>
+        /// <param name="activityName">The activity name, such as <c>ACT_IDLE</c>.</param>
+        /// <returns>The sequence, or <see langword="null"/> when no sequence plays the activity.</returns>
+        public SequenceAnimation? FindSequenceByActivity(string activityName)
+        {
+            foreach (var animation in Animations.Values)
+            {
+                if (animation is not SequenceAnimation { Hidden: false } sequence)
+                {
+                    continue;
+                }
+
+                if (Array.Exists(sequence.Activities, activity => activity.Name.Equals(activityName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return sequence;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>Activates the given animation instance with a blend-in time, or clears the active animation when <see langword="null"/>.</summary>
+        /// <param name="activeAnimation">The animation to activate, or <see langword="null"/> to clear.</param>
+        /// <param name="blendTime">The time in seconds to blend from the current animation to the new one.</param>
+        /// <param name="warp">Whether re-activating the animation already playing should cross over
+        /// into a second instance of it rather than restarting it in place.</param>
+        public void SetAnimation(AnimationBase? activeAnimation, float blendTime = 0f, bool warp = false)
+        {
+            AnimationController.SetAnimation(activeAnimation, blendTime, warp);
+            UpdateBoundingBox();
+
+            if (activeAnimation != default)
+            {
+                foreach (var renderer in meshRenderers)
+                {
+                    renderer.SetSkinningActive(IsAnimated);
+                }
+            }
+            else
+            {
+                foreach (var renderer in meshRenderers)
+                {
+                    renderer.SetSkinningActive(false);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Loads an animation graph to play on this model, reusing the clips the node already loaded. Each node
+        /// needs its own instance, which holds the playback state.
+        /// </summary>
+        /// <param name="graphPath">The graph resource name, such as one of <see cref="AnimationGraphReferences"/>.</param>
+        /// <returns>The graph, or <see langword="null"/> when it or a skeleton it animates could not be loaded.</returns>
+        public AnimationGraph? LoadAnimationGraph(string graphPath)
+        {
+            var fileLoader = Scene.RendererContext.FileLoader;
+
+            try
+            {
+                if (fileLoader.LoadFileCompiled(graphPath) is not { ResourceType: ResourceType.NmGraph, DataBlock: BinaryKV3 graphDefinition })
+                {
+                    return null;
+                }
+
+                return AnimationGraph.TryLoad(graphDefinition, fileLoader, clipName => Animations.GetValueOrDefault(clipName) as ClipAnimation);
+            }
+            catch (Exception e)
+            {
+                // The graph format changes over time, and one that cannot be read must not take the model down with it
+                Scene.RendererContext.Logger.LogError(e, "Failed to load animation graph '{Graph}'", graphPath);
+                return null;
+            }
+        }
+
+        /// <summary>Plays the model's default animation graph.</summary>
+        /// <returns><see langword="true"/> when the model has a default graph and it loaded.</returns>
+        public bool PlayDefaultAnimationGraph()
+        {
+            if (AnimationGraphReferences.Count == 0 || LoadAnimationGraph(AnimationGraphReferences[0].GraphPath) is not { } graph)
+            {
+                return false;
+            }
+
+            SetAnimationGraph(graph);
+            return true;
+        }
+
+        /// <summary>
+        /// Plays an animation graph on this model, binding the skinning buffers the same way
+        /// <see cref="SetAnimation"/> does. Pass <see langword="null"/> to detach the graph.
+        /// </summary>
+        /// <param name="graph">The animation graph to play, or <see langword="null"/> to detach.</param>
+        public void SetAnimationGraph(IAnimationGraph? graph)
+        {
+            AnimationController.SetAnimationGraph(graph);
+            UpdateBoundingBox();
+
+            foreach (var renderer in meshRenderers)
+            {
+                renderer.SetSkinningActive(graph != null && IsAnimated);
+            }
+        }
+
+#if DEBUG
+        /// <inheritdoc/>
+        public override void UpdateVertexArrayObjects()
+        {
+            foreach (var renderer in meshRenderers)
+            {
+                renderer.UpdateVertexArrayObjects();
+            }
+        }
+#endif
+    }
+}

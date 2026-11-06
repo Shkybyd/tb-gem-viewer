@@ -1,0 +1,171 @@
+using System.Diagnostics;
+using ValveResourceFormat.ResourceTypes;
+
+namespace ValveResourceFormat.Renderer.SceneNodes
+{
+    /// <summary>
+    /// Carries the posed skeleton to the GPU, and the bounding box that follows the pose.
+    /// </summary>
+    public partial class ModelSceneNode
+    {
+        private bool IsAnimated { get; set; }
+
+        private readonly int boneCount;
+
+        private readonly ReadOnlyMemory<int> remappingTable;
+
+        /// <summary>
+        /// The inverse bind pose of every slot of <see cref="remappingTable"/>, as the slot's mesh is skinned with it.
+        /// </summary>
+        private readonly Matrix4x4[] slotInverseBindPose;
+
+        /// <summary>
+        /// The mesh-local bone index for the given model-level bone index, within that mesh's slice of
+        /// the remapping table.
+        /// </summary>
+        private int GetMeshBoneIndex(int modelBoneIndex, RenderableMesh mesh)
+            => remappingTable.Span.Slice(mesh.MeshBoneOffset, mesh.MeshBoneCount).IndexOf(modelBoneIndex);
+
+        // Slots from a model's transform to its first bone, with one transform in between
+        internal const int BoneTransformStart = 2;
+
+        internal int SkinningTransformCount
+            => remappingTable.Length == 0 ? 0 : BoneTransformStart - 1 + remappingTable.Length;
+
+        internal uint TransformSlot { get; set; }
+
+        internal void WriteSkinningTransforms(Span<OpenTK.Mathematics.Matrix3x4> destination)
+        {
+            if (!IsAnimated)
+            {
+                return;
+            }
+
+            var meshBoneCount = remappingTable.Length;
+
+            Debug.Assert(destination.Length == BoneTransformStart - 1 + meshBoneCount);
+
+            var boneTransforms = destination[(BoneTransformStart - 1)..];
+            var pose = AnimationController.Pose;
+            var meshBoneRemap = remappingTable.Span;
+
+            var identity = Matrix4x4.Identity.To3x4();
+
+            for (var slot = 0; slot < meshBoneCount; slot++)
+            {
+                var modelBoneIndex = meshBoneRemap[slot];
+                var modelBoneExists = modelBoneIndex < boneCount && modelBoneIndex != -1;
+
+                boneTransforms[slot] = modelBoneExists
+                    ? (slotInverseBindPose[slot] * pose[modelBoneIndex]).To3x4()
+                    : identity;
+            }
+        }
+
+        /// <summary>
+        /// Stores the inverse bind pose a mesh is skinned with in the slots of its bones.
+        /// </summary>
+        private void SetSlotInverseBindPose(Model model, Mesh mesh, int meshIndex, Matrix4x4[] modelInverseBindPose)
+        {
+            var meshStart = model.BoneRemapTable.GetMeshStart(meshIndex);
+
+            model.GetSkinningInverseBindPose(mesh, meshIndex, modelInverseBindPose).CopyTo(slotInverseBindPose, meshStart);
+        }
+
+        /// <summary>
+        /// Bone merges this model onto another: from now on it stops animating itself and takes its pose
+        /// from <paramref name="parent"/> on every update, the way Source attaches one model to the
+        /// skeleton of another.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Bones are matched by name. A bone the parent lacks keeps its bind offset from its own parent bone.
+        /// </para>
+        /// <para>
+        /// The pose is taken as it stood before <paramref name="parent"/> hid any bones for the first
+        /// person view, so a model merged onto first person legs still has its upper body.
+        /// </para>
+        /// <para>
+        /// Update <paramref name="parent"/> before this node each frame, or the pose trails it by a frame.
+        /// </para>
+        /// </remarks>
+        /// <param name="parent">The node whose pose this one takes.</param>
+        internal void BoneMerge(ModelSceneNode parent)
+        {
+            AnimationController.SetBoneMergeParent(parent.AnimationController);
+
+            // A model with no animations of its own, such as clothing, is only skinned once it is merged
+            SetupSkinning();
+
+            foreach (var renderer in meshRenderers)
+            {
+                renderer.SetSkinningActive(IsAnimated);
+            }
+        }
+
+        private void SetupSkinning()
+        {
+            IsAnimated = boneCount > 0;
+        }
+
+        private void UpdateBoundingBox()
+        {
+            var first = true;
+            foreach (var mesh in meshRenderers)
+            {
+                LocalBoundingBox = first ? mesh.BoundingBox : LocalBoundingBox.Union(mesh.BoundingBox);
+                first = false;
+            }
+        }
+
+        /// <summary>
+        /// Fits the local bounding box to the current pose by placing each bone's authored sphere at that
+        /// bone's posed origin.
+        /// </summary>
+        private void UpdateAnimatedBoundingBox()
+        {
+            const bool SkipNonSkinningBones = true;
+
+            var spheres = AnimationController.Skeleton.BoneSpheres;
+
+            if (spheres.Length == 0)
+            {
+                return;
+            }
+
+            var pose = AnimationController.Pose;
+
+            var min = new Vector3(float.MaxValue);
+            var max = new Vector3(float.MinValue);
+            var anyBoneContributed = false;
+
+            for (var boneIndex = 0; boneIndex < spheres.Length; boneIndex++)
+            {
+                if (SkipNonSkinningBones && spheres[boneIndex] <= 0f)
+                {
+                    continue;
+                }
+
+                var bone = pose[boneIndex];
+
+                // A bone's scale is uniform in practice; its X axis stands in for all three.
+                var scale = bone.AxisScale(0);
+
+                var radius = new Vector3(spheres[boneIndex] * scale);
+                var origin = bone.Translation;
+
+                min = Vector3.Min(min, origin - radius);
+                max = Vector3.Max(max, origin + radius);
+                anyBoneContributed = true;
+            }
+
+            if (!anyBoneContributed)
+            {
+                UpdateBoundingBox();
+                return;
+            }
+
+            LocalBoundingBox = new AABB(min, max);
+        }
+    }
+}

@@ -1,0 +1,112 @@
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using ValveKeyValue;
+using ValveResourceFormat.Serialization.KeyValues;
+
+namespace ValveResourceFormat.CompiledShader;
+
+/// <summary>
+/// Header block for shader features files.
+/// </summary>
+public class FeaturesHeaderBlock : ShaderDataBlock
+{
+    /// <summary>
+    /// Gets the shader source version. It increments whenever the source changes and is identical
+    /// across all platforms and shader models.
+    /// </summary>
+    public int Version { get; }
+    /// <summary>Gets the file description.</summary>
+    public string FileDescription { get; }
+    /// <summary>Gets whether this is a development shader.</summary>
+    public bool DevShader { get; }
+    /// <summary>
+    /// Gets which programs are present, indexed by the file's program slot. Slots match <see cref="VcsProgramType"/>
+    /// before version 68, which removed the hull and domain shader slots.
+    /// </summary>
+    public bool[] AvailablePrograms { get; }
+    /// <summary>Gets the list of shader modes.</summary>
+    public List<(string Name, string ShaderFallback, string StaticComboName, int StaticComboValue)> Modes { get; } = [];
+
+    /// <summary>
+    /// Initializes a new instance from <see cref="KVObject"/> data.
+    /// </summary>
+    public FeaturesHeaderBlock(KVObject data)
+    {
+        Version = data.GetInt32Property("m_nVersion");
+        FileDescription = data.GetStringProperty("m_description");
+        DevShader = data.GetBooleanProperty("m_bDevShader");
+        AvailablePrograms = data.GetArray<bool>("m_bHasShaderProgram")!;
+
+        var modeArray = data.GetArray("m_modeArray");
+        Modes.EnsureCapacity(modeArray.Count);
+
+        foreach (var modeObj in modeArray)
+        {
+            var name = modeObj.GetStringProperty("m_szName");
+            var shaderFallback = modeObj.GetStringProperty("m_szShaderFallback");
+
+            var mode = (name, shaderFallback, StaticComboName: string.Empty, StaticComboValue: -1);
+
+            var settings = modeObj.GetArray("m_staticComboSettings")!;
+            if (settings.Count > 0)
+            {
+                Debug.Assert(settings.Count <= 1, "CVfxModeSettings with more than one combo.");
+
+                var setting = settings[0];
+                mode.StaticComboName = setting.GetStringProperty("m_szStaticCombo");
+                mode.StaticComboValue = setting.GetInt32Property("m_nValue");
+            }
+
+            Modes.Add(mode);
+        }
+    }
+
+    /// <summary>
+    /// Initializes a new instance from a binary reader.
+    /// </summary>
+    public FeaturesHeaderBlock(BinaryReader datareader, int programTypesCount) : base(datareader)
+    {
+        Version = datareader.ReadInt32();
+
+        var descriptionLength = datareader.ReadInt32();
+        FileDescription = datareader.ReadNullTermString(Encoding.UTF8);
+        UnexpectedMagicException.Assert(FileDescription.Length == descriptionLength, descriptionLength);
+
+        // For some reason valve is storing booleans as ints
+        DevShader = datareader.ReadInt32() != 0;
+
+        AvailablePrograms = new bool[programTypesCount];
+
+        for (var i = 0; i < programTypesCount; i++)
+        {
+            AvailablePrograms[i] = datareader.ReadInt32() != 0;
+        }
+
+        var modeCount = datareader.ReadInt32();
+
+        for (var i = 0; i < modeCount; i++)
+        {
+            // CVfxMode::Unserialize
+            var name = ReadStringWithMaxLength(datareader, 64);
+            var shaderFallback = ReadStringWithMaxLength(datareader, 64);
+
+            var modeSettingsCount = datareader.ReadInt32();
+
+            var staticComboName = string.Empty;
+            var staticComboValue = -1;
+            if (modeSettingsCount > 0)
+            {
+                Debug.Assert(modeSettingsCount == 1); // we never supported more than 1 here
+
+                for (var j = 0; j < modeSettingsCount; j++)
+                {
+                    // CVfxModeSettings::Unserialize
+                    staticComboName = ReadStringWithMaxLength(datareader, 64);
+                    staticComboValue = datareader.ReadInt32();
+                }
+            }
+            Modes.Add((name, shaderFallback, staticComboName, staticComboValue));
+        }
+    }
+}

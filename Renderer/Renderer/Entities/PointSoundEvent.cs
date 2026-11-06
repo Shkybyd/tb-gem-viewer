@@ -1,0 +1,119 @@
+using ValveResourceFormat.Renderer.Audio;
+using ValveResourceFormat.Renderer.SceneNodes;
+using ValveResourceFormat.Serialization.KeyValues;
+
+namespace ValveResourceFormat.Renderer.Entities;
+
+/// <summary>
+/// <c>point_soundevent</c>. Plays a sound event, either the moment the map starts or whenever entity I/O
+/// tells it to.
+/// </summary>
+/// <seealso href="https://s2v.app/SchemaExplorer/cs2/server/CSoundEventEntity">CSoundEventEntity</seealso>
+public sealed class PointSoundEvent : BaseEntity
+{
+    /// <summary>Gets the sound event this plays.</summary>
+    public string? SoundName { get; private set; }
+
+    /// <summary>Gets whether the sound is playing.</summary>
+    public bool IsPlaying => playing.Playing;
+
+    private SoundHandle playing;
+
+    /// <summary>Initializes a <c>point_soundevent</c> from its keyvalues.</summary>
+    public PointSoundEvent(EntitySystem system, EntitySpawnInfo spawnInfo) : base(system, spawnInfo)
+    {
+    }
+
+    /// <inheritdoc/>
+    public override void Spawn()
+    {
+        base.Spawn();
+
+        SoundName = KeyValues.GetStringProperty("soundname");
+    }
+
+    /// <inheritdoc/>
+    public override void Activate()
+    {
+        if (!KeyValues.GetBooleanProperty("startonspawn"))
+        {
+            return;
+        }
+
+        // Starts on the first tick, not here: entities activate while the map is still loading and it
+        // should not be audible before it is on screen
+        SetNextThink(EntitySystem.CurrentTime + EntitySystem.TickInterval);
+    }
+
+    /// <inheritdoc/>
+    public override void Think() => StartSound();
+
+    /// <summary>Starts the sound, restarting it if it was already going.</summary>
+    public void StartSound()
+    {
+        if (string.IsNullOrEmpty(SoundName))
+        {
+            return;
+        }
+
+        StopSound();
+
+        playing = Sound.Play(SoundName, GetEmitPosition());
+    }
+
+    /// <summary>Stops the sound, if it is playing.</summary>
+    public void StopSound()
+    {
+        playing.Stop();
+        playing = default;
+    }
+
+    /// <inheritdoc/>
+    protected override void OnRemove()
+    {
+        StopSound();
+
+        base.OnRemove();
+    }
+
+    [EntityInput("StartSound")]
+    private void InputStartSound(EntityInputData data) => StartSound();
+
+    [EntityInput("StopSound")]
+    private void InputStopSound(EntityInputData data) => StopSound();
+
+    // The source entity's attachment or origin, else this entity's position;
+    // null plays flat on the listener (tolocalplayer)
+    private Vector3? GetEmitPosition()
+    {
+        if (KeyValues.GetBooleanProperty("tolocalplayer"))
+        {
+            return null;
+        }
+
+        var sourceEntityName = KeyValues.GetStringProperty("sourceentityname");
+
+        if (string.IsNullOrEmpty(sourceEntityName)
+            || EntitySystem.FindByTargetName(sourceEntityName)?.RootNode is not { } sourceNode)
+        {
+            return Transform.Translation;
+        }
+
+        var attachmentName = KeyValues.GetStringProperty("sourceentityattachment");
+
+        if (!string.IsNullOrEmpty(attachmentName)
+            && sourceNode is ModelSceneNode sourceModel
+            && sourceModel.Attachments.ContainsKey(attachmentName))
+        {
+            return sourceModel.GetAttachmentTransform(attachmentName).Translation;
+        }
+
+        // The offset is authored relative to the source, and this entity was placed at the result of it
+        if (KeyValues.GetBooleanProperty("uselocaloffset"))
+        {
+            return Transform.Translation;
+        }
+
+        return sourceNode.Transform.Translation;
+    }
+}

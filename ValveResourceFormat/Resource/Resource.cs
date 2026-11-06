@@ -1,0 +1,745 @@
+using System.Buffers;
+using System.Collections;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
+using ValvePak;
+using ValveResourceFormat.Blocks;
+using ValveResourceFormat.Blocks.ResourceEditInfoStructs;
+using ValveResourceFormat.CompiledShader;
+using ValveResourceFormat.ResourceTypes;
+using ValveResourceFormat.ResourceTypes.GenericData;
+
+namespace ValveResourceFormat
+{
+    /// <summary>
+    /// Represents a compiled Source 2 resource file, such as a <c>.vtex_c</c> or <c>.vmdl_c</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Create an instance, then call <see cref="Read(string, ReadMode)"/> or <see cref="Read(Stream, bool, ReadMode)"/>.
+    /// Check <see cref="ResourceType"/> and cast <see cref="DataBlock"/> to the matching block class.
+    /// </para>
+    /// <para>
+    /// Blocks and the data they expose are read from the input stream when first accessed, so the
+    /// resource must stay undisposed and its input stream open for as long as its blocks are used.
+    /// </para>
+    /// </remarks>
+    public class Resource : IDisposable
+    {
+        /// <summary>
+        /// The known and expected header version for resource files.
+        /// </summary>
+        public const ushort KnownHeaderVersion = 12;
+
+        private FileStream? FileStream;
+
+        // Serializes reads through Reader after Read returns: on-demand blocks and lazily decoded buffers
+        internal Lock ReaderLock { get; } = new();
+
+        /// <summary>
+        /// Gets the binary reader. USE AT YOUR OWN RISK!
+        /// It is exposed publicly to ease reading the same file.
+        /// </summary>
+        /// <value>The binary reader.</value>
+        public BinaryReader? Reader { get; private set; }
+
+        /// <summary>
+        /// Gets or sets the file name this resource was parsed from.
+        /// </summary>
+        public string? FileName { get; set; }
+
+        /// <summary>
+        /// Gets the resource size.
+        /// </summary>
+        public uint FileSize { get; private set; }
+
+        /// <summary>
+        /// Gets the version of this resource, should be 12.
+        /// </summary>
+        public ushort HeaderVersion { get; private set; }
+
+        /// <summary>
+        /// Gets the file type version.
+        /// </summary>
+        public ushort Version { get; private set; }
+
+        private readonly BlockList blocks = new();
+
+        /// <summary>
+        /// Gets the blocks this resource contains, each parsed by the time it is returned.
+        /// </summary>
+        public IReadOnlyList<Block> Blocks => blocks;
+
+        /// <summary>
+        /// Gets the blocks without parsing the ones a <see cref="ReadMode.Deferred"/> read left unparsed.
+        /// </summary>
+        internal List<Block> UnparsedBlocks => blocks.Items;
+
+        /// <summary>
+        /// Gets the type of the resource, which decides the class of <see cref="DataBlock"/>.
+        /// It comes from the file extension of <see cref="FileName"/> when set, otherwise from the edit info block,
+        /// and is <see cref="ResourceType.Unknown"/> when neither identifies it.
+        /// </summary>
+        /// <value>The type of the resource.</value>
+        public ResourceType ResourceType { get; private set; }
+
+        /// <summary>
+        /// Gets the <see cref="ResourceEditInfo"/> block.
+        /// </summary>
+        public ResourceEditInfo? EditInfo
+        {
+            get
+            {
+                editInfo?.EnsureRead();
+                return editInfo;
+            }
+        }
+
+        private ResourceEditInfo? editInfo;
+
+        /// <summary>
+        /// Gets the <see cref="ResourceExtRefList"/> block.
+        /// </summary>
+        public ResourceExtRefList? ExternalReferences => (ResourceExtRefList?)GetBlockByType(BlockType.RERL);
+
+        /// <summary>
+        /// Gets the DATA block, which holds the main contents of the resource.
+        /// Its class depends on <see cref="ResourceType"/>, for example <see cref="ResourceTypes.Texture"/>
+        /// for textures. It is <c>null</c> when the resource has no DATA block.
+        /// </summary>
+        public Block? DataBlock => GetBlockByType(BlockType.DATA);
+
+        /// <summary>
+        /// Resource files have a <see cref="FileSize"/> in the metadata, however
+        /// certain file types such as sounds have streaming audio data come
+        /// after the resource file, and the size is specified within the DATA block.
+        /// This property attempts to return the correct size.
+        /// </summary>
+        public uint FullFileSize
+        {
+            get
+            {
+                var size = FileSize;
+
+                if (ResourceType == ResourceType.Sound && DataBlock is Sound dataSound)
+                {
+                    size += dataSound.StreamingDataSize;
+                }
+                else if (ResourceType == ResourceType.Texture && DataBlock is Texture dataTexture)
+                {
+                    size += (uint)dataTexture.CalculateTextureDataSize();
+                }
+
+                return size;
+            }
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Resource"/> class.
+        /// </summary>
+        public Resource()
+        {
+            ResourceType = ResourceType.Unknown;
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Resource"/> class for creating new resources.
+        /// </summary>
+        public Resource(ResourceType resourceType, ushort version = 0)
+        {
+            ResourceType = resourceType;
+            HeaderVersion = KnownHeaderVersion;
+            Version = version;
+        }
+
+        /// <summary>
+        /// Releases binary reader.
+        /// </summary>
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Releases the resources used by the <see cref="Resource"/>.
+        /// </summary>
+        /// <param name="disposing">True to release both managed and unmanaged resources; false to release only unmanaged resources.</param>
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (FileStream != null)
+                {
+                    FileStream.Dispose();
+                    FileStream = null;
+                }
+
+                if (Reader != null)
+                {
+                    Reader.Dispose();
+                    Reader = null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Opens and reads the given filename.
+        /// The file is held open until the object is disposed.
+        /// </summary>
+        /// <param name="filename">The file to open and read.</param>
+        /// <param name="mode">When the blocks are parsed.</param>
+        public void Read(string filename, ReadMode mode = ReadMode.Runtime)
+        {
+            if (Reader != null)
+            {
+                throw new InvalidOperationException("This resource has already been read.");
+            }
+
+            FileName = filename;
+            FileStream = new FileStream(filename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+
+            Read(FileStream, mode: mode);
+        }
+
+        /// <summary>
+        /// Reads the given <see cref="Stream"/>.
+        /// </summary>
+        /// <param name="input">The input <see cref="Stream"/> to read from.</param>
+        /// <param name="leaveOpen">Whether to leave the stream open after the object is disposed.</param>
+        /// <param name="mode">When the blocks are parsed.</param>
+        /// <remarks>
+        /// The input stream must remain open while accessing data from this resource,
+        /// as some operations may perform reads lazily from the stream at call time.
+        /// </remarks>
+        public void Read(Stream input, bool leaveOpen = false, ReadMode mode = ReadMode.Runtime)
+        {
+            if (Reader != null)
+            {
+                throw new InvalidOperationException("This resource has already been read.");
+            }
+
+            Reader = new BinaryReader(input, Encoding.UTF8, leaveOpen);
+
+            FileSize = Reader.ReadUInt32();
+
+            if (FileSize == Package.MAGIC)
+            {
+                throw new InvalidDataException("Use ValvePak library to parse VPK files.\nSee https://github.com/ValveResourceFormat/ValvePak");
+            }
+
+            if (FileSize == VfxProgramData.MAGIC)
+            {
+                throw new InvalidDataException($"Use {nameof(VfxProgramData)}() class to parse legacy compiled shader files.");
+            }
+
+            HeaderVersion = Reader.ReadUInt16();
+
+            if (HeaderVersion != KnownHeaderVersion)
+            {
+                throw new UnexpectedMagicException($"Unexpected header. You likely tried to read a file that is not actually a resource (usually ends in '_c').", HeaderVersion, nameof(HeaderVersion));
+            }
+
+            if (FileName != null)
+            {
+                ResourceType = ResourceTypeExtensions.DetermineByFileExtension(Path.GetExtension(FileName.AsSpan()));
+            }
+
+            Version = Reader.ReadUInt16();
+
+            var blockOffset = Reader.ReadUInt32();
+            var blockCount = Reader.ReadUInt32();
+
+            Reader.BaseStream.Position += blockOffset - 8; // 8 is 2 uint32s we just read
+
+            blocks.Items.EnsureCapacity((int)blockCount);
+
+            for (var i = 0; i < blockCount; i++)
+            {
+                var blockType = (BlockType)Reader.ReadUInt32();
+
+                var position = Reader.BaseStream.Position;
+                var offset = (uint)position + Reader.ReadUInt32();
+                var size = Reader.ReadUInt32();
+                Block? block = null;
+
+                // Peek data to detect VKV3
+                // Valve has deprecated NTRO as reported by resourceinfo.exe
+                // TODO: Find a better way without checking against resource type
+                if (size >= 4 && blockType == BlockType.DATA && !IsHandledResourceType(ResourceType))
+                {
+                    Reader.BaseStream.Position = offset;
+
+                    var magic = Reader.ReadUInt32();
+
+                    if (BinaryKV3.IsBinaryKV3(magic))
+                    {
+                        block = new BinaryKV3() { Resource = this };
+                    }
+                    else if (magic == BinaryKV1.MAGIC)
+                    {
+                        block = new BinaryKV1() { Resource = this };
+                    }
+
+                    Reader.BaseStream.Position = position;
+                }
+
+                block ??= ConstructFromType(blockType);
+                Debug.Assert(block.Resource == this);
+
+                block.Offset = offset;
+                block.Size = size;
+
+                blocks.Items.Add(block);
+                block.MarkDeferred();
+
+                if (block is ResourceEditInfo blockEditInfo)
+                {
+                    editInfo = blockEditInfo;
+
+                    // Try to determine resource type by looking at the compiler identifiers
+                    // This must be done right after reading EditInfo because future DATA block
+                    // will depend on knowing the resource type to construct the correct block in ConstructResourceType()
+                    if (ResourceType == ResourceType.Unknown)
+                    {
+                        block.EnsureRead();
+
+                        foreach (var specialDep in editInfo.SpecialDependencies)
+                        {
+                            ResourceType = DetermineResourceTypeByCompilerIdentifier(specialDep);
+
+                            if (ResourceType != ResourceType.Unknown)
+                            {
+                                break;
+                            }
+                        }
+
+                        // Try to determine resource type by looking at the input dependency if there is only one
+                        if (ResourceType == ResourceType.Unknown && editInfo.InputDependencies.Count == 1)
+                        {
+                            ResourceType = ResourceTypeExtensions.DetermineByFileExtension(Path.GetExtension(editInfo.InputDependencies[0].ContentRelativeFilename));
+                        }
+                    }
+                }
+
+                Reader.BaseStream.Position = position + 8;
+            }
+
+            if (mode != ReadMode.Deferred)
+            {
+                foreach (var block in blocks.Items)
+                {
+                    // Skip some blocks
+                    if (mode == ReadMode.Runtime && block.Type is (BlockType.REDI or BlockType.RED2 or BlockType.STAT))
+                    {
+                        continue;
+                    }
+
+                    block.EnsureRead();
+                }
+            }
+
+            // Specialize the generic VData KV3 DATA block into a typed block based on generic_data_type
+            if (ResourceType == ResourceType.VData
+                && DataBlock is BinaryKV3 vdataBlock
+                && GenericData.Construct(vdataBlock) is { } specializedData)
+            {
+                blocks.Items[blocks.Items.IndexOf(vdataBlock)] = specializedData;
+            }
+        }
+
+        /// <summary>
+        /// Whether any block of a compiled resource satisfies a predicate, without parsing the resource.
+        /// Compressed binary KV3 blocks are visited as their decompressed buffers, other blocks as stored,
+        /// and geometry and visibility buffers are skipped.
+        /// </summary>
+        /// <param name="input">A seekable stream with the resource at position 0.</param>
+        /// <param name="predicate">Called with each buffer, which is only valid during the call, until it returns true.</param>
+        /// <exception cref="UnexpectedMagicException">The stream does not hold a resource.</exception>
+        /// <exception cref="InvalidDataException">A block or a compressed buffer is invalid.</exception>
+        /// <exception cref="EndOfStreamException">The stream ends early.</exception>
+        public static bool AnyBlockContents(Stream input, Func<ReadOnlySpan<byte>, bool> predicate)
+        {
+            using var reader = new BinaryReader(input, Encoding.UTF8, leaveOpen: true);
+
+            input.Position = 4;
+            var headerVersion = reader.ReadUInt16();
+
+            if (headerVersion != KnownHeaderVersion)
+            {
+                throw new UnexpectedMagicException("Not a resource", headerVersion, nameof(headerVersion));
+            }
+
+            input.Position = 8;
+            var blockOffset = reader.ReadUInt32();
+            var blockCount = reader.ReadUInt32();
+            input.Position += blockOffset - 8;
+
+            for (var i = 0; i < blockCount; i++)
+            {
+                var type = (BlockType)reader.ReadUInt32();
+                var offset = input.Position;
+                offset += reader.ReadUInt32();
+                var size = reader.ReadUInt32();
+                var nextBlock = input.Position;
+
+                if (type is BlockType.VBIB or BlockType.MBUF or BlockType.MVTX or BlockType.MIDX or BlockType.MADJ or BlockType.MSLT or BlockType.TBUF or BlockType.VXVS)
+                {
+                    continue;
+                }
+
+                if (offset + size > input.Length)
+                {
+                    throw new InvalidDataException("A block is outside of the resource.");
+                }
+
+                var buffer = ArrayPool<byte>.Shared.Rent((int)size);
+
+                try
+                {
+                    input.Position = offset;
+                    input.ReadExactly(buffer, 0, (int)size);
+
+                    if (BinaryKV3.AnyDecompressedBuffer(new ArraySegment<byte>(buffer, 0, (int)size), predicate))
+                    {
+                        return true;
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+
+                input.Position = nextBlock;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Serialize resource to binary.
+        /// </summary>
+        /// <remarks>NOT PRODUCTION READY! Not all blocks support serialization and will throw. The total file size must not exceed <see cref="uint"/>.</remarks>
+        /// <param name="stream">Stream to write to. The stream must support seeking.</param>
+        public void Serialize(Stream stream)
+        {
+            if (!stream.CanSeek)
+            {
+                throw new InvalidOperationException("The stream must be seekable.");
+            }
+
+            var start = stream.Position;
+            using var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true);
+
+            writer.Write(0xDEADBEEF); // file size to be updated later
+            writer.Write(KnownHeaderVersion);
+            writer.Write(Version);
+            writer.Write(8); // basically always 8 because we only write 2 ints
+            writer.Write(Blocks.Count);
+
+            var blocksStart = stream.Position + 4; // Skip the block type for correct stride
+
+            foreach (var block in Blocks)
+            {
+                writer.Write((uint)block.Type);
+                writer.Write(0xDEADBEEF); // offset
+                writer.Write(0xDEADBEEF); // size
+            }
+
+            writer.Flush();
+
+            for (var i = 0; i < Blocks.Count; i++)
+            {
+                // Align to 16 bytes
+                var currentPos = stream.Position;
+                var padding = (16 - currentPos % 16) % 16;
+
+                if (padding >= 5)
+                {
+                    var halfPadding = padding / 2;
+                    var s2vStart = halfPadding - 1;
+
+                    for (var j = 0; j < s2vStart; j++)
+                    {
+                        writer.Write((byte)0);
+                    }
+
+                    // Who said the padding has to be null bytes? :)
+                    writer.Write((byte)'S');
+                    writer.Write((byte)'2');
+                    writer.Write((byte)'V');
+
+                    padding -= s2vStart + 3;
+                }
+
+                for (var j = 0; j < padding; j++)
+                {
+                    writer.Write((byte)0);
+                }
+
+                var blockOffset = stream.Position;
+                var block = Blocks[i];
+
+                block.Serialize(stream);
+                stream.Flush();
+
+                var blockOffsetEnd = stream.Position;
+                var blockSize = blockOffsetEnd - blockOffset;
+
+                if (blockOffsetEnd > uint.MaxValue)
+                {
+                    throw new InvalidDataException("File size exceeds 32-bit integer.");
+                }
+
+                // Update metadata
+                var blockMetadataOffset = blocksStart + i * 12; // Start of offset field for this block
+                stream.Position = blockMetadataOffset;
+                writer.Write((uint)(blockOffset - blockMetadataOffset));
+                writer.Write((uint)blockSize);
+                writer.Flush();
+                stream.Position = blockOffsetEnd;
+            }
+
+            var end = stream.Position;
+
+            // Update file size
+            var fileSize = end - start;
+
+            if (fileSize > uint.MaxValue)
+            {
+                throw new InvalidDataException("File size exceeds 32-bit integer.");
+            }
+
+            stream.SetLength(fileSize);
+            stream.Position = start;
+
+            writer.Write((uint)fileSize);
+            writer.Flush();
+        }
+
+        /// <summary>
+        /// Gets a block by its index in the blocks list.
+        /// </summary>
+        /// <param name="index">The zero-based index of the block.</param>
+        /// <returns>The block at the specified index.</returns>
+        /// <exception cref="ArgumentOutOfRangeException">Thrown when the index is out of range.</exception>
+        public Block GetBlockByIndex(int index)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(index);
+            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(index, Blocks.Count);
+
+            return Blocks[index];
+        }
+
+        /// <summary>
+        /// Gets the first block of the specified type.
+        /// </summary>
+        /// <param name="type">The type of block to retrieve.</param>
+        /// <returns>The first block of the specified type, or null if not found.</returns>
+        public Block? GetBlockByType(BlockType type)
+        {
+            foreach (var block in blocks.Items)
+            {
+                if (block.Type == type)
+                {
+                    block.EnsureRead();
+                    return block;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Determines whether the resource contains a block of the specified type.
+        /// </summary>
+        /// <param name="type">The type of block to check for.</param>
+        /// <returns>True if a block of the specified type exists; otherwise, false.</returns>
+        public bool ContainsBlockType(BlockType type)
+        {
+            foreach (var block in blocks.Items)
+            {
+                if (block.Type == type)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private Block ConstructFromType(BlockType blockType)
+        {
+            return blockType switch
+            {
+                BlockType.DATA => ConstructResourceType(),
+                BlockType.REDI => new ResourceEditInfo() { Resource = this },
+                BlockType.RED2 => new ResourceEditInfo2() { Resource = this },
+                BlockType.RERL => new ResourceExtRefList() { Resource = this },
+                BlockType.NTRO => new ResourceIntrospectionManifest() { Resource = this },
+                BlockType.VBIB => new VBIB() { Resource = this },
+                BlockType.VXVS => new VoxelVisibility() { Resource = this },
+                BlockType.SNAP => new ParticleSnapshot() { Resource = this },
+                BlockType.MBUF => new MBUF() { Resource = this },
+                BlockType.TBUF => new TBUF() { Resource = this },
+                BlockType.MVTX => new MeshVertexBuffer() { Resource = this },
+                BlockType.MIDX => new MeshIndexBuffer() { Resource = this },
+                BlockType.MADJ => new MeshAdjacencyBuffer() { Resource = this },
+                BlockType.MSLT => new MeshletBuffer() { Resource = this },
+                BlockType.CTRL => new BinaryKV3(BlockType.CTRL) { Resource = this },
+                BlockType.MDAT => new Mesh(BlockType.MDAT) { Resource = this },
+                BlockType.INSG => new BinaryKV3(BlockType.INSG) { Resource = this },
+                BlockType.SrMa => new BinaryKV3(BlockType.SrMa) { Resource = this }, // SourceMap
+                BlockType.LaCo => new BinaryKV3(BlockType.LaCo) { Resource = this }, // vxml ast
+                BlockType.STAT => new BinaryKV3(BlockType.STAT) { Resource = this },
+                BlockType.FLCI => new BinaryKV3(BlockType.FLCI) { Resource = this },
+                BlockType.DSTF => new BinaryKV3(BlockType.DSTF) { Resource = this },
+                BlockType.MRPH => new Morph(BlockType.MRPH) { Resource = this },
+                BlockType.ANIM => new KeyValuesOrNTRO(BlockType.ANIM, "AnimationResourceData_t") { Resource = this },
+                BlockType.ASEQ => new KeyValuesOrNTRO(BlockType.ASEQ, "SequenceGroupResourceData_t") { Resource = this },
+                BlockType.AGRP => new KeyValuesOrNTRO(BlockType.AGRP, "AnimationGroupResourceData_t") { Resource = this },
+                BlockType.PHYS => new PhysAggregateData(BlockType.PHYS) { Resource = this },
+                _ => throw new ArgumentException($"Unrecognized block type '{Encoding.ASCII.GetString(BitConverter.GetBytes((uint)blockType))}'"),
+            };
+        }
+
+        private Block ConstructResourceType()
+        {
+            return ResourceType switch
+            {
+                ResourceType.AnimationGraph => new AnimGraph() { Resource = this },
+                ResourceType.NmClip => new ResourceTypes.ModelAnimation2.AnimationClip() { Resource = this },
+                ResourceType.ChoreoSceneFileData => new ChoreoSceneFileData() { Resource = this },
+                ResourceType.EntityLump => new EntityLump() { Resource = this },
+                ResourceType.Map => new Map() { Resource = this },
+                ResourceType.Material => new Material() { Resource = this },
+                ResourceType.Mesh => new Mesh(BlockType.DATA) { Resource = this },
+                ResourceType.Model => new Model() { Resource = this },
+                ResourceType.Morph => new Morph(BlockType.DATA) { Resource = this },
+                ResourceType.Panorama or ResourceType.PanoramaScript or ResourceType.PanoramaTypescript or ResourceType.PanoramaVectorGraphic => new Panorama() { Resource = this },
+                ResourceType.PanoramaDynamicImages => new PanoramaDynamicImages() { Resource = this },
+                ResourceType.PanoramaLayout => new PanoramaLayout() { Resource = this },
+                ResourceType.PanoramaStyle => new PanoramaStyle() { Resource = this },
+                ResourceType.Particle => new ParticleSystem() { Resource = this },
+                ResourceType.PhysicsCollisionMesh => new PhysAggregateData() { Resource = this },
+                ResourceType.PostProcessing => new PostProcessing() { Resource = this },
+                ResourceType.ResourceManifest => new ResourceManifest() { Resource = this },
+                ResourceType.ResponseRules => new ResponseRules() { Resource = this },
+                ResourceType.SboxManagedResource or ResourceType.ArtifactItem or ResourceType.DotaHeroList => new Plaintext() { Resource = this },
+                ResourceType.SmartProp => new SmartProp() { Resource = this },
+                ResourceType.Sound => new Sound() { Resource = this },
+                ResourceType.SoundStackScript => new SoundStackScript() { Resource = this },
+                ResourceType.Texture => new Texture() { Resource = this },
+                ResourceType.World => new World() { Resource = this },
+                ResourceType.WorldNode => new WorldNode() { Resource = this },
+                _ => ContainsBlockType(BlockType.NTRO) ? new NTRO() { Resource = this } : new UnknownDataBlock(ResourceType) { Resource = this },
+            };
+        }
+
+        private static bool IsHandledResourceType(ResourceType type)
+        {
+            return type
+                is ResourceType.Model
+                or ResourceType.Mesh
+                or ResourceType.World
+                or ResourceType.WorldNode
+                or ResourceType.Particle
+                or ResourceType.Material
+                or ResourceType.EntityLump
+                or ResourceType.PhysicsCollisionMesh
+                or ResourceType.Morph
+                or ResourceType.SmartProp
+                or ResourceType.AnimationGraph
+                or ResourceType.NmClip
+                or ResourceType.PostProcessing;
+        }
+
+        private static ResourceType DetermineResourceTypeByCompilerIdentifier(SpecialDependency input)
+        {
+            var identifier = input.CompilerIdentifier.AsSpan();
+
+            if (identifier.StartsWith("Compile", StringComparison.Ordinal))
+            {
+                identifier = identifier["Compile".Length..];
+            }
+
+            // Special mappings and otherwise different identifiers
+            var resourceType = identifier switch
+            {
+                "Animgraph" => ResourceType.AnimationGraph,
+                "AnimGroup" => ResourceType.AnimationGroup,
+                "ChoreoSceneFileData" => ResourceType.ChoreoSceneFileData,
+                "ChoreoSceneResource" => ResourceType.ChoreoSceneResource,
+                "CSGOEconItem" => ResourceType.EconItem,
+                "CSGOItem" => ResourceType.EconItem,
+                "DotaHeroList" => ResourceType.DotaHeroList,
+                "DotaItem" => ResourceType.ArtifactItem,
+                "DotaPatchNotes" => ResourceType.DotaPatchNotes,
+                "DotaVisualNovels" => ResourceType.DotaVisualNovels,
+                "Font" => ResourceType.BitmapFont,
+                "GraphInstance" => ResourceType.ProcessingGraphInstance,
+                "NmClip" => ResourceType.NmClip,
+                "NmGraph" => ResourceType.NmGraph,
+                "NmGraphVariation" => ResourceType.NmGraphVariation,
+                "NmSkeleton" => ResourceType.NmSkeleton,
+                "NmIKRig" => ResourceType.NmIKRig,
+                "Panorama" => input.String switch
+                {
+                    "Panorama Style Compiler Version" => ResourceType.PanoramaStyle,
+                    "Panorama Script Compiler Version" => ResourceType.PanoramaScript,
+                    "Panorama Layout Compiler Version" => ResourceType.PanoramaLayout,
+                    "Panorama Dynamic Images Compiler Version" => ResourceType.PanoramaDynamicImages,
+                    _ => ResourceType.Panorama,
+                },
+                "Psf" => ResourceType.ParticleSnapshotLegacy,
+                "PulseGraphDef" => ResourceType.PulseGraphDef,
+                "RenderMesh" => ResourceType.Mesh,
+                "ResponseRules" => ResourceType.ResponseRules,
+                "SBData" or "ManagedResourceCompiler" => ResourceType.SboxManagedResource,
+                "SmartProp" => ResourceType.SmartProp,
+                "TypeScript" => ResourceType.PanoramaTypescript,
+                "VCompMat" => ResourceType.CompositeMaterial,
+                "VData" => ResourceType.VData,
+                "VectorGraphic" => ResourceType.PanoramaVectorGraphic,
+                "VPhysXData" => ResourceType.PhysicsCollisionMesh,
+                _ => ResourceType.Unknown,
+            };
+
+            if (resourceType == ResourceType.Unknown && Enum.TryParse(identifier, false, out ResourceType resourceTypeParsed))
+            {
+                return resourceTypeParsed;
+            }
+
+            return resourceType;
+        }
+
+        private sealed class BlockList : IReadOnlyList<Block>
+        {
+            public List<Block> Items { get; } = [];
+
+            public int Count => Items.Count;
+
+            public Block this[int index]
+            {
+                get
+                {
+                    var block = Items[index];
+                    block.EnsureRead();
+                    return block;
+                }
+            }
+
+            public IEnumerator<Block> GetEnumerator()
+            {
+                foreach (var block in Items)
+                {
+                    block.EnsureRead();
+                    yield return block;
+                }
+            }
+
+            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+        }
+    }
+}

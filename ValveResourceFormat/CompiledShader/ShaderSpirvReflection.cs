@@ -1,0 +1,910 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using ValveResourceFormat.ResourceTypes;
+using Vortice.SPIRV;
+using Vortice.SpirvCross;
+using static ValveResourceFormat.CompiledShader.RsComparison;
+using static ValveResourceFormat.CompiledShader.RsFilter;
+using static ValveResourceFormat.CompiledShader.RsTextureAddressMode;
+using SpirvResourceType = Vortice.SpirvCross.ResourceType;
+
+namespace ValveResourceFormat.CompiledShader;
+
+/// <summary>
+/// Provides SPIR-V reflection and decompilation utilities for shaders.
+/// </summary>
+public static partial class ShaderSpirvReflection
+{
+    /// <summary>
+    /// Gets the SPIR-V binding of register 0 of a register type, which the shader compiler adds to the HLSL register number.
+    /// Samplers, textures and unordered access views have their own ranges, anything else is in the constant buffer range.
+    /// Before version 69, descriptor set 0 gives each graphics stage its own block of bindings, while other sets
+    /// and compute shaders use one compact layout. From version 69 every stage and set uses that layout.
+    /// </summary>
+    /// <remarks>
+    /// These constants are not stored in the shader files. They come from GetBindingStartOffsetHLSLToSPIRV in
+    /// rendersystemvulkan, a small function taking the shader stage, a VkDescriptorType and the descriptor set,
+    /// and returning these numbers (switch over descriptor types 0, 2/4, 3/7, 6/8, plus 1000150000 in newer builds).
+    /// Since version 69 it is VfxGetBindingStartOffsetHLSLToSPIRV, which takes the register type and returns 30, 14 or 158.
+    /// Mobile builds of rendersystemvulkan have their own copy with different constants.
+    /// </remarks>
+    private static uint GetBindingStartOffset(VfxProgramData program, uint set, VfxRegisterType registerType)
+    {
+        uint? stage = program.VcsProgramType switch
+        {
+            VcsProgramType.PixelShader => 0,
+            VcsProgramType.VertexShader => 1,
+            VcsProgramType.GeometryShader => 2,
+            VcsProgramType.HullShader => 3,
+            VcsProgramType.DomainShader => 4,
+            _ => null,
+        };
+
+        if (program.VcsVersion >= 69 || set != 0 || stage is not { } stageIndex)
+        {
+            if (program.IsMobileVulkan)
+            {
+                return registerType switch
+                {
+                    VfxRegisterType.SamplerState => 12,
+                    VfxRegisterType.Texture => 28,
+                    VfxRegisterType.Uav => 156,
+                    _ => 0,
+                };
+            }
+
+            return registerType switch
+            {
+                VfxRegisterType.SamplerState => 14,
+                VfxRegisterType.Texture => 30,
+                VfxRegisterType.Uav => 158,
+                _ => 0,
+            };
+        }
+
+        if (program.IsMobileVulkan)
+        {
+            return registerType switch
+            {
+                VfxRegisterType.SamplerState => 60 + 16 * stageIndex,
+                VfxRegisterType.Texture => 140 + 128 * stageIndex,
+                VfxRegisterType.Uav => 780 + 8 * stageIndex,
+                _ => 12 * stageIndex,
+            };
+        }
+
+        // Version 68 removed the hull and domain shader stages, which shrank the blocks
+        if (program.VcsVersion >= 68)
+        {
+            return registerType switch
+            {
+                VfxRegisterType.SamplerState => 42 + 16 * stageIndex,
+                VfxRegisterType.Texture => 90 + 128 * stageIndex,
+                VfxRegisterType.Uav => 474 + 8 * stageIndex,
+                _ => 14 * stageIndex,
+            };
+        }
+
+        return registerType switch
+        {
+            VfxRegisterType.SamplerState => 70 + 16 * stageIndex,
+            VfxRegisterType.Texture => 150 + 128 * stageIndex,
+            VfxRegisterType.Uav => 790 + 8 * stageIndex,
+            _ => 14 * stageIndex,
+        };
+    }
+
+    private readonly record struct AddressMode(RsTextureAddressMode? Value = null, bool IsDynamic = false)
+    {
+        public static readonly AddressMode Dynamic = new(IsDynamic: true);
+        public static implicit operator AddressMode(RsTextureAddressMode mode) => new(mode);
+    }
+
+    private record struct SamplerDefinition(
+        RsFilter? Filter = null,
+        AddressMode AddressU = default,
+        AddressMode AddressV = default,
+        AddressMode AddressW = default,
+        int? MaxAniso = null,
+        RsComparison? ComparisonFunc = null,
+        int? BorderColor = null,
+        int? MipBias = null,
+        int? MaxLod = null,
+        int? MinLod = null,
+        bool? AllowGlobalMipBiasOverride = null)
+    {
+        public bool HasUnknownFields { get; set; }
+
+        public readonly SamplerDefinition AddressAll(RsTextureAddressMode m) => this with { AddressU = m, AddressV = m, AddressW = m };
+        public readonly SamplerDefinition AddressUV(RsTextureAddressMode m) => this with { AddressU = m, AddressV = m };
+        public readonly SamplerDefinition NoMipBias() => this with { AllowGlobalMipBiasOverride = false };
+
+        public static readonly SamplerDefinition Aniso = new(Filter: Anisotropic, MaxAniso: 8);
+        public static readonly SamplerDefinition Bilinear = new(Filter: MinMagLinearMipPoint);
+        public static readonly SamplerDefinition Trilinear = new(Filter: MinMagMipLinear);
+        public static readonly SamplerDefinition Point = new(Filter: MinMagMipPoint);
+        public static readonly SamplerDefinition UserConfig = new(Filter: RsFilter.UserConfig, MaxAniso: -1, AddressU: AddressMode.Dynamic, AddressV: AddressMode.Dynamic);
+
+        public void SetStatic(string name, int value)
+        {
+            switch (name)
+            {
+                case "Filter": Filter = (RsFilter)value; break;
+                case "AddressU": AddressU = (RsTextureAddressMode)value; break;
+                case "AddressV": AddressV = (RsTextureAddressMode)value; break;
+                case "AddressW": AddressW = (RsTextureAddressMode)value; break;
+                case "MaxAniso": MaxAniso = value; break;
+                case "ComparisonFunc": ComparisonFunc = (RsComparison)value; break;
+                case "BorderColor": BorderColor = value; break;
+                case "MipBias": MipBias = value; break;
+                case "MaxLOD": MaxLod = value; break;
+                case "MinLOD": MinLod = value; break;
+                case "AllowGlobalMipBiasOverride": AllowGlobalMipBiasOverride = value != 0; break;
+                default: HasUnknownFields = true; break;
+            }
+        }
+
+        public void SetDynamic(string name)
+        {
+            switch (name)
+            {
+                case "AddressU": AddressU = AddressMode.Dynamic; break;
+                case "AddressV": AddressV = AddressMode.Dynamic; break;
+                default: HasUnknownFields = true; break;
+            }
+        }
+    }
+
+    private static readonly Dictionary<string, Type> SamplerStateEnumSource = new(StringComparer.Ordinal)
+    {
+        ["AddressU"] = typeof(RsTextureAddressMode),
+        ["AddressV"] = typeof(RsTextureAddressMode),
+        ["AddressW"] = typeof(RsTextureAddressMode),
+        ["ComparisonFunc"] = typeof(RsComparison),
+        ["Filter"] = typeof(RsFilter),
+    };
+
+    private static readonly Dictionary<SamplerDefinition, string> WellKnownSamplers = new()
+    {
+        [SamplerDefinition.Aniso.NoMipBias()] = "g_sAniso",
+        [SamplerDefinition.Aniso with { AddressV = Clamp }] = "g_sAnisoClampV",
+        [SamplerDefinition.Bilinear.AddressAll(Clamp).NoMipBias()] = "g_sBilinearClamp",
+        [SamplerDefinition.Bilinear.AddressAll(Wrap).NoMipBias()] = "g_sBilinearWrap",
+        [SamplerDefinition.Bilinear.AddressAll(Mirror).NoMipBias()] = "g_sBilinearMirror",
+        [SamplerDefinition.Bilinear.AddressAll(Border) with { BorderColor = 0 }] = "g_sCookieSampler",
+        [SamplerDefinition.Trilinear.AddressUV(Wrap).NoMipBias()] = "g_sTrilinearWrap",
+        [SamplerDefinition.Trilinear.AddressUV(Clamp).NoMipBias()] = "g_sTrilinearClamp",
+        [SamplerDefinition.Trilinear.AddressUV(Mirror).NoMipBias()] = "g_sTrilinearMirror",
+        [SamplerDefinition.Trilinear.AddressUV(Border).NoMipBias()] = "g_sTrilinearBorder",
+        [SamplerDefinition.Point.AddressAll(Clamp).NoMipBias()] = "g_sPointClamp",
+        [SamplerDefinition.Point.AddressAll(Border).NoMipBias()] = "g_sPointBorder",
+        [SamplerDefinition.Point.AddressUV(Mirror).NoMipBias()] = "g_sPointMirror",
+        [SamplerDefinition.Point.AddressAll(Wrap)] = "g_sPoint",
+        [new SamplerDefinition(Filter: ComparisonMinMagMipLinear, ComparisonFunc: LessEqual).AddressUV(Clamp)] = "g_tShadowDepthBufferCmpSampler",
+        [SamplerDefinition.UserConfig.NoMipBias()] = "g_sUserConfig",
+        [SamplerDefinition.UserConfig] = "g_sUserConfigAllowGlobalMipBias",
+    };
+
+    /// <summary>
+    /// Reflects and decompiles SPIR-V bytecode to a target shader language.
+    /// </summary>
+    /// <param name="vulkanSource">The Vulkan shader source containing SPIR-V bytecode.</param>
+    /// <param name="backend">The target shader language backend.</param>
+    /// <param name="code">The decompiled shader code.</param>
+    /// <returns>True if decompilation succeeded, false otherwise.</returns>
+    public static bool ReflectSpirv(VfxShaderFileVulkan vulkanSource, Backend backend, out string code)
+    {
+        static bool Error(out string code, spvc_context context)
+        {
+            var lastError = SpirvCrossApi.spvc_context_get_last_error_string(context);
+            code = lastError ?? string.Empty;
+            return false;
+        }
+
+        var result = SpirvCrossApi.spvc_context_create(out var context);
+
+        if (result != Result.Success)
+        {
+            code = "Failed to create SPIR-V context";
+            return false;
+        }
+
+        using var buffer = new StringWriter(CultureInfo.InvariantCulture);
+
+        try
+        {
+            result = SpirvCrossApi.spvc_context_parse_spirv(context, vulkanSource.Bytecode, out var parsedIr);
+
+            if (result != Result.Success) // Typically InvalidSPIRV
+            {
+                return Error(out code, context);
+            }
+
+            result = SpirvCrossApi.spvc_context_create_compiler(context, backend, parsedIr, CaptureMode.TakeOwnership, out var compiler);
+
+            if (result != Result.Success)
+            {
+                return Error(out code, context);
+            }
+
+            result = SpirvCrossApi.spvc_compiler_create_compiler_options(compiler, out var options);
+
+            if (result != Result.Success)
+            {
+                return Error(out code, context);
+            }
+
+            if (backend == Backend.GLSL)
+            {
+                SpirvCrossApi.spvc_compiler_options_set_uint(options, CompilerOption.GLSLVersion, 460);
+                SpirvCrossApi.spvc_compiler_options_set_bool(options, CompilerOption.GLSLES, SpirvCrossApi.SPVC_FALSE);
+                SpirvCrossApi.spvc_compiler_options_set_bool(options, CompilerOption.GLSLVulkanSemantics,
+                    SpirvCrossApi.SPVC_TRUE);
+                SpirvCrossApi.spvc_compiler_options_set_bool(options,
+                    CompilerOption.GLSLEmitUniformBufferAsPlainUniforms, SpirvCrossApi.SPVC_TRUE);
+            }
+            else if (backend == Backend.HLSL)
+            {
+                SpirvCrossApi.spvc_compiler_options_set_uint(options, CompilerOption.HLSLShaderModel, 62);
+                SpirvCrossApi.spvc_compiler_options_set_bool(options, CompilerOption.HLSLEnable16bitTypes, SpirvCrossApi.SPVC_TRUE);
+                SpirvCrossApi.spvc_compiler_options_set_uint(options, CompilerOption.HLSLUseEntryPointName, 1);
+            }
+
+            result = SpirvCrossApi.spvc_compiler_install_compiler_options(compiler, options);
+
+            if (result != Result.Success)
+            {
+                return Error(out code, context);
+            }
+
+            if (vulkanSource.ParentCombo?.ParentProgramData?.VcsProgramType is not VcsProgramType.RaytracingShader)
+            {
+                result = SpirvCrossApi.spvc_compiler_create_shader_resources(compiler, out var resources);
+
+                if (result != Result.Success)
+                {
+                    return Error(out code, context);
+                }
+
+                RenameResource(compiler, resources, SpirvResourceType.SeparateImage, vulkanSource);
+                RenameResource(compiler, resources, SpirvResourceType.SeparateSamplers, vulkanSource);
+
+                RenameResource(compiler, resources, SpirvResourceType.StorageBuffer, vulkanSource);
+                RenameResource(compiler, resources, SpirvResourceType.StorageImage, vulkanSource);
+                RenameResource(compiler, resources, SpirvResourceType.UniformBuffer, vulkanSource);
+                RenameResource(compiler, resources, SpirvResourceType.PushConstant, vulkanSource);
+
+                RenameResource(compiler, resources, SpirvResourceType.StageInput, vulkanSource);
+                RenameResource(compiler, resources, SpirvResourceType.StageOutput, vulkanSource);
+
+                RenameSpecializationConstants(compiler, vulkanSource);
+
+                if (backend == Backend.HLSL)
+                {
+                    RemapVertexInputSemantics(compiler, resources, vulkanSource);
+                }
+            }
+
+            result = SpirvCrossApi.spvc_compiler_compile(compiler, out var compiledCode);
+
+            if (result != Result.Success)
+            {
+                return Error(out code, context);
+            }
+
+            code = compiledCode ?? string.Empty;
+
+            if (backend == Backend.HLSL)
+            {
+                if (vulkanSource.ParentCombo?.ParentProgramData?.VcsProgramType is VcsProgramType.VertexShader)
+                {
+                    code = code.Replace("SPIRV_Cross_Input", "VS_INPUT", StringComparison.Ordinal);
+                    code = code.Replace("SPIRV_Cross_Output", "PS_INPUT", StringComparison.Ordinal);
+                }
+                else if (vulkanSource.ParentCombo?.ParentProgramData?.VcsProgramType is VcsProgramType.PixelShader)
+                {
+                    code = code.Replace("SPIRV_Cross_Input", "PS_INPUT", StringComparison.Ordinal);
+                    code = code.Replace("SPIRV_Cross_Output", "PS_OUTPUT", StringComparison.Ordinal);
+                }
+            }
+
+            code = ReplaceCommonPatterns(code);
+
+            buffer.WriteLine($"// {StringToken.VRF_GENERATOR}");
+            buffer.WriteLine($"// SPIR-V source, {backend} reflection with SPIRV-Cross by KhronosGroup");
+
+            BuildComboComment(vulkanSource, buffer);
+
+            buffer.WriteLine();
+            buffer.WriteLine(code);
+        }
+        finally
+        {
+            SpirvCrossApi.spvc_context_release_allocations(context);
+            SpirvCrossApi.spvc_context_destroy(context);
+        }
+
+        code = buffer.ToString();
+        return result == Result.Success;
+    }
+
+    private static void BuildComboComment(VfxShaderFile shaderFile, StringWriter buffer)
+    {
+        var staticCombo = shaderFile.ParentCombo;
+        var program = staticCombo?.ParentProgramData;
+
+        if (program is null || staticCombo is null)
+        {
+            return;
+        }
+
+        if (program.StaticComboArray.Length > 0)
+        {
+            var state = new ComboConfigMapping(program).GetConfigState(staticCombo.StaticComboId);
+            var staticCombos = ShaderUtilHelpers.FormatComboState(program.StaticComboArray, state);
+
+            if (staticCombos.Length > 0)
+            {
+                buffer.WriteLine($"// Static combos: {staticCombos}");
+            }
+        }
+
+        var dynamicComboEntry = Array.Find(staticCombo.DynamicComboRenderStates, r => r.ShaderFileId == shaderFile.ShaderFileId);
+        var dynamicComboId = dynamicComboEntry?.DynamicComboId ?? 0;
+
+        if (dynamicComboId != 0)
+        {
+            var dynamicCombos = ShaderUtilHelpers.FormatComboState(program.DynamicComboArray, program.GetDynamicComboConfig(dynamicComboId));
+
+            if (dynamicCombos.Length > 0)
+            {
+                buffer.WriteLine($"// Dynamic combos: {dynamicCombos}");
+            }
+        }
+    }
+
+    private static unsafe void RenameSpecializationConstants(spvc_compiler compiler, VfxShaderFile shaderFile)
+    {
+        var program = shaderFile.ParentCombo?.ParentProgramData;
+
+        if (program is null)
+        {
+            return;
+        }
+
+        spvc_specialization_constant* constants;
+        nuint count;
+
+        if (SpirvCrossApi.spvc_compiler_get_specialization_constants(compiler, &constants, &count) != Result.Success)
+        {
+            return;
+        }
+
+        for (nuint i = 0; i < count; i++)
+        {
+            var constant = constants[i];
+
+            // The constant id is stored in the type specific bits of the variable
+            var variable = Array.Find(program.VariableDescriptions,
+                v => v.RegisterType is VfxRegisterType.SpecConstant && (uint)v.TypeSpecificBits == constant.constant_id);
+
+            if (variable is not null)
+            {
+                SpirvCrossApi.spvc_compiler_set_name(compiler, constant.id, variable.Name);
+            }
+        }
+    }
+
+    // Without a remap, SPIRV-Cross gives every vertex input a TEXCOORD semantic
+    private static unsafe void RemapVertexInputSemantics(spvc_compiler compiler, spvc_resources resources, VfxShaderFileVulkan vulkanSource)
+    {
+        if (vulkanSource.ParentCombo?.ParentProgramData?.VcsProgramType is not VcsProgramType.VertexShader)
+        {
+            return;
+        }
+
+        foreach (var input in SpirvCrossApi.spvc_resources_get_resource_list_for_type(resources, SpirvResourceType.StageInput))
+        {
+            var location = SpirvCrossApi.spvc_compiler_get_decoration(compiler, input.id, SpvDecoration.Location);
+
+            if (!vulkanSource.TryGetInputSemantic(location, out var semanticName, out var semanticIndex))
+            {
+                continue;
+            }
+
+            fixed (byte* semantic = $"{semanticName}{semanticIndex}".GetUtf8Span())
+            {
+                var remap = new spvc_hlsl_vertex_attribute_remap
+                {
+                    location = location,
+                    semantic = semantic,
+                };
+
+                SpirvCrossApi.spvc_compiler_hlsl_add_vertex_attribute_remap(compiler, &remap, 1);
+            }
+        }
+    }
+
+    private static void RenameResource(spvc_compiler compiler, spvc_resources resources, SpirvResourceType resourceType,
+        VfxShaderFile shaderFile)
+    {
+        var staticComboData = shaderFile.ParentCombo;
+        var program = staticComboData?.ParentProgramData;
+
+        if (program is null || staticComboData is null)
+        {
+            return;
+        }
+
+        // The shader file id is not the dynamic combo id, look up the combo that uses this file
+        var renderState = Array.Find(staticComboData.DynamicComboRenderStates, r => r.ShaderFileId == shaderFile.ShaderFileId);
+        var dynamicComboIndex = renderState != null ? staticComboData.GetDynamicComboIndex(renderState.DynamicComboId) : -1;
+        var writeSequence = staticComboData.DynamicComboVariables[Math.Max(dynamicComboIndex, 0)];
+
+        var hasBindlessResources =
+            staticComboData.Attributes.FirstOrDefault(a => a.Name == "BindlessResources")?.ConstValue is true;
+
+        int? bindlessSet = null;
+        if (hasBindlessResources)
+        {
+            foreach (var field in writeSequence.RenderState)
+            {
+                if (program.VariableDescriptions[field.VariableIndex].Name == "g_globalLateBoundBindlessSet")
+                {
+                    bindlessSet = field.BindingSlot;
+                    break;
+                }
+            }
+        }
+
+        var reflectedResources = SpirvCrossApi.spvc_resources_get_resource_list_for_type(resources, resourceType);
+
+        var isVertexShader = program.VcsProgramType is VcsProgramType.VertexShader;
+        Material.InputSignatureElement[] vsInputSignature = [];
+
+        // Only vertex shaders describe their vertex layout, and only since the attribute map was added to the metadata.
+        // Without one there is nothing that says which input sits at which location, so they are left unnamed.
+        var vertexLayout = isVertexShader && shaderFile is VfxShaderFileVulkan { AttribMap: not null } vulkanSource
+            ? vulkanSource
+            : null;
+
+        if (vertexLayout is not null && renderState != null
+            && staticComboData.GetVsInputSignatureIndex(renderState.DynamicComboId) is >= 0 and var vsInputSignatureIndex)
+        {
+            vsInputSignature = program.VsInputSignatures[vsInputSignatureIndex].Elements;
+        }
+
+        // The synthesized _Globals_ uniform buffer has no Cbuffer variable, each dynamic combo stores its slot and set instead
+        uint? globalsBufferSet = null;
+        uint? globalsBufferBinding = null;
+        var bindingIndex = Math.Max(dynamicComboIndex, 0);
+
+        if (bindingIndex < staticComboData.ConstantBufferBindingSlots.Length
+            && staticComboData.ConstantBufferBindingSlots[bindingIndex] != byte.MaxValue)
+        {
+            globalsBufferSet = staticComboData.ConstantBufferBindingFlags[bindingIndex];
+            globalsBufferBinding = GetBindingStartOffset(program, globalsBufferSet.Value, VfxRegisterType.ConstantBuffer)
+                + staticComboData.ConstantBufferBindingSlots[bindingIndex];
+        }
+
+        var pushConstantBufferName = writeSequence.Fields
+            .Select(field => program.VariableDescriptions[field.VariableIndex])
+            .FirstOrDefault(variable => variable.RegisterType is VfxRegisterType.PushConstantBuffer)?.Name;
+
+        foreach (var resource in reflectedResources)
+        {
+            // Some shaders keep their original names, which are better than anything matched by binding
+            if (!string.IsNullOrEmpty(SpirvCrossApi.spvc_compiler_get_name(compiler, resource.id)))
+            {
+                continue;
+            }
+
+            var binding = SpirvCrossApi.spvc_compiler_get_decoration(compiler, resource.id, SpvDecoration.Binding);
+            var set = SpirvCrossApi.spvc_compiler_get_decoration(compiler, resource.id, SpvDecoration.DescriptorSet);
+            var location = SpirvCrossApi.spvc_compiler_get_decoration(compiler, resource.id, SpvDecoration.Location);
+
+            var imageVfxType = resourceType is SpirvResourceType.SeparateImage
+                ? GetImageVfxType(compiler, resource.base_type_id)
+                : VfxVariableType.Void;
+
+            var name = resourceType switch
+            {
+                SpirvResourceType.SeparateImage when imageVfxType is VfxVariableType.Buffer
+                    => GetNameForStorageBuffer(program, writeSequence, binding, set),
+                SpirvResourceType.SeparateImage => GetNameForTexture(program, writeSequence, binding, set, imageVfxType),
+                // We don't know the difference between `SamplerState` and `SamplerComparisonState`
+                // as `variable_is_depth_or_compare` requires `analyze_image_and_sampler_usage` to be called for full functionality;
+                // that function is private and the only other way to trigger it is to call compile twice.
+                SpirvResourceType.SeparateSamplers when set == bindlessSet => "g_bindless_Sampler",
+                SpirvResourceType.SeparateSamplers => GetNameForSampler(program, writeSequence, binding, set),
+                SpirvResourceType.StorageBuffer or SpirvResourceType.StorageImage => GetNameForStorageBuffer(program,
+                    writeSequence, binding, set),
+                SpirvResourceType.UniformBuffer => GetNameForUniformBuffer(program, writeSequence, binding, set)
+                    ?? (binding == globalsBufferBinding && set == globalsBufferSet ? "_Globals_" : "undetermined"),
+                // Vulkan allows one push constant block per shader stage
+                SpirvResourceType.PushConstant => pushConstantBufferName ?? "undetermined",
+                SpirvResourceType.StageInput when vertexLayout is not null
+                    => GetVertexInputName(vertexLayout, vsInputSignature, location),
+                SpirvResourceType.StageInput => GetStageAttributeName(location, input: true),
+                SpirvResourceType.StageOutput => GetStageAttributeName(location, input: false),
+                _ => string.Empty
+            };
+
+            if (string.IsNullOrEmpty(name))
+            {
+                Console.WriteLine($"Unhandled resource type {resourceType}");
+                continue;
+            }
+
+            if (resourceType is SpirvResourceType.SeparateImage && imageVfxType is VfxVariableType.Void)
+            {
+                name = $"{name}_unexpectedTypeId{resource.base_type_id}_{resource.type_id}";
+            }
+
+            SpirvCrossApi.spvc_compiler_set_name(compiler, resource.id, name);
+
+            if (resourceType is SpirvResourceType.UniformBuffer or SpirvResourceType.PushConstant)
+            {
+                var bufferRanges = SpirvCrossApi.spvc_compiler_get_active_buffer_ranges(compiler, resource.id);
+
+                foreach (var bufferRange in bufferRanges)
+                {
+                    unsafe
+                    {
+                        var memberName = name == "_Globals_"
+                            ? GetGlobalBufferMemberName(program, writeSequence, (int)bufferRange.offset / 4)
+                            : GetBufferMemberName(program, name, offset: (int)bufferRange.offset / 4);
+
+                        if (string.IsNullOrEmpty(memberName))
+                        {
+                            continue;
+                        }
+
+                        fixed (byte* memberNameBytes = memberName.GetUtf8Span())
+                        {
+                            SpirvCrossApi.spvc_compiler_set_member_name(compiler, resource.base_type_id, bufferRange.index,
+                                memberNameBytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static VfxVariableType GetImageVfxType(spvc_compiler compiler, uint baseTypeId)
+    {
+        var type = SpirvCrossApi.spvc_compiler_get_type_handle(compiler, baseTypeId);
+
+        if (type.IsNull || SpirvCrossApi.spvc_type_get_basetype(type) is not (Basetype.Image or Basetype.SampledImage))
+        {
+            return VfxVariableType.Void;
+        }
+
+        var dim = SpirvCrossApi.spvc_type_get_image_dimension(type);
+        var arrayed = (bool)SpirvCrossApi.spvc_type_get_image_arrayed(type);
+
+        return (dim, arrayed) switch
+        {
+            (SpvDim.Dim1D, false) => VfxVariableType.Sampler1D,
+            (SpvDim.Dim1D, true) => VfxVariableType.Sampler1DArray,
+            (SpvDim.Dim2D, false) => VfxVariableType.Sampler2D,
+            (SpvDim.Dim2D, true) => VfxVariableType.Sampler2DArray,
+            (SpvDim.Dim3D, false) => VfxVariableType.Sampler3D,
+            (SpvDim.Dim3D, true) => VfxVariableType.Sampler3DArray,
+            (SpvDim.Cube, false) => VfxVariableType.SamplerCube,
+            (SpvDim.Cube, true) => VfxVariableType.SamplerCubeArray,
+            (SpvDim.Buffer, _) => VfxVariableType.Buffer,
+            _ => VfxVariableType.Void,
+        };
+    }
+
+    /// <summary>
+    /// Gets the variable name for a texture at a given binding point.
+    /// </summary>
+    /// <param name="program">The shader program data.</param>
+    /// <param name="writeSequence">The write sequence containing variable indices.</param>
+    /// <param name="imageBinding">The image binding point.</param>
+    /// <param name="set">The descriptor set index.</param>
+    /// <param name="vfxType">The VFX variable type to match.</param>
+    /// <returns>The texture variable name, or "undetermined" if not found.</returns>
+    public static string GetNameForTexture(VfxProgramData program, VfxVariableIndexArray writeSequence,
+        uint imageBinding, uint set, VfxVariableType vfxType)
+    {
+        var startingPoint = GetBindingStartOffset(program, set, VfxRegisterType.Texture);
+
+        foreach (var field in writeSequence.RenderState)
+        {
+            if (field.LayoutSet != set)
+            {
+                continue;
+            }
+
+            var variable = program.VariableDescriptions[field.VariableIndex];
+
+            if (variable.RegisterType is VfxRegisterType.SamplerState)
+            {
+                Debug.Assert(variable.Flags == VariableFlags.Sampler);
+                continue;
+            }
+
+            if (variable.RegisterType is not VfxRegisterType.Texture)
+            {
+                continue;
+            }
+
+            var isBindlessTextureArray = variable.Flags.HasFlag(VariableFlags.Bindless);
+            Debug.Assert(variable.Flags.HasFlag(VariableFlags.Texture | VariableFlags.Sampler));
+
+            if (variable.VfxType is VfxVariableType.Sampler1D
+                or VfxVariableType.Sampler2D
+                or VfxVariableType.Sampler3D
+                or VfxVariableType.SamplerCube
+                or VfxVariableType.SamplerCubeArray
+                or VfxVariableType.Sampler2DArray
+                or VfxVariableType.Sampler1DArray
+                or VfxVariableType.Sampler3DArray)
+            {
+                if (isBindlessTextureArray && vfxType != variable.VfxType)
+                {
+                    continue;
+                }
+
+                if (field.BindingSlot == imageBinding - startingPoint)
+                {
+                    return variable.Name;
+                }
+            }
+        }
+
+        return "undetermined";
+    }
+
+    /// <summary>
+    /// Builds a descriptive sampler name for a given binding point.
+    /// </summary>
+    /// <param name="program">The shader program data.</param>
+    /// <param name="writeSequence">The write sequence containing variable indices.</param>
+    /// <param name="samplerBinding">The sampler binding point.</param>
+    /// <param name="set">The descriptor set index.</param>
+    /// <returns>A well-known sampler name or a concatenated sampler state description, or "undetermined" if no sampler is bound at the slot.</returns>
+    public static string GetNameForSampler(VfxProgramData program, VfxVariableIndexArray writeSequence,
+        uint samplerBinding, uint set)
+    {
+        var startingPoint = GetBindingStartOffset(program, set, VfxRegisterType.SamplerState);
+        List<(string Name, string Value)> settings = [];
+        var definition = new SamplerDefinition();
+
+        foreach (var field in writeSequence.RenderState)
+        {
+            if (field.LayoutSet != set)
+            {
+                continue;
+            }
+
+            var param = program.VariableDescriptions[field.VariableIndex];
+
+            if (param.RegisterType is not VfxRegisterType.SamplerState || field.BindingSlot != samplerBinding - startingPoint)
+            {
+                continue;
+            }
+
+            string value;
+            if (param.HasDynamicExpression)
+            {
+                value = "dynamic";
+                definition.SetDynamic(param.Name);
+            }
+            else
+            {
+                var intValue = param.IntDefs[0];
+                value = SamplerStateEnumSource.GetValueOrDefault(param.Name) is { } enumSource
+                    ? ShaderUtilHelpers.GetEnumName(enumSource, intValue)
+                    : intValue.ToString(CultureInfo.InvariantCulture);
+                definition.SetStatic(param.Name, intValue);
+            }
+
+            settings.Add((param.Name, value));
+        }
+
+        if (settings.Count == 0)
+        {
+            return "undetermined";
+        }
+
+        if (WellKnownSamplers.TryGetValue(definition, out var wellKnownName))
+        {
+            return wellKnownName;
+        }
+
+        return string.Join("__", settings
+            .OrderBy(s => s.Name, StringComparer.Ordinal)
+            .Select(s => $"{s.Name}_{s.Value}"));
+    }
+
+    /// <summary>
+    /// Gets the variable name for a storage buffer at a given binding point.
+    /// </summary>
+    /// <param name="program">The shader program data.</param>
+    /// <param name="writeSequence">The write sequence containing variable indices.</param>
+    /// <param name="bufferBinding">The buffer binding point.</param>
+    /// <param name="set">The descriptor set index.</param>
+    /// <returns>The storage buffer variable name, or "undetermined" if not found.</returns>
+    public static string GetNameForStorageBuffer(VfxProgramData program, VfxVariableIndexArray writeSequence,
+        uint bufferBinding, uint set)
+    {
+        foreach (var field in writeSequence.RenderState)
+        {
+            if (field.LayoutSet != set)
+            {
+                continue;
+            }
+
+            var param = program.VariableDescriptions[field.VariableIndex];
+
+            if (param.VfxType is not (VfxVariableType.Buffer or >= VfxVariableType.StructuredBuffer and <= VfxVariableType.RWStructuredBufferWithCounter))
+            {
+                continue;
+            }
+
+            // Read-only resources are bound like textures, writable ones like unordered access views
+            var startingPoint = GetBindingStartOffset(program, set, param.RegisterType is VfxRegisterType.Uav ? VfxRegisterType.Uav : VfxRegisterType.Texture);
+
+            if (field.BindingSlot == bufferBinding - startingPoint)
+            {
+                return param.Name;
+            }
+        }
+
+        return "undetermined";
+    }
+
+    /// <summary>
+    /// Gets the variable name for a uniform buffer at a given binding point and descriptor set.
+    /// </summary>
+    /// <param name="program">The shader program data.</param>
+    /// <param name="writeSequence">The write sequence containing variable indices.</param>
+    /// <param name="binding">The buffer binding point.</param>
+    /// <param name="set">The descriptor set index.</param>
+    /// <returns>The uniform buffer variable name, or null if no matching <see cref="VfxVariableType.Cbuffer"/> variable exists.</returns>
+    public static string? GetNameForUniformBuffer(VfxProgramData program, VfxVariableIndexArray writeSequence,
+        uint binding, uint set)
+    {
+        var startingPoint = GetBindingStartOffset(program, set, VfxRegisterType.ConstantBuffer);
+
+        foreach (var field in writeSequence.RenderState)
+        {
+            var param = program.VariableDescriptions[field.VariableIndex];
+
+            if (param.VfxType is VfxVariableType.Cbuffer && field.BindingSlot == binding - startingPoint && field.LayoutSet == set)
+            {
+                return param.Name;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Gets the member name for a global buffer variable at a given offset.
+    /// </summary>
+    /// <param name="program">The shader program data.</param>
+    /// <param name="writeSequence">The write sequence containing variable indices.</param>
+    /// <param name="offset">The offset in the buffer.</param>
+    /// <returns>The member name, or an empty string if not found.</returns>
+    public static string GetGlobalBufferMemberName(VfxProgramData program, VfxVariableIndexArray writeSequence,
+        int offset)
+    {
+        return writeSequence.Constants
+            .Select<VfxVariableIndexData, (VfxVariableIndexData Field, VfxVariableDescription Param)>(f =>
+                (f, program.VariableDescriptions[f.VariableIndex]))
+            .FirstOrDefault(fp => fp.Field.RegisterOffset == offset).Param?.Name ?? string.Empty;
+    }
+
+    // by offset
+    // https://github.com/KhronosGroup/SPIRV-Cross/blob/f349c91274b91c1a7c173f2df70ec53080076191/spirv_hlsl.cpp#L2616
+    /// <summary>
+    /// Gets the member name for a buffer variable by index or offset.
+    /// </summary>
+    /// <param name="program">The shader program data.</param>
+    /// <param name="bufferName">The buffer name.</param>
+    /// <param name="index">The member index (optional).</param>
+    /// <param name="offset">The member offset (optional).</param>
+    /// <returns>The member name when found, <see cref="string.Empty"/> when the buffer is unknown, or "undetermined" when no selector is supplied.</returns>
+    public static string GetBufferMemberName(VfxProgramData program, string bufferName, int index = -1,
+        int offset = -1)
+    {
+        var bufferParams = program.ExtConstantBufferDescriptions.FirstOrDefault(buffer => buffer.Name == bufferName)
+            ?.Variables;
+
+        if (bufferParams is null)
+        {
+            return string.Empty;
+        }
+
+        if (index != -1)
+        {
+            return bufferParams[index].Name;
+        }
+
+        if (offset != -1)
+        {
+            return bufferParams.FirstOrDefault(p => p.Offset == offset).Name;
+        }
+
+        return "undetermined";
+    }
+
+    /// <summary>
+    /// Gets the name of the vertex shader input at a given location, by asking the shader's attribute map which
+    /// vertex layout slot feeds that location and then matching the slot's semantic against the input signature.
+    /// </summary>
+    /// <param name="vulkanSource">The vertex shader whose <see cref="VfxShaderFileVulkan.AttribMap"/> to consult.</param>
+    /// <param name="vsInputSignature">The input signature elements of this variant, in any order.</param>
+    /// <param name="location">The SPIR-V input location.</param>
+    /// <returns>The name from the signature, or a name derived from the Direct3D semantic if the signature has no matching element.</returns>
+    public static string GetVertexInputName(VfxShaderFileVulkan vulkanSource,
+        ReadOnlySpan<Material.InputSignatureElement> vsInputSignature, uint location)
+    {
+        if (!vulkanSource.TryGetInputSemantic(location, out var semanticName, out var semanticIndex))
+        {
+            return GetStageAttributeName(location, input: true);
+        }
+
+        foreach (var element in vsInputSignature)
+        {
+            if (element.D3DSemanticIndex == semanticIndex && element.D3DSemanticName == semanticName)
+            {
+                return element.Name;
+            }
+        }
+
+        return $"input_{semanticName}{semanticIndex}";
+    }
+
+    /// <summary>
+    /// Gets a placeholder name for a shader stage input or output attribute that nothing gives a name to.
+    /// </summary>
+    /// <param name="location">The SPIR-V location of the attribute.</param>
+    /// <param name="input">True if this is an input attribute, false for output.</param>
+    public static string GetStageAttributeName(uint location, bool input)
+    {
+        return $"{(input ? "input" : "output")}_{location}";
+    }
+
+    // The clamped expression is matched with a balancing group so that it can contain nested calls and their
+    // commas, which is the usual case: clamp(dot(a, b), 0.0, 1.0). The bounds accept both backends' spelling,
+    // including the hlsl float suffix and splats such as vec3(0.0) or float4(0.0f, 0.0f, 0.0f, 0.0f).
+    [GeneratedRegex("""
+        \bclamp\s*\(\s*
+            (?<arg> (?: [^(),] | (?<depth>\() | (?<-depth>\)) | (?(depth),|(?!)) )+? )
+            (?(depth)(?!))
+        \s*,\s*
+            (?: 0(?:\.0*)?[fF]? | (?:vec|float|half)[2-4]\s*\(\s*0(?:\.0*)?[fF]?(?:\s*,\s*0(?:\.0*)?[fF]?)*\s*\) )
+        \s*,\s*
+            (?: 1(?:\.0*)?[fF]? | (?:vec|float|half)[2-4]\s*\(\s*1(?:\.0*)?[fF]?(?:\s*,\s*1(?:\.0*)?[fF]?)*\s*\) )
+        \s*\)
+        """, RegexOptions.IgnorePatternWhitespace)]
+    private static partial Regex Clamp01();
+
+    private static string ReplaceCommonPatterns(string code)
+    {
+        // Replace() resumes after each match, so a clamp nested inside another one is skipped on the first
+        // pass. Repeat until the code stops changing, one level of nesting gets folded per pass.
+        for (var pass = 0; pass < 8; pass++)
+        {
+            var replaced = Clamp01().Replace(code, "saturate(${arg})");
+
+            if (string.Equals(replaced, code, StringComparison.Ordinal))
+            {
+                break;
+            }
+
+            code = replaced;
+        }
+
+        return code;
+    }
+}

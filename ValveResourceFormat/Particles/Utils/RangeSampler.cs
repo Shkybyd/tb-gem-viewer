@@ -1,0 +1,68 @@
+using ValveResourceFormat.Serialization.KeyValues;
+
+namespace ValveResourceFormat.Particles.Utils
+{
+    /// <summary>
+    /// Picks a point in a min/max vector range for a particle, configured by the
+    /// <c>m_randomnessParameters</c> block the six range-filling initializers carry. The
+    /// default is an ordinary draw from the system's shared random table. Asked for an even
+    /// distribution it instead walks a stratified low-discrepancy sequence keyed to the particle's
+    /// spawn ordinal, spreading the particles out rather than letting them clump, and takes nothing
+    /// from the shared table.
+    /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particles/CRandomNumberGeneratorParameters">CRandomNumberGeneratorParameters</seealso>
+    readonly struct RangeSampler
+    {
+        private readonly bool distributeEvenly;
+        private readonly int seed;
+
+        private RangeSampler(bool distributeEvenly, int seed)
+        {
+            this.distributeEvenly = distributeEvenly;
+            this.seed = seed;
+        }
+
+        /// <summary>
+        /// Reads a particle function's <c>m_randomnessParameters</c> block, falling back to an ordinary
+        /// random table draw when the block is absent.
+        /// </summary>
+        public static RangeSampler Parse(ParticleDefinitionParser parse)
+        {
+            var block = parse.Data.GetSubCollection("m_randomnessParameters");
+
+            if (block == null)
+            {
+                return default;
+            }
+
+            var parameters = parse.Nested(block);
+
+            return new RangeSampler(parameters.Boolean("m_bDistributeEvenly"), parameters.Int32("m_nSeed", -1));
+        }
+
+        /// <summary>
+        /// Interpolates per component between <paramref name="min"/> and <paramref name="max"/>, either from
+        /// three consecutive values off the system's shared random table or, when an even distribution is
+        /// asked for, from a stratified sample that takes nothing from that table. A negative authored seed
+        /// is displaced by the system's own seed, giving each instance of an effect its own sequence. The
+        /// stratified sample is keyed to the spawn index of the particle at collection index <paramref name="index"/>.
+        /// </summary>
+        public Vector3 NextVectorBetween(int index, ParticleSystemState particleSystemState, Vector3 min, Vector3 max)
+        {
+            if (!distributeEvenly)
+            {
+                return particleSystemState.Random.NextBetweenPerComponentSeededTwice(min, max);
+            }
+
+            var start = seed < 0 ? seed + particleSystemState.Random.Seed : seed;
+            var sample = (start + particleSystemState.SpawnIndex(index)) & 0x7FFFFFFF;
+
+            var fractions = new Vector3(
+                MathUtils.RadicalInverse(sample, 2),
+                MathUtils.RadicalInverse(sample, 3),
+                MathUtils.RadicalInverse(sample, 5));
+
+            return MathUtils.Lerp(min, max, fractions);
+        }
+    }
+}

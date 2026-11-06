@@ -1,0 +1,59 @@
+"ResourceEditInfo"
+{
+	"InputDependencies"
+	{
+	}
+	"AdditionalInputDependencies"
+	{
+		"0"
+		{
+			"ContentRelativeFilename"	"maps/dota/world_physics.vrman"
+			"ContentSearchPath"	"dota"
+			"FileCRC"	"2137666942"
+			"Optional"	"0"
+			"FileExists"	"1"
+			"IsGameFile"	"0"
+		}
+	}
+	"ArgumentDependencies"
+	{
+		"0"
+		{
+			"ParameterName"	"___OverrideInputData___"
+			"ParameterType"	"BinaryBlobArg"
+			"Fingerprint"	"0"
+			"FingerprintDefault"	"0"
+		}
+	}
+	"SpecialDependencies"
+	{
+		"0"
+		{
+			"String"	"DynData Compiler Version"
+			"CompilerIdentifier"	"CompileResourceManifest"
+			"Fingerprint"	"6"
+			"UserData"	"0"
+		}
+		"1"
+		{
+			"String"	"Manifest Compiler Version"
+			"CompilerIdentifier"	"CompileResourceManifest"
+			"Fingerprint"	"2"
+			"UserData"	"0"
+		}
+	}
+	"AdditionalRelatedFiles"
+	{
+	}
+	"ChildResourceList"
+	{
+	}
+	"SearchableUserData"
+	{
+		"0"
+		{
+			"Key"	"IsChildResource"
+			"Value"	"1"
+		}
+	}
+}

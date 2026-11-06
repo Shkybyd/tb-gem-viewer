@@ -1,0 +1,262 @@
+#version 460
+
+#ifndef VRF_UTILS_INCLUDE
+#define VRF_UTILS_INCLUDE
+
+#define PI 3.1415926535897932384626433832795
+// tau = PI*2
+#define TAU 6.2831853071795864769252867665590
+
+#define INCH_TO_M 0.0254
+
+// The bitangent of a tangent that carries the bitangent sign in w
+vec3 GetBitangent(vec3 normal, vec4 tangent)
+{
+    return cross(normal, tangent.xyz) * (tangent.w > 0.0 ? 1.0 : -1.0);
+}
+
+// clamp(value, 0.0, 1.0)
+T saturate<T : IFloat>(T val)
+{
+    return min(max(val, T(0.0)), T(1.0));
+}
+
+// value^2
+T pow2<T : IFloat>(T val)
+{
+    return val * val;
+}
+
+// Guards against pow(0, 0) = NaN by clamping the base off zero.
+float SafePow(float base, float exponent)
+{
+    return pow(max(base, 1e-9), exponent);
+}
+vec3 SafePow(vec3 base, vec3 exponent)
+{
+    return pow(max(base, vec3(1e-9)), exponent);
+}
+
+float Random2D(vec2 Seed)
+{
+    return fract(sin( dot(Seed, vec2(12.9898, 78.233)) ) * 43758.5469);
+}
+
+float Min3( vec3 Vector )
+{
+	return min( min( Vector.x, Vector.y ), Vector.z );
+}
+float Max3( vec3 Vector )
+{
+	return max( max( Vector.x, Vector.y ), Vector.z );
+}
+
+float length_squared<T : IFloat>(T vector)
+{
+	return dot(vector, vector);
+}
+
+// Color
+
+const vec3 LumaWeights = vec3(0.2125, 0.7154, 0.0721); // BT.709-1
+
+float GetLuma(vec3 color) { return dot(color, LumaWeights); }
+
+vec3 GetLuma(vec3 r, vec3 g, vec3 b) { return mat3(r, g, b) * LumaWeights; }
+vec4 GetLuma(vec4 r, vec4 g, vec4 b) { return mat3x4(r, g, b) * LumaWeights; }
+
+vec3 SrgbGammaToLinear(vec3 color)
+{
+    vec3 vLinearSegment = color / vec3(12.92);
+    vec3 vExpSegment = pow((color / vec3(1.055)) + vec3(0.0521327), vec3(2.4));
+
+    const float cap = 0.04045;
+    float select = color.r > cap ? vExpSegment.r : vLinearSegment.r;
+    float select1 = color.g > cap ? vExpSegment.g : vLinearSegment.g;
+    float select2 = color.b > cap ? vExpSegment.b : vLinearSegment.b;
+
+    return vec3(select, select1, select2);
+}
+
+vec4 SrgbGammaToLinear(vec4 color)
+{
+    vec4 vLinearSegment = color / vec4(12.92);
+    vec4 vExpSegment = pow((color / vec4(1.055)) + vec4(0.0521327), vec4(2.4));
+
+    const float cap = 0.04045;
+    float select3 = color.a > cap ? vExpSegment.a : vLinearSegment.a;
+
+    return vec4(SrgbGammaToLinear(color.rgb), select3);
+}
+
+vec3 SrgbLinearToGamma( vec3 vLinearColor )
+{
+	// 15 asm instructions
+	vec3 vLinearSegment = vLinearColor.rgb * 12.92;
+	vec3 vExpSegment = ( 1.055 * pow( vLinearColor.rgb, vec3 ( 1.0 / 2.4) )) - 0.055;
+
+	vec3 vGammaColor = vec3(( vLinearColor.r <= 0.0031308 ) ? vLinearSegment.r : vExpSegment.r,
+                            ( vLinearColor.g <= 0.0031308 ) ? vLinearSegment.g : vExpSegment.g,
+                            ( vLinearColor.b <= 0.0031308 ) ? vLinearSegment.b : vExpSegment.b );
+
+	return vGammaColor.rgb;
+}
+
+vec3 DecodeYCoCg(vec4 color)
+{
+    float scale = (color.z * (255.0 / 8.0)) + 1.0;
+    float Co = (color.x + (-128.0 / 255.0)) / scale;
+    float Cg = (color.y + (-128.0 / 255.0)) / scale;
+    float Y = color.w;
+
+    float R = Y + Co - Cg;
+    float G = Y + Cg;
+    float B = Y - Co - Cg;
+
+    return vec3(R, G, B);
+}
+
+vec3 DecodeRGBM(vec4 color)
+{
+    const float MaxRange = 6.0;
+    return color.rgb * (color.a * MaxRange);
+}
+
+vec3 DecodeBakedLightRGBM(vec4 color)
+{
+    return pow2(DecodeRGBM(color));
+}
+
+vec2 RotateVector2D(vec2 vectorInput, float rotation)
+{
+    rotation = radians(rotation);
+    float sinRot = sin(rotation);
+    float cosRot = cos(rotation);
+
+    return vec2(dot(vec2(cosRot, -sinRot), vectorInput), dot(vec2(sinRot, cosRot), vectorInput));
+}
+
+vec2 RotateVector2D(vec2 vectorInput, float rotation, vec2 scale, vec2 offset)
+{
+    return scale * RotateVector2D(vectorInput - vec2(0.5), rotation) + vec2(0.5) + offset;
+}
+
+// The secondary texture transform of the CS2 generic shaders. The v row adds the center's x
+// where a plain rotation around the center would subtract it.
+vec2 TransformSecondaryTexCoord(vec2 texCoord, float rotation, vec2 scale, vec2 offset, vec2 center)
+{
+    float rotationRadians = radians(rotation);
+    float sinRot = sin(rotationRadians);
+    float cosRot = cos(rotationRadians);
+
+    vec2 centered = texCoord - center;
+    float u = cosRot * scale.x * centered.x - sinRot * scale.y * centered.y;
+    float v = sinRot * scale.x * (texCoord.x + center.x) + cosRot * scale.y * centered.y;
+
+    return vec2(u, v) + center + offset;
+}
+
+vec4 QuaternionMultiplication( vec4 q1, vec4 q2 )
+{
+	return vec4(
+		q2.xyz * q1.w + q1.xyz * q2.w + cross( q1.xyz, q2.xyz ),
+		q1.w * q2.w - dot( q1.xyz, q2.xyz )
+	);
+}
+
+vec3 QuaternionRotation( vec3 v, vec4 q )
+{
+	vec4 q_c = q.xyzw * vec4( -1, -1, -1, 1 );
+	return QuaternionMultiplication( q, QuaternionMultiplication( vec4( v.xyz, 0 ), q_c.xyzw ) ).xyz;
+}
+
+T ClampToPositive<T : IFloat>( T vValue )
+{
+	return max( T(0.0), vValue );
+}
+
+// basically map to 0-1
+float LinearRamp( float flMin, float flMax, float flInput )
+{
+	return saturate( ( flInput - flMin ) / ( flMax - flMin ) );
+}
+
+// Remap a value in the range [A,B] to [C,D]. Values <A map to C, and >B maps to D.
+float RemapValClamped( float flOldVal, float flOldMin, float flOldMax, float flNewMin, float flNewMax )
+{
+	// Put the old val into 0-1 range based on the old min/max
+	float flValNormalized = saturate( ( flOldVal - flOldMin ) / ( flOldMax - flOldMin ) );
+
+	// Map 0-1 range into new min/max
+	return ( flValNormalized * ( flNewMax - flNewMin ) ) + flNewMin;
+}
+
+// The texel scaled to the range, which may be given with its ends in either order
+float RemapByRange(float texel, vec2 range)
+{
+    float scale = max(range.x, range.y) - range.x;
+    return texel * scale + range.x;
+}
+
+float ApplyBlendModulation(float blendFactor, float blendMask, float blendSoftness)
+{
+    float minb = max(0.0, blendMask - blendSoftness);
+    float maxb = min(1.0, blendMask + blendSoftness);
+
+    return smoothstep(minb, maxb, blendFactor);
+}
+
+T PackToColor<T : IFloat>( T vValue )
+{
+	return ( ( vValue * T(0.5) ) + T(0.5) );
+}
+
+T UnpackFromColor<T : IFloat>( T cColor )
+{
+	return ( ( cColor * T(2.0) ) - T(1.0) );
+}
+
+vec3 DecodeDxt5Normal(vec4 bumpTexel)
+{
+    vec2 temp = UnpackFromColor(bumpTexel.ag);
+    temp.y = -temp.y;
+    return vec3(temp, sqrt(saturate(1 - length_squared(temp))));
+}
+
+vec3 HemiOctToFloat32x3(vec2 e)
+{
+    vec3 v = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
+    return normalize(v);
+}
+
+// Safe normalize that handles degenerate normals from zero-scaled bones
+vec3 SafeNormalize(vec3 v)
+{
+    float len2 = length_squared(v);
+    if (len2 < 1e-8)
+    {
+        return vec3(0.0, 0.0, 1.0);
+    }
+    return v * inversesqrt(len2);
+}
+
+// Scale is assumed to be uniform.
+vec3 TransformDirectionToWorld(mat3x4 objectToWorld, vec3 vDirectionOs)
+{
+    // Plain normalize would give us NaN for zero-scaled bones.
+    return SafeNormalize(vec4(vDirectionOs, 0.0) * objectToWorld);
+}
+
+// Unpack HemiOct normal map
+vec3 DecodeHemiOctahedronNormal(vec2 vHemiOct)
+{
+    //Reconstruct the tangent vector from the map
+    vec2 temp = vec2(vHemiOct.x + vHemiOct.y - 1.003922, vHemiOct.x - vHemiOct.y);
+    vec3 tangentNormal = HemiOctToFloat32x3(temp);
+
+    // This is free, it gets compiled into the TS->WS matrix mul
+    tangentNormal.y = -tangentNormal.y;
+    return tangentNormal;
+}
+
+#endif

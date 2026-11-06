@@ -1,0 +1,1257 @@
+using System.Diagnostics;
+using System.Drawing;
+using System.Runtime.ExceptionServices;
+using System.Threading;
+using System.Windows.Forms;
+using GUI.Controls;
+using GUI.Utils;
+using OpenTK.Graphics.OpenGL;
+using OpenTK.Windowing.Common;
+using OpenTK.Windowing.Desktop;
+using ValveResourceFormat.Renderer;
+using ValveResourceFormat.Renderer.Input;
+using Windows.Win32;
+using Windows.Win32.Foundation;
+
+namespace GUI.Types.GLViewers;
+
+internal abstract class GLBaseControl : IDisposable, IMessageFilter
+{
+    protected internal RendererControl? UiControl;
+
+    protected OpenTK.Windowing.Desktop.NativeWindow? GLNativeWindow;
+
+    /// <summary>The command stream this control records into, over <see cref="GLNativeWindow"/>.</summary>
+    protected internal GraphicsContext? GraphicsContext;
+    public GLControl? GLControl { get; private set; }
+
+    protected Form? FullScreenForm { get; private set; }
+    public bool IsFullScreen => FullScreenForm != null;
+
+    public bool MouseOverRenderArea;
+    public Point MouseDelta;
+    protected Point MousePreviousPosition;
+    protected Point InitialMousePosition;
+    protected TrackedKeys CurrentlyPressedKeys;
+    public Point LastMouseDelta { get; protected set; }
+
+    /// <summary>Whether the mouse has moved while a button was held since the last mouse down.</summary>
+    protected bool MouseDragged;
+
+    /// <summary>
+    /// Set when the viewport lets go of the cursor (focus lost, or escape in walk mode) so mouse look
+    /// does not take it straight back; cleared by clicking back into the viewport.
+    /// </summary>
+    protected bool MouseReleased;
+
+    private readonly Lock inputStateLock = new();
+    private bool registeredWithRenderLoop;
+    private Point pendingMouseDelta;
+    private int pendingMouseWheelDelta;
+    private bool cursorHiddenForDrag;
+    private bool currentDragIsTouch;
+    private bool mouseLookNeedsRebase;
+    private bool rawMouseLook;
+    private bool rawMouseDeltaSeen;
+    private static bool loggedRawMouseInput;
+    private Point mouseLookRestorePosition;
+
+    public bool GrabbedMouse
+    {
+        get;
+        set
+        {
+            if (field != value)
+            {
+                if (value)
+                {
+                    mouseLookNeedsRebase = true;
+                    GLControl?.BeginInvoke(() => HideCursorForMouseLook(Cursor.Position, touch: false));
+                }
+                else
+                {
+                    GLControl?.BeginInvoke(RestoreCursorAfterDrag);
+                }
+            }
+
+            field = value;
+        }
+    }
+
+#if DEBUG
+    public ShaderHotReload ShaderHotReload;
+    public static ContextFlags Flags => ContextFlags.ForwardCompatible | ContextFlags.Debug;
+#else
+    public static ContextFlags Flags => ContextFlags.ForwardCompatible;
+#endif
+
+    protected readonly Lock glLock = new();
+
+    private int MaxSamples;
+    protected int NumSamples => Math.Max(1, Math.Min(Settings.Config.AntiAliasingSamples, MaxSamples));
+
+    private bool FirstPaint = true;
+    public long LastUpdate { get; protected set; }
+    private long lastSwapTimestamp;
+    public bool Paused = true;
+
+    /// <summary>
+    /// Pauses this control.
+    /// </summary>
+    public virtual void OnDetachedFromRenderLoop()
+    {
+        Paused = true;
+
+        if (PrewarmPending)
+        {
+            PrewarmPending = false;
+            prewarmed.Set();
+        }
+    }
+    protected long lastFpsUpdate;
+
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CA2213:Disposable fields should be disposed", Justification = "RendererContext is disposed in Dispose method")]
+    protected internal RendererContext RendererContext;
+
+    protected Framebuffer? GLDefaultFramebuffer;
+    protected Framebuffer? MainFramebuffer;
+
+    public GLBaseControl(RendererContext rendererContext)
+    {
+        LastUpdate = Stopwatch.GetTimestamp();
+        RendererContext = rendererContext;
+
+#if DEBUG
+        ShaderHotReload = new ShaderHotReload(this, rendererContext.ShaderLoader);
+#endif
+    }
+
+    /// <summary>
+    /// Finds the viewer whose GL surface sits somewhere under <paramref name="container"/> (a tab page,
+    /// say), or null when it hosts none.
+    /// </summary>
+    public static GLBaseControl? FindHostedIn(Control container)
+    {
+        foreach (Control child in container.Controls)
+        {
+            if (child is GLControl { Tag: GLBaseControl viewer })
+            {
+                return viewer;
+            }
+
+            if (FindHostedIn(child) is { } nested)
+            {
+                return nested;
+            }
+        }
+
+        return null;
+    }
+
+    public Control InitializeUiControls(bool isPreview = false)
+    {
+        GLControl = new GLControl(glLock)
+        {
+            Dock = DockStyle.Fill,
+            // Back-reference for FindHostedIn: this class is not itself a WinForms control, so the
+            // GL surface is the only thing of ours in the tab's control tree.
+            Tag = this,
+        };
+
+        GLControl.Paint += OnGlControlPaint;
+        GLControl.SizeChanged += OnSizeChanged;
+        GLControl.MouseEnter += OnMouseEnter;
+        GLControl.MouseLeave += OnMouseLeave;
+        GLControl.MouseUp += OnMouseUp;
+        GLControl.MouseDown += OnMouseDown;
+        GLControl.LostFocus += OnLostFocus;
+
+        // High-frequency input (mouse move, wheel, keyboard) is intercepted as raw window messages
+        // instead of WinForms events, whose args allocate on every message. See PreFilterMessage.
+        Application.AddMessageFilter(this);
+
+        UiControl = new(isPreview)
+        {
+            Dock = DockStyle.Fill
+        };
+
+        UiControl.GLControlContainer.Controls.Add(GLControl);
+        GLControl.AttachNativeWindow(GLNativeWindow!);
+
+        GLNativeWindow!.MouseMove += OnNativeMouseMove;
+
+#if DEBUG
+        ShaderHotReload.SetSynchronizingObject(GLControl);
+#endif
+
+        UiControl.SuspendLayout();
+
+#if DEBUG // We want reload shaders to be the top most button
+        if (ShowReloadShadersButton)
+        {
+            var button = new ThemedButton
+            {
+                Text = "Reload shaders",
+                AutoSize = true,
+            };
+            button.Click += OnButtonClick;
+
+            void OnButtonClick(object? s, EventArgs e)
+            {
+                ShaderHotReload.ReloadShaders();
+            }
+
+            UiControl.AddControl(button);
+        }
+#endif
+
+        AddUiControls();
+
+        UiControl.ResumeLayout();
+
+        return UiControl;
+    }
+
+    /// <summary>
+    /// Force the GL control to redraw. Used when the viewer becomes visible after being obscured (e.g. by a
+    /// loading panel), which does not reliably deliver a paint message to the underlying GL control on its own.
+    /// </summary>
+    public virtual void NotifyVisible()
+    {
+        GLControl?.Invalidate();
+    }
+
+    /// <summary>Whether the debug sidebar gets the shader hot-reload button; viewers that never
+    /// compile scene shaders turn it off.</summary>
+    protected virtual bool ShowReloadShadersButton => true;
+
+    protected virtual void AddUiControls()
+    {
+        // Implemented in derived classes
+    }
+
+    private const int WM_KEYDOWN = 0x0100;
+    private const int WM_KEYUP = 0x0101;
+    private const int WM_SYSKEYDOWN = 0x0104;
+    private const int WM_SYSKEYUP = 0x0105;
+    private const int WM_SETFOCUS = 0x0007;
+    private const int WM_KILLFOCUS = 0x0008;
+    private const int WM_MOUSEMOVE = 0x0200;
+    private const int WM_MOUSEWHEEL = 0x020A;
+
+    /// <summary>
+    /// Intercepts the GL control's high-frequency input messages before WinForms translates each one
+    /// into freshly allocated event args (MouseEventArgs, KeyEventArgs, PreviewKeyDownEventArgs).
+    /// Swallowing them here also sinks all shortcuts into the control.
+    /// </summary>
+    public bool PreFilterMessage(ref Message m)
+    {
+        if (GLControl is not { IsHandleCreated: true } || m.HWnd != GLControl.Handle)
+        {
+            return false;
+        }
+
+        switch (m.Msg)
+        {
+            case WM_MOUSEMOVE:
+                OnMouseMove((short)m.LParam, (short)((nint)m.LParam >> 16));
+
+                // Let the first move of each hover reach the control, so WinForms fires MouseEnter
+                // and re-arms its WM_MOUSELEAVE tracking; swallow the rest of the flood.
+                return MouseOverRenderArea;
+
+            case WM_MOUSEWHEEL:
+                var screenPosition = new Point((short)m.LParam, (short)((nint)m.LParam >> 16));
+                OnMouseWheel((short)((nint)m.WParam >> 16), GLControl.PointToClient(screenPosition));
+                return true;
+
+            case WM_KEYDOWN or WM_SYSKEYDOWN:
+                OnKeyDown(((Keys)m.WParam & Keys.KeyCode) | Control.ModifierKeys);
+                return true;
+
+            case WM_KEYUP or WM_SYSKEYUP:
+                OnKeyUp((Keys)m.WParam & Keys.KeyCode);
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    protected virtual void OnKeyDown(Keys keyData)
+    {
+        var keyCode = keyData & Keys.KeyCode;
+
+        using (inputStateLock.EnterScope())
+        {
+            CurrentlyPressedKeys |= RemapKey(keyCode);
+        }
+
+        if (keyData == (Keys.Control | Keys.C))
+        {
+            var title = Program.MainForm.Text;
+            Program.MainForm.Text = "Source 2 Viewer - Copying image to clipboard…";
+            Application.DoEvents(); // Force the updated text to show up
+
+            using var bitmap = ReadPixelsToBitmap();
+            if (bitmap == null)
+            {
+                Log.Error(nameof(GLBaseControl), "Failed to copy image to clipboard, bitmap was null");
+            }
+            else
+            {
+                AppClipboard.SetImage(bitmap);
+            }
+
+            Program.MainForm.Text = title;
+
+            return;
+        }
+
+        if ((keyCode == Keys.Escape || keyCode == Keys.F11) && FullScreenForm != null)
+        {
+            FullScreenForm.Close();
+
+            return;
+        }
+
+        if (keyCode == Keys.F11)
+        {
+            var currentScreen = Screen.FromControl(Program.MainForm);
+
+            FullScreenForm = new Form
+            {
+                Text = "Source 2 Viewer Fullscreen",
+                Icon = Program.MainForm.Icon,
+                ControlBox = false,
+                FormBorderStyle = FormBorderStyle.None,
+                StartPosition = FormStartPosition.Manual,
+                Location = currentScreen.Bounds.Location,
+                Size = currentScreen.Bounds.Size,
+                WindowState = FormWindowState.Maximized
+            };
+            FullScreenForm.Controls.Add(GLControl);
+            FullScreenForm.Activated += RenderLoopThread.OnAppActivated;
+            FullScreenForm.Show();
+            FullScreenForm.Focus();
+            GLControl?.Invalidate();
+            FullScreenForm.FormClosed += OnFullScreenFormClosed;
+        }
+    }
+
+    protected virtual void OnKeyUp(Keys keyCode)
+    {
+        using var _ = inputStateLock.EnterScope();
+        CurrentlyPressedKeys &= ~RemapKey(keyCode);
+    }
+
+    protected virtual void OnResize(int w, int h)
+    {
+        if (w <= 0 || h <= 0)
+        {
+            return;
+        }
+
+        if (GLDefaultFramebuffer is null || MainFramebuffer is null)
+        {
+            return;
+        }
+
+        GLDefaultFramebuffer.Resize(w, h);
+
+        if (MainFramebuffer != GLDefaultFramebuffer)
+        {
+            MainFramebuffer.Resize(w, h, NumSamples);
+        }
+    }
+
+    public void OnLostFocus(object? sender, EventArgs e)
+    {
+        using (inputStateLock.EnterScope())
+        {
+            CurrentlyPressedKeys = TrackedKeys.None;
+        }
+
+        MouseDelta = Point.Empty;
+        currentDragIsTouch = false;
+        mouseLookNeedsRebase = true;
+        MouseReleased = true;
+        GrabbedMouse = false;
+        RestoreCursorAfterDrag();
+    }
+
+    private static TrackedKeys RemapKey(Keys key) => key switch
+    {
+        Keys.W => TrackedKeys.W,
+        Keys.A => TrackedKeys.A,
+        Keys.S => TrackedKeys.S,
+        Keys.D => TrackedKeys.D,
+        Keys.Q => TrackedKeys.Q,
+        Keys.Z => TrackedKeys.Z,
+        Keys.Up => TrackedKeys.W,
+        Keys.Down => TrackedKeys.S,
+        Keys.Left => TrackedKeys.A,
+        Keys.Right => TrackedKeys.D,
+        Keys.ControlKey => TrackedKeys.Control,
+        Keys.ShiftKey or Keys.LShiftKey => TrackedKeys.Shift,
+        Keys.Menu or Keys.LMenu => TrackedKeys.Alt,
+        Keys.Space => TrackedKeys.Space,
+        Keys.X => TrackedKeys.X,
+        Keys.D1 => TrackedKeys.Slot1,
+        Keys.D2 => TrackedKeys.Slot2,
+        Keys.D3 => TrackedKeys.Slot3,
+        Keys.D4 => TrackedKeys.Slot4,
+        Keys.E => TrackedKeys.E,
+        Keys.F => TrackedKeys.F,
+        Keys.Escape => TrackedKeys.Escape,
+        _ => TrackedKeys.None,
+    };
+
+    private void OnFullScreenFormClosed(object? sender, EventArgs e)
+    {
+        UiControl?.GLControlContainer.Controls.Add(GLControl);
+        GLControl?.Focus();
+
+        var form = (Form?)sender;
+        form?.FormClosed -= OnFullScreenFormClosed;
+        form?.Activated -= RenderLoopThread.OnAppActivated;
+
+        FullScreenForm = null;
+    }
+
+    public virtual void Dispose()
+    {
+        RendererContext.CancelLoading();
+
+        using var lockedGl = glLock.EnterScope();
+
+        RestoreCursorAfterDrag();
+
+        if (registeredWithRenderLoop)
+        {
+            registeredWithRenderLoop = false;
+            RenderLoopThread.UnregisterInstance();
+        }
+
+        if (GLControl is not null)
+        {
+            RenderLoopThread.UnsetCurrentGLControl(this);
+
+            GLControl.Paint -= OnGlControlPaint;
+            GLControl.SizeChanged -= OnSizeChanged;
+            GLControl.MouseEnter -= OnMouseEnter;
+            GLControl.MouseLeave -= OnMouseLeave;
+            GLControl.MouseUp -= OnMouseUp;
+            GLControl.MouseDown -= OnMouseDown;
+            GLControl.LostFocus -= OnLostFocus;
+
+            Application.RemoveMessageFilter(this);
+
+            UiControl?.Dispose();
+        }
+
+#if DEBUG
+        ShaderHotReload?.Dispose();
+#endif
+
+        prewarmed.Dispose();
+        FullScreenForm?.Dispose();
+
+        if (GLNativeWindow is not null)
+        {
+            GLNativeWindow.MouseMove -= OnNativeMouseMove;
+        }
+
+        NativeWindowFactory.Destroy(GLNativeWindow);
+        GraphicsContext = null;
+        RendererContext.Dispose();
+    }
+
+    private void OnMouseLeave(object? sender, EventArgs e)
+    {
+        MouseOverRenderArea = false;
+    }
+
+    private void OnMouseEnter(object? sender, EventArgs e)
+    {
+        MouseOverRenderArea = true;
+    }
+
+    protected virtual void OnMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right)
+        {
+            return;
+        }
+
+        InitialMousePosition = new Point(e.X, e.Y);
+        MouseDelta = Point.Empty;
+        MouseDragged = false;
+        MouseReleased = false;
+        currentDragIsTouch = IsTouchOrPenInput();
+        mouseLookNeedsRebase = true;
+
+        if (GLControl != null)
+        {
+            GLControl.Focus();
+            MousePreviousPosition = GLControl.PointToScreen(InitialMousePosition);
+        }
+
+        using var _ = inputStateLock.EnterScope();
+
+        if (e.Button == MouseButtons.Left)
+        {
+            CurrentlyPressedKeys |= TrackedKeys.MouseLeft;
+        }
+        else if (e.Button == MouseButtons.Right)
+        {
+            CurrentlyPressedKeys |= TrackedKeys.MouseRight;
+        }
+    }
+
+    protected virtual void OnMouseUp(object? sender, MouseEventArgs e)
+    {
+        using var _ = inputStateLock.EnterScope();
+        if (e.Button == MouseButtons.Left)
+        {
+            CurrentlyPressedKeys &= ~TrackedKeys.MouseLeft;
+        }
+        else if (e.Button == MouseButtons.Right)
+        {
+            // right click context menu?
+            CurrentlyPressedKeys &= ~TrackedKeys.MouseRight;
+        }
+
+        if ((CurrentlyPressedKeys & TrackedKeys.MouseLeftOrRight) == 0)
+        {
+            pendingMouseDelta = Point.Empty;
+            MouseDelta = Point.Empty;
+            currentDragIsTouch = false;
+            mouseLookNeedsRebase = true;
+
+            if (!GrabbedMouse)
+            {
+                RestoreCursorAfterDrag();
+            }
+        }
+    }
+
+    private void HideCursorForMouseLook(Point restorePosition, bool touch)
+    {
+        if (cursorHiddenForDrag || GLControl == null)
+        {
+            return;
+        }
+
+        cursorHiddenForDrag = true;
+        mouseLookRestorePosition = restorePosition;
+        mouseLookNeedsRebase = true;
+
+        if (!touch)
+        {
+            Cursor.Clip = GLControl.RectangleToScreen(GLControl.ClientRectangle);
+            BeginRawMouseLook();
+        }
+
+        SetCursorVisible(false);
+    }
+
+    private void RestoreCursorAfterDrag()
+    {
+        if (!cursorHiddenForDrag)
+        {
+            return;
+        }
+
+        cursorHiddenForDrag = false;
+        mouseLookNeedsRebase = true;
+        EndRawMouseLook();
+        Cursor.Clip = Rectangle.Empty;
+        Cursor.Position = mouseLookRestorePosition;
+        SetCursorVisible(true);
+    }
+
+    private void BeginRawMouseLook()
+    {
+        if (rawMouseLook || GLNativeWindow == null
+            || !OpenTK.Windowing.GraphicsLibraryFramework.GLFW.RawMouseMotionSupported())
+        {
+            return;
+        }
+
+        rawMouseLook = true;
+        mouseLookNeedsRebase = true;
+        GLNativeWindow.CursorState = CursorState.Grabbed;
+        GLNativeWindow.RawMouseInput = true;
+        SendFocusToNativeWindow(WM_SETFOCUS);
+    }
+
+    private void EndRawMouseLook()
+    {
+        if (!rawMouseLook)
+        {
+            return;
+        }
+
+        rawMouseLook = false;
+        rawMouseDeltaSeen = false;
+
+        if (GLNativeWindow != null)
+        {
+            SendFocusToNativeWindow(WM_KILLFOCUS);
+            GLNativeWindow.CursorState = CursorState.Normal;
+        }
+    }
+
+    private unsafe void SendFocusToNativeWindow(uint message)
+    {
+        if (GLNativeWindow is not { Exists: true })
+        {
+            return;
+        }
+
+        var hWnd = (HWND)OpenTK.Windowing.GraphicsLibraryFramework.GLFW.GetWin32Window(GLNativeWindow.WindowPtr);
+
+        if (!hWnd.IsNull)
+        {
+            PInvoke.SendMessage(hWnd, message, default, default);
+        }
+    }
+
+    // Windows resets the cursor visibility counter when a mouse is added or removed, so a hide cannot
+    // count on its own show to undo it. Drive the counter to the wanted state instead of stepping it once.
+    private static void SetCursorVisible(bool visible)
+    {
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            var displayCount = PInvoke.ShowCursor(visible);
+
+            if (visible ? displayCount >= 0 : displayCount < 0)
+            {
+                return;
+            }
+        }
+    }
+
+    private Point CenterOfRenderArea()
+    {
+        var renderArea = GLControl!.RectangleToScreen(GLControl.ClientRectangle);
+        return new Point(renderArea.X + renderArea.Width / 2, renderArea.Y + renderArea.Height / 2);
+    }
+
+    private void RecenterCursor()
+    {
+        if (GLControl is not { IsHandleCreated: true })
+        {
+            return;
+        }
+
+        var center = CenterOfRenderArea();
+
+        if (Cursor.Position != center)
+        {
+            Cursor.Position = center;
+        }
+    }
+
+    private void OnNativeMouseMove(MouseMoveEventArgs e)
+    {
+        if (!rawMouseLook)
+        {
+            return;
+        }
+
+        var deltaX = (int)e.DeltaX;
+        var deltaY = (int)e.DeltaY;
+
+        if (deltaX == 0 && deltaY == 0)
+        {
+            return;
+        }
+
+        if (!rawMouseDeltaSeen)
+        {
+            rawMouseDeltaSeen = true;
+
+            if (!loggedRawMouseInput)
+            {
+                loggedRawMouseInput = true;
+                Log.Debug(nameof(GLBaseControl), "Raw mouse input enabled");
+            }
+
+            return;
+        }
+
+        using var _ = inputStateLock.EnterScope();
+
+        pendingMouseDelta.X += deltaX;
+        pendingMouseDelta.Y += deltaY;
+        MouseDragged = true;
+    }
+
+    protected virtual void OnMouseMove(int x, int y)
+    {
+        if (GLControl == null)
+        {
+            return;
+        }
+
+        var dragging = (CurrentlyPressedKeys & TrackedKeys.MouseLeftOrRight) != 0;
+        var touch = currentDragIsTouch || IsTouchOrPenInput();
+
+        if (!dragging && !(GrabbedMouse && !touch))
+        {
+            return;
+        }
+
+        if (rawMouseLook && !touch)
+        {
+            RecenterCursor();
+            return;
+        }
+
+        using var _ = inputStateLock.EnterScope();
+
+        var position = GLControl.PointToScreen(new Point(x, y));
+
+        if (mouseLookNeedsRebase)
+        {
+            mouseLookNeedsRebase = false;
+            MousePreviousPosition = position;
+            return;
+        }
+
+        var delta = new Point(
+            position.X - MousePreviousPosition.X,
+            position.Y - MousePreviousPosition.Y
+        );
+
+        pendingMouseDelta.X += delta.X;
+        pendingMouseDelta.Y += delta.Y;
+
+        if (delta != Point.Empty)
+        {
+            MouseDragged = true;
+            HideCursorForMouseLook(MousePreviousPosition, touch);
+        }
+
+        // Touch and pen are absolute digitizers: warping the cursor doesn't move the contact point
+        if (touch)
+        {
+            MousePreviousPosition = position;
+            return;
+        }
+
+        if (rawMouseLook)
+        {
+            return;
+        }
+
+        if (!cursorHiddenForDrag)
+        {
+            MousePreviousPosition = position;
+            return;
+        }
+
+        // Relative mouse: pin the cursor so the look can continue past the screen edges
+        MousePreviousPosition = CenterOfRenderArea();
+        Cursor.Position = MousePreviousPosition;
+    }
+
+    // Signature Windows stamps onto mouse messages synthesized from touch or pen input.
+    // See "Distinguishing Pen and Touch Input from Mouse Input" in the Windows docs.
+    private const long MouseEventFromTouchOrPen = 0xFF515700;
+
+    private static bool IsTouchOrPenInput()
+        => ((nint)PInvoke.GetMessageExtraInfo() & 0xFFFFFF00) == MouseEventFromTouchOrPen;
+
+    protected virtual void OnMouseWheel(int delta, Point location)
+    {
+        using var _ = inputStateLock.EnterScope();
+        if (delta > 0)
+        {
+            CurrentlyPressedKeys |= TrackedKeys.MouseWheelUp;
+        }
+        else if (delta < 0)
+        {
+            CurrentlyPressedKeys |= TrackedKeys.MouseWheelDown;
+        }
+
+        pendingMouseWheelDelta += delta;
+    }
+
+    protected Point ConsumePendingMouseDelta()
+    {
+        using var _ = inputStateLock.EnterScope();
+        var delta = pendingMouseDelta;
+        pendingMouseDelta = Point.Empty;
+        MouseDelta = Point.Empty;
+        return delta;
+    }
+
+    protected int ConsumePendingMouseWheelDelta()
+    {
+        using var _ = inputStateLock.EnterScope();
+        var wheelDelta = pendingMouseWheelDelta;
+        pendingMouseWheelDelta = 0;
+        return wheelDelta;
+    }
+
+    protected TrackedKeys ConsumeCurrentlyPressedKeysForUpdate()
+    {
+        using var _ = inputStateLock.EnterScope();
+        var keys = CurrentlyPressedKeys;
+
+        // Clear mouse wheel events after processing (they're one-time events)
+        CurrentlyPressedKeys &= ~(TrackedKeys.MouseWheelUp | TrackedKeys.MouseWheelDown);
+
+        return keys;
+    }
+
+    private void OnGlControlPaint(object? sender, EventArgs e) => AttachToRenderLoop();
+
+    internal void AttachToRenderLoop()
+    {
+        if (!RenderLoopThread.IsCurrentGLControl(this))
+        {
+            ApplySettingsToRenderState();
+        }
+
+        RenderLoopThread.SetCurrentGLControl(this);
+    }
+
+    // Only reapplied when the setting changes, so a field of view set on the viewer itself survives switching tabs
+    private float appliedFieldOfView;
+
+    /// <summary>Push user settings into the render state.</summary>
+    private void ApplySettingsToRenderState()
+    {
+        using var lockedGl = MakeCurrent();
+
+        GLNativeWindow?.Context.SwapInterval = Settings.Config.Vsync;
+
+        if (this is GLSceneViewer viewer)
+        {
+            RendererContext.ViewmodelFieldOfView = Settings.Config.ViewmodelFieldOfView;
+
+            var fieldOfView = Settings.Config.FieldOfView;
+
+            if (fieldOfView != appliedFieldOfView)
+            {
+                appliedFieldOfView = fieldOfView;
+                viewer.SetFieldOfView(fieldOfView);
+            }
+        }
+    }
+
+    protected bool ShouldResize;
+
+#if DEBUG
+    /// <summary>How many frames have been painted, presented or not.</summary>
+    public long PaintedFrames { get; private set; }
+#endif
+
+    protected bool SkipBufferSwap;
+
+    protected virtual void OnSizeChanged(object? sender, EventArgs e)
+    {
+        ShouldResize = GLControl is not null && GLControl.Width > 0 && GLControl.Height > 0;
+    }
+
+    protected virtual void OnFirstPaint()
+    {
+        var elapsed = Stopwatch.GetElapsedTime(LastUpdate, Stopwatch.GetTimestamp());
+
+        Log.Debug(nameof(GLBaseControl), $"First paint: {elapsed}");
+    }
+
+    protected virtual void OnUpdate(float frameTime)
+    {
+        //
+    }
+
+    protected virtual void OnPaint(float frameTime)
+    {
+        //
+    }
+
+    public void InitializeLoad()
+    {
+        using var loading = RendererContext.BeginLoading();
+
+        InitializeLoadCore();
+    }
+
+    private void InitializeLoadCore()
+    {
+        // Create the GLFW window on the UI thread even though this method may be called from a
+        // background thread. This is necessary because of Win32 window thread-affinity rules.
+        //
+        // The goal is to load GL resources on a background thread to avoid blocking the UI during
+        // file loading, but we also need to render into a WinForms control which requires the OpenGL
+        // window to be reparented as a child of that control.
+        //
+        // Win32 has strict rules about window ownership. A window can only be manipulated (resized,
+        // reparented, styled) by the thread that created it. Calling SetParent or SetWindowLongPtr
+        // from a different thread causes deadlocks because these APIs send synchronous window messages
+        // that must be processed by the owning thread. If that thread is blocked, the messages never
+        // get processed and the calling thread freezes.
+        //
+        // We tried creating the window on the background thread and reparenting it from the UI thread,
+        // but the Win32 APIs would block waiting for the background thread to process messages while
+        // the background thread was busy loading resources. We also tried having the background thread
+        // invoke back to the UI thread to get the parent handle and then do the reparenting, but this
+        // caused a deadlock where each thread was waiting for the other. Creating a separate render
+        // thread had the same thread-affinity issues. Using two windows with shared contexts mostly
+        // worked but caused black screens because each window has its own default framebuffer and we
+        // were getting the wrong one.
+        //
+        // The solution is to create the window on the UI thread but transfer the OpenGL context to
+        // the background thread for loading. Note that OpenGL contexts cannot exist without a window
+        // because they require a drawing surface allocated by the OS. OpenGL contexts have different
+        // rules than windows though. A context can only be current on one thread at a time, but it
+        // can be made current on different threads at different times. You release it from one thread
+        // with MakeNoneCurrent and then make it current on another thread with MakeCurrent.
+        //
+        // So the sequence is: UI thread creates the window (via Invoke if needed) which makes it owned
+        // by the UI thread so it can be reparented later. The OpenGL context is automatically made
+        // current on the UI thread. We release the context with MakeNoneCurrent so it's not bound to
+        // any thread. The background thread makes the context current and loads all the GL resources
+        // like textures, shaders, and VBOs. This is the slow part that we don't want blocking the UI.
+        // When loading is done the background thread releases the context. Finally the UI thread makes
+        // the context current again when creating the WinForms controls and can safely reparent the window
+        // since it owns it and render since it has the context.
+        //
+        // This works because window operations happen on the thread that created the window (UI thread)
+        // but context operations can happen on any thread as long as the context is only current on one
+        // thread at a time. Resources created in a context are available regardless of which thread
+        // makes the context current.
+        Program.MainForm.Invoke(() =>
+        {
+            Debug.Assert(GLNativeWindow is null);
+
+            var settings = new NativeWindowSettings()
+            {
+                APIVersion = GLEnvironment.RequiredVersion,
+                Flags = Flags,
+                RedBits = 8,
+                GreenBits = 8,
+                BlueBits = 8,
+                AlphaBits = 0,
+                DepthBits = 0,
+                StencilBits = 0,
+                StartFocused = false,
+                StartVisible = false,
+                ClientSize = new(4, 4),
+                AutoLoadBindings = false,
+                AutoIconify = false,
+                WindowBorder = OpenTK.Windowing.Common.WindowBorder.Hidden,
+                WindowState = OpenTK.Windowing.Common.WindowState.Normal,
+                Title = "Source 2 Viewer OpenGL",
+            };
+            GLNativeWindow = NativeWindowFactory.Create(settings);
+
+            // Showing a GLFW window also focuses it, which takes the foreground when Windows allows it
+            if (Automation.Automation.IsEnabled)
+            {
+                unsafe
+                {
+                    OpenTK.Windowing.GraphicsLibraryFramework.GLFW.SetWindowAttrib(GLNativeWindow.WindowPtr, OpenTK.Windowing.GraphicsLibraryFramework.WindowAttribute.FocusOnShow, false);
+                }
+            }
+
+            GLNativeWindow.Context.MakeNoneCurrent();
+        });
+
+        Debug.Assert(GLNativeWindow is not null);
+
+        RenderLoopThread.RegisterInstance();
+        registeredWithRenderLoop = true;
+
+        GraphicsContext = RendererContext.Device.CreateContext(new GLFWSurface(GLNativeWindow.Context));
+
+        LoadGLResources();
+
+        if (PrewarmsRenderer)
+        {
+            PrewarmPending = true;
+
+            RenderLoopThread.SetCurrentGLControl(this);
+            prewarmed.Wait();
+            RenderLoopThread.UnsetCurrentGLControl(this);
+
+            // The warm-up runs on the render loop thread, rethrow its failure to whoever is loading this viewer
+            PrewarmFailure?.Throw();
+
+            RendererContext.CancellationToken.ThrowIfCancellationRequested();
+        }
+    }
+
+    private void LoadGLResources()
+    {
+        Debug.Assert(GLNativeWindow is not null);
+
+        using var lockedGl = MakeCurrent();
+
+        GLNativeWindow.Context.SwapInterval = Settings.Config.Vsync;
+
+        if (!loadedBindings)
+        {
+            LoadOpenGLBindings();
+            loadedBindings = true;
+        }
+
+        GL.Enable(EnableCap.DebugOutput);
+        GL.DebugMessageCallback(OpenGLDebugMessageDelegate, IntPtr.Zero);
+
+#if DEBUG
+        GL.Enable(EnableCap.DebugOutputSynchronous);
+
+        // Filter out performance warnings
+        GL.DebugMessageControl(DebugSourceControl.DebugSourceApi, DebugTypeControl.DebugTypeOther, DebugSeverityControl.DebugSeverityNotification, 0, Array.Empty<int>(), false);
+
+        // Filter out debug group push/pops
+        GL.DebugMessageControl(DebugSourceControl.DebugSourceApplication, DebugTypeControl.DontCare, DebugSeverityControl.DebugSeverityNotification, 0, Array.Empty<int>(), false);
+#else
+        // Only log high severity messages in release builds
+        GL.DebugMessageControl(DebugSourceControl.DontCare, DebugTypeControl.DontCare, DebugSeverityControl.DontCare, 0, Array.Empty<int>(), false);
+        GL.DebugMessageControl(DebugSourceControl.DontCare, DebugTypeControl.DontCare, DebugSeverityControl.DebugSeverityHigh, 0, Array.Empty<int>(), true);
+#endif
+
+        GLEnvironment.Initialize(VrfGuiContext.Logger);
+        GLEnvironment.SetDefaultRenderState();
+
+        MaxSamples = GL.GetInteger(GetPName.MaxSamples);
+        GLDefaultFramebuffer = Framebuffer.GLDefaultFramebuffer;
+
+        // Framebuffer used to draw geometry
+        MainFramebuffer = Framebuffer.Prepare(nameof(MainFramebuffer),
+            4, 4,
+            NumSamples,
+            ImageFormat.RGBA16161616F,
+            ImageFormat.D32
+        );
+
+        MainFramebuffer.Initialize();
+
+        OnGLLoad();
+
+        RendererContext.ShaderLoader.LinkLoadedShaders();
+    }
+
+    /// <summary>Reports how long the buffer swap blocked the render thread.</summary>
+    protected virtual void OnBufferSwapped(double blockedMs, double framePeriodMs) { }
+
+    protected virtual void OnGLLoad()
+    {
+        //
+    }
+
+    /// <summary>Whether loading waits for the warm-up; such viewers must be loaded off the UI thread.</summary>
+    protected virtual bool PrewarmsRenderer => false;
+
+    protected virtual void PrewarmRenderer()
+    {
+    }
+
+    private readonly ManualResetEventSlim prewarmed = new(false);
+
+    private bool PrewarmPending { get; set; }
+
+    private ExceptionDispatchInfo? PrewarmFailure;
+
+    /// <summary>Runs the warm-up loading is waiting on, if any, and reports whether it did. Called by the
+    /// render loop thread, which is the one the driver has to see the draws come from.</summary>
+    public bool TryPrewarm()
+    {
+        if (!PrewarmPending)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var lockedGl = MakeCurrent();
+            PrewarmRenderer();
+        }
+        catch (Exception e)
+        {
+            PrewarmFailure = ExceptionDispatchInfo.Capture(e);
+        }
+        finally
+        {
+            PrewarmPending = false;
+            prewarmed.Set();
+        }
+
+        return true;
+    }
+
+    protected void SetMoveSpeedOrZoomLabel(string text) => UiControl?.SetMoveSpeed(text);
+
+    private static void OnDebugMessage(DebugSource source, DebugType type, int id, DebugSeverity severity, int length, IntPtr pMessage, IntPtr pUserParam)
+    {
+        var severityStr = severity.ToString().Replace("DebugSeverity", string.Empty, StringComparison.Ordinal);
+        var sourceStr = source.ToString().Replace("DebugSource", string.Empty, StringComparison.Ordinal);
+        var typeStr = type.ToString().Replace("DebugType", string.Empty, StringComparison.Ordinal);
+        var message = System.Runtime.InteropServices.Marshal.PtrToStringUTF8(pMessage, length);
+        var error = $"[{severityStr} {sourceStr} {typeStr}] {message}";
+
+        switch (type)
+        {
+            case DebugType.DebugTypeError: Log.Error("OpenGL", error); break;
+            default: Log.Debug("OpenGL", error); break;
+        }
+
+#if DEBUG
+        // Without a debugger to catch it, breaking would stop the viewer at a system dialog
+        if (type == DebugType.DebugTypeError && source != DebugSource.DebugSourceShaderCompiler && Debugger.IsAttached)
+        {
+            Debugger.Break();
+        }
+#endif
+    }
+
+    protected static readonly DebugProc OpenGLDebugMessageDelegate = OnDebugMessage;
+
+    public bool Draw(bool isPaused)
+    {
+        using var lockedGl = glLock.EnterScope();
+
+        if (GLNativeWindow == null || !GLNativeWindow.Exists || GraphicsContext == null)
+        {
+            Log.Debug(nameof(GLBaseControl), "Attempted to draw onto destroyed GL Native Window.");
+            RenderLoopThread.UnsetCurrentGLControl(this);
+            return false;
+        }
+
+        try
+        {
+            GraphicsContext.Begin();
+        }
+        catch (OpenTK.Windowing.GraphicsLibraryFramework.GLFWException e)
+        {
+            // 'The requested transformation operation is not supported.' when resizing the app
+            // 'The handle is invalid.' when changing tab visibility
+            Log.Debug(nameof(GLFWGraphicsContext), e.Message);
+            return false;
+        }
+
+        if (ShouldResize)
+        {
+            OnResize(GLNativeWindow.Size.X, GLNativeWindow.Size.Y);
+            ShouldResize = false;
+        }
+
+        var firstDraw = FirstPaint;
+
+        if (firstDraw)
+        {
+            OnFirstPaint();
+            FirstPaint = false;
+        }
+
+        var wasPaused = Paused;
+        var resumingRender = wasPaused && !isPaused;
+        Paused = isPaused;
+
+        var currentTime = Stopwatch.GetTimestamp();
+        var elapsed = resumingRender
+            ? TimeSpan.Zero
+            : Stopwatch.GetElapsedTime(LastUpdate, currentTime);
+
+        // Clamp frametime so it does not cause issues in things like particle rendering
+        var frameTime = MathF.Min(1f, (float)elapsed.TotalSeconds);
+        LastUpdate = currentTime;
+
+        try
+        {
+            OnUpdate(frameTime);
+            OnPaint(frameTime);
+        }
+        catch (OperationCanceledException) when (RendererContext.CancellationToken.IsCancellationRequested)
+        {
+            // The tab was closed while the scene was loading on this thread
+            GraphicsContext.End();
+            RenderLoopThread.UnsetCurrentGLControl(this);
+            return false;
+        }
+
+#if DEBUG
+        PaintedFrames++;
+#endif
+
+        if (SkipBufferSwap)
+        {
+            SkipBufferSwap = false;
+            GraphicsContext.End();
+            return false;
+        }
+
+        var swapStart = Stopwatch.GetTimestamp();
+        GLNativeWindow.Context.SwapBuffers();
+        var swapEnd = Stopwatch.GetTimestamp();
+
+        var framePeriodMs = isPaused || resumingRender || lastSwapTimestamp == 0
+            ? 0.0
+            : Stopwatch.GetElapsedTime(lastSwapTimestamp, swapEnd).TotalMilliseconds;
+
+        OnBufferSwapped(Stopwatch.GetElapsedTime(swapStart, swapEnd).TotalMilliseconds, framePeriodMs);
+
+        lastSwapTimestamp = swapEnd;
+
+        GraphicsContext.End();
+
+        if (firstDraw)
+        {
+            LastUpdate = Stopwatch.GetTimestamp();
+        }
+
+        return true;
+    }
+
+    protected virtual void BlitFramebufferToScreen()
+    {
+        //
+    }
+
+    public GLLockScope MakeCurrent() => new(glLock, this);
+
+    static bool loadedBindings;
+    private static void LoadOpenGLBindings()
+    {
+        var provider = new OpenTK.Windowing.GraphicsLibraryFramework.GLFWBindingsContext();
+        GL.LoadBindings(provider);
+    }
+
+    /// <summary>Captures what the viewer exports as an image, which by default is the frame the window shows.</summary>
+    protected virtual SkiaSharp.SKBitmap? ReadPixelsToBitmap() => ReadWindowPixels();
+
+    internal SkiaSharp.SKBitmap? CaptureFrame() => ReadPixelsToBitmap();
+
+    /// <summary>Reads back the frame as the window shows it.</summary>
+    internal SkiaSharp.SKBitmap? ReadWindowPixels()
+    {
+        if (GLDefaultFramebuffer is null)
+        {
+            return null;
+        }
+
+        var bitmap = new SkiaSharp.SKBitmap(GLDefaultFramebuffer.Width, GLDefaultFramebuffer.Height, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Opaque);
+        var pixels = bitmap.GetPixels(out var length);
+
+        using var lockedGl = MakeCurrent();
+
+        BlitFramebufferToScreen();
+
+        GLDefaultFramebuffer.Bind(FramebufferTarget.ReadFramebuffer);
+        GL.ReadPixels(0, 0, GLDefaultFramebuffer.Width, GLDefaultFramebuffer.Height, PixelFormat.Bgra, PixelType.UnsignedByte, pixels);
+
+        // Flip y
+        using var canvas = new SkiaSharp.SKCanvas(bitmap);
+        canvas.Scale(1, -1, 0, bitmap.Height / 2f);
+        canvas.DrawBitmap(bitmap, new SkiaSharp.SKPoint(), SkiaSharp.SKSamplingOptions.Default);
+
+        return bitmap;
+    }
+}

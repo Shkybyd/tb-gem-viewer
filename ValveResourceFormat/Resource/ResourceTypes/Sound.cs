@@ -1,0 +1,688 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using ValveKeyValue;
+using ValveResourceFormat.Serialization.KeyValues;
+
+namespace ValveResourceFormat.ResourceTypes
+{
+
+    /// <summary>
+    /// Represents an emphasis sample for voice modulation.
+    /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/soundsystem_voicecontainers/CAudioEmphasisSample">CAudioEmphasisSample</seealso>
+    public readonly struct EmphasisSample
+    {
+        /// <summary>
+        /// Gets the time of the emphasis sample.
+        /// </summary>
+        public float Time { get; init; }
+
+        /// <summary>
+        /// Gets the emphasis value.
+        /// </summary>
+        public float Value { get; init; }
+    }
+
+    /// <summary>
+    /// Represents a phoneme timing tag for lip-sync animation.
+    /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/soundsystem_voicecontainers/CAudioPhonemeTag">CAudioPhonemeTag</seealso>
+    public readonly struct PhonemeTag
+    {
+        /// <summary>
+        /// Gets the start time of the phoneme.
+        /// </summary>
+        public float StartTime { get; init; }
+
+        /// <summary>
+        /// Gets the end time of the phoneme.
+        /// </summary>
+        public float EndTime { get; init; }
+
+        /// <summary>
+        /// Gets the phoneme identifier code.
+        /// </summary>
+        public ushort PhonemeCode { get; init; }
+    }
+
+    /// <summary>
+    /// Represents a sentence with phoneme and emphasis data for voice playback.
+    /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/soundsystem_voicecontainers/CAudioSentence">CAudioSentence</seealso>
+    public partial class Sentence
+    {
+        /// <summary>
+        /// Gets a value indicating whether voice ducking should be applied.
+        /// </summary>
+        public bool ShouldVoiceDuck { get; init; }
+
+        /// <summary>
+        /// Gets the phoneme tags for lip-sync.
+        /// </summary>
+        public required PhonemeTag[] RunTimePhonemes { get; init; }
+
+        /// <summary>
+        /// Gets the emphasis samples for voice modulation.
+        /// </summary>
+        public EmphasisSample[] EmphasisSamples { get; init; } = [];
+    }
+
+    /// <summary>
+    /// Represents a sound resource containing audio data and metadata.
+    /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/soundsystem_voicecontainers/CVSound">CVSound</seealso>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/soundsystem_voicecontainers/CVoiceContainerBase">CVoiceContainerBase</seealso>
+    public class Sound : Block
+    {
+        /// <summary>
+        /// Specifies the audio file container type.
+        /// </summary>
+        public enum AudioFileType
+        {
+            /// <summary>No audio data, such as containers that only reference other sounds.</summary>
+            None = -1,
+            /// <summary>Advanced Audio Coding container.</summary>
+            AAC = 0,
+            /// <summary>Waveform Audio File Format container.</summary>
+            WAV = 1,
+            /// <summary>MPEG Layer 3 container.</summary>
+            MP3 = 2,
+        }
+
+        /// <summary>
+        /// Specifies the audio encoding format for version 4 sound files.
+        /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/soundsystem_voicecontainers/CVSoundFormat_t">CVSoundFormat_t</seealso>
+        public enum AudioFormatV4
+        {
+            /// <summary>16-bit PCM audio.</summary>
+            PCM16 = 0,
+            /// <summary>8-bit PCM audio.</summary>
+            PCM8 = 1,
+            /// <summary>MPEG Layer 3 compressed audio.</summary>
+            MP3 = 2,
+            /// <summary>Adaptive Differential Pulse Code Modulation compressed audio.</summary>
+            ADPCM = 3,
+        }
+
+        /// <summary>
+        /// Specifies the WAVE audio encoding format.
+        /// </summary>
+        public enum WaveAudioFormat
+        {
+            /// <summary>Unknown or unspecified audio encoding.</summary>
+            Unknown = 0,
+            /// <summary>Uncompressed pulse-code modulation.</summary>
+            PCM = 1,
+            /// <summary>Adaptive Differential Pulse Code Modulation compressed audio.</summary>
+            ADPCM = 2,
+        }
+
+        /// <inheritdoc/>
+        public override BlockType Type => BlockType.DATA;
+
+        /// <summary>
+        /// Gets the audio file type.
+        /// </summary>
+        /// <value>The file type.</value>
+        public AudioFileType SoundType { get; private set; } = AudioFileType.None;
+
+        /// <summary>
+        /// Gets the samples per second.
+        /// </summary>
+        /// <value>The sample rate.</value>
+        public uint SampleRate { get; private set; }
+
+        /// <summary>
+        /// Gets the bit size.
+        /// </summary>
+        /// <value>The bit size.</value>
+        public uint Bits { get; private set; }
+
+        /// <summary>
+        /// Gets the number of channels. 1 for mono, 2 for stereo.
+        /// </summary>
+        /// <value>The number of channels.</value>
+        public uint Channels { get; private set; }
+
+        /// <summary>
+        /// Gets the bitstream encoding format.
+        /// </summary>
+        /// <value>The audio format.</value>
+        public WaveAudioFormat AudioFormat { get; private set; }
+
+        /// <summary>
+        /// Gets the size of each audio sample in bytes.
+        /// </summary>
+        public uint SampleSize { get; private set; }
+
+        /// <summary>
+        /// Gets the total number of audio samples.
+        /// </summary>
+        public uint SampleCount { get; private set; }
+
+        /// <summary>
+        /// Gets the loop start position in samples.
+        /// </summary>
+        public int LoopStart { get; private set; }
+
+        /// <summary>
+        /// Gets the loop end position in samples.
+        /// </summary>
+        public int LoopEnd { get; private set; }
+
+        /// <summary>
+        /// Gets the duration of the sound in seconds.
+        /// </summary>
+        public float Duration { get; private set; }
+
+        /// <summary>
+        /// Gets the sentence data containing phoneme and emphasis information.
+        /// </summary>
+        public Sentence? Sentence { get; private set; }
+
+        /// <summary>
+        /// Gets the WAVE format header data for ADPCM audio.
+        /// </summary>
+        public byte[] Header { get; private set; } = [];
+
+        /// <summary>
+        /// Gets the size of the streaming audio data in bytes.
+        /// </summary>
+        public uint StreamingDataSize { get; private set; }
+
+        private BinaryReader? Reader => Resource.Reader;
+
+        /// <inheritdoc/>
+        public override void Read(BinaryReader reader)
+        {
+            // Version 5 sounds have an empty DATA block and store their info in CTRL
+            if (ReadFromCtrl())
+            {
+                return;
+            }
+
+            if (Size == 0)
+            {
+                return;
+            }
+
+            reader.BaseStream.Position = Offset;
+
+            if (Resource.Version > 4)
+            {
+                throw new InvalidDataException($"Invalid vsnd version '{Resource.Version}'");
+            }
+
+            if (Resource.Version >= 4)
+            {
+                SampleRate = reader.ReadUInt16();
+                var soundFormat = (AudioFormatV4)reader.ReadByte();
+                Channels = reader.ReadByte();
+
+                SetSoundFormatBits(soundFormat);
+            }
+            else
+            {
+                var bitpackedSoundInfo = reader.ReadUInt32();
+                var type = ExtractSub(bitpackedSoundInfo, 0, 2);
+                var bits = ExtractSub(bitpackedSoundInfo, 2, 5);
+                // Bits 9-11 are the bytes per sample frame, channels times bytes per sample
+                var waveFormat = (WaveAudioFormat)ExtractSub(bitpackedSoundInfo, 12, 2);
+
+                var soundFormat = (AudioFileType)type switch
+                {
+                    AudioFileType.MP3 => AudioFormatV4.MP3,
+                    AudioFileType.WAV when waveFormat == WaveAudioFormat.ADPCM => AudioFormatV4.ADPCM,
+                    AudioFileType.WAV when bits == 8 => AudioFormatV4.PCM8,
+                    AudioFileType.WAV => AudioFormatV4.PCM16,
+                    AudioFileType.AAC => AudioFormatV4.PCM16, // The engine plays this type as 16-bit PCM
+                    _ => throw new InvalidDataException($"Unknown sound type in old vsnd version: {type}"),
+                };
+
+                SetSoundFormatBits(soundFormat);
+                Channels = ExtractSub(bitpackedSoundInfo, 7, 2);
+                SampleRate = ExtractSub(bitpackedSoundInfo, 14, 16);
+            }
+
+            LoopStart = reader.ReadInt32();
+            SampleCount = reader.ReadUInt32();
+
+            if (Resource.Version < 3 && SoundType == AudioFileType.MP3)
+            {
+                LoopStart = -1;
+            }
+            Duration = reader.ReadSingle();
+
+            var sentencePosition = reader.BaseStream.Position;
+            var sentenceOffset = reader.ReadUInt32(); // CResourcePointer<CSentence_t> m_Sentence
+
+            var headerPosition = reader.BaseStream.Position;
+            var headerOffset = reader.ReadUInt32(); // CResourceArray<uint8> m_pHeader
+            var headerSize = reader.ReadInt32();
+            StreamingDataSize = reader.ReadUInt32();
+
+            if (sentenceOffset != 0)
+            {
+                sentenceOffset = (uint)(sentencePosition + sentenceOffset);
+            }
+
+            // An array the engine relocates but never reads
+            if (Resource.Version >= 1)
+            {
+                reader.ReadInt32(); // offset
+                reader.ReadInt32(); // count
+            }
+
+            // Pointer to CAudioMorphData, v3 adds no new fields
+            if (Resource.Version >= 2)
+            {
+                reader.ReadInt32();
+            }
+
+            if (Resource.Version >= 4)
+            {
+                LoopEnd = reader.ReadInt32();
+            }
+
+            if (headerSize > 0)
+            {
+                Debug.Assert(AudioFormat == WaveAudioFormat.ADPCM);
+                Debug.Assert(reader.BaseStream.Position == headerPosition + headerOffset);
+
+                reader.BaseStream.Position = headerPosition + headerOffset;
+                Header = reader.ReadBytes(headerSize);
+            }
+
+            ReadPhonemeStream(reader, sentenceOffset);
+        }
+
+        private bool ReadFromCtrl()
+        {
+            if (Resource.GetBlockByType(BlockType.CTRL) is not BinaryKV3 obj)
+            {
+                return false;
+            }
+
+            var soundClass = obj.Data.Root.GetStringProperty("_class");
+
+            if (soundClass is not "CVoiceContainerDefault" and not "CVoiceContainerEnvelope")
+            {
+                return false;
+            }
+
+            var sound = obj.Data.Root.GetSubCollection("m_vSound");
+
+            switch (sound.GetStringProperty("m_nFormat"))
+            {
+                case "MP3": SetSoundFormatBits(AudioFormatV4.MP3); break;
+                case "PCM8": SetSoundFormatBits(AudioFormatV4.PCM8); break;
+                case "PCM16": SetSoundFormatBits(AudioFormatV4.PCM16); break;
+
+                default:
+                    throw new UnexpectedMagicException("Unexpected audio format", sound.GetStringProperty("m_nFormat"), "m_nFormat");
+            }
+
+            SampleRate = sound.GetUInt32Property("m_nRate");
+            SampleCount = sound.GetUInt32Property("m_nSampleCount");
+            Channels = sound.GetByteProperty("m_nChannels");
+            LoopStart = sound.GetInt32Property("m_nLoopStart");
+            LoopEnd = sound.GetInt32Property("m_nLoopEnd");
+            Duration = sound.GetFloatProperty("m_flDuration");
+            StreamingDataSize = sound.GetUInt32Property("m_nStreamingSize");
+
+            ReadSentenceFromCtrl(sound);
+
+            return true;
+        }
+
+        private void SetSoundFormatBits(AudioFormatV4 soundFormat)
+        {
+            switch (soundFormat)
+            {
+                case AudioFormatV4.PCM8:
+                    SoundType = AudioFileType.WAV;
+                    Bits = 8;
+                    SampleSize = 1;
+                    AudioFormat = WaveAudioFormat.PCM;
+                    break;
+
+                case AudioFormatV4.PCM16:
+                    SoundType = AudioFileType.WAV;
+                    Bits = 16;
+                    SampleSize = 2;
+                    AudioFormat = WaveAudioFormat.PCM;
+                    break;
+
+                case AudioFormatV4.MP3:
+                    SoundType = AudioFileType.MP3;
+                    break;
+
+                case AudioFormatV4.ADPCM:
+                    SoundType = AudioFileType.WAV;
+                    Bits = 16;
+                    SampleSize = 1;
+                    AudioFormat = WaveAudioFormat.ADPCM;
+
+                    break;
+
+                default:
+                    throw new UnexpectedMagicException("Unexpected audio type", (int)soundFormat, nameof(soundFormat));
+            }
+        }
+
+        private void ReadPhonemeStream(BinaryReader reader, uint sentenceOffset)
+        {
+            if (sentenceOffset == 0)
+            {
+                return;
+            }
+
+            reader.BaseStream.Position = sentenceOffset;
+
+            var shouldVoiceDuck = reader.ReadByte() != 0;
+            reader.BaseStream.Position += 3; // Padding to align the resource arrays
+
+            var phonemesPosition = reader.BaseStream.Position;
+            var phonemesOffset = reader.ReadInt32(); // CResourceArray<CBasePhonemeTag_t> m_RunTimePhonemes
+            var numPhonemeTags = reader.ReadInt32();
+
+            var emphasisPosition = reader.BaseStream.Position;
+            var emphasisOffset = reader.ReadInt32(); // CResourceArray<CEmphasisSample_t> m_EmphasisSamples
+            var numEmphasisSamples = reader.ReadInt32();
+
+            var emphasisSamples = new EmphasisSample[numEmphasisSamples];
+
+            if (numEmphasisSamples > 0)
+            {
+                reader.BaseStream.Position = emphasisPosition + emphasisOffset;
+
+                for (var i = 0; i < numEmphasisSamples; i++)
+                {
+                    emphasisSamples[i] = new EmphasisSample
+                    {
+                        Time = reader.ReadSingle(),
+                        Value = reader.ReadSingle(),
+                    };
+                }
+            }
+
+            var phonemes = new PhonemeTag[numPhonemeTags];
+
+            if (numPhonemeTags > 0)
+            {
+                reader.BaseStream.Position = phonemesPosition + phonemesOffset;
+
+                for (var i = 0; i < numPhonemeTags; i++)
+                {
+                    var startTime = reader.ReadSingle();
+                    var endTime = reader.ReadSingle();
+                    var phonemeCode = reader.ReadUInt16();
+
+                    reader.BaseStream.Position += 2; // Padding, CBasePhonemeTag_t is 4-byte aligned
+
+                    phonemes[i] = new PhonemeTag
+                    {
+                        StartTime = startTime,
+                        EndTime = endTime,
+                        PhonemeCode = phonemeCode
+                    };
+                }
+            }
+
+            Sentence = new Sentence
+            {
+                ShouldVoiceDuck = shouldVoiceDuck,
+                RunTimePhonemes = phonemes,
+                EmphasisSamples = emphasisSamples,
+            };
+        }
+
+        private void ReadSentenceFromCtrl(KVObject sound)
+        {
+            var sentences = sound.GetArray("m_Sentences");
+
+            if (sentences == null || sentences.Count == 0)
+            {
+                return;
+            }
+
+            var phonemes = sentences[0].GetArray("m_RunTimePhonemes");
+
+            if (phonemes == null)
+            {
+                return;
+            }
+
+            var runTimePhonemes = new PhonemeTag[phonemes.Count];
+
+            for (var i = 0; i < phonemes.Count; i++)
+            {
+                runTimePhonemes[i] = new PhonemeTag
+                {
+                    StartTime = phonemes[i].GetFloatProperty("m_flStartTime"),
+                    EndTime = phonemes[i].GetFloatProperty("m_flEndTime"),
+                    PhonemeCode = (ushort)phonemes[i].GetInt32Property("m_nPhonemeCode"),
+                };
+            }
+
+            var emphasis = sentences[0].GetArray("m_EmphasisSamples");
+            var emphasisSamples = new EmphasisSample[emphasis?.Count ?? 0];
+
+            for (var i = 0; i < emphasisSamples.Length; i++)
+            {
+                emphasisSamples[i] = new EmphasisSample
+                {
+                    Time = emphasis![i].GetFloatProperty("m_flTime"),
+                    Value = emphasis[i].GetFloatProperty("m_flValue"),
+                };
+            }
+
+            Sentence = new Sentence
+            {
+                ShouldVoiceDuck = sentences[0].GetBooleanProperty("m_bShouldVoiceDuck"),
+                RunTimePhonemes = runTimePhonemes,
+                EmphasisSamples = emphasisSamples,
+            };
+        }
+
+        /// <summary>
+        /// Returns human readable label and value pairs describing this sound: its duration,
+        /// container and encoding, channel layout, sample rate, bit depth, sample count, loop
+        /// points when the sound loops, and the size of the streaming audio data.
+        /// </summary>
+        /// <returns>The metadata rows, in display order.</returns>
+        public IReadOnlyList<(string Label, string Value)> GetInfoRows()
+        {
+            var duration = TimeSpan.FromSeconds(Duration);
+            var durationFormat = duration.TotalHours >= 1d ? @"h\:mm\:ss\.fff" : @"m\:ss\.fff";
+
+            var format = AudioFormat == WaveAudioFormat.Unknown
+                ? SoundType.ToString()
+                : $"{SoundType} {AudioFormat}";
+
+            var channels = Channels switch
+            {
+                1 => "Mono",
+                2 => "Stereo",
+                _ => Channels.ToString(CultureInfo.InvariantCulture),
+            };
+
+            var rows = new List<(string Label, string Value)>
+            {
+                ("Duration", duration.ToString(durationFormat, CultureInfo.InvariantCulture)),
+                ("Format", format),
+                ("Channels", channels),
+                ("Sample rate", $"{SampleRate.ToString(CultureInfo.InvariantCulture)} Hz"),
+            };
+
+            if (Bits > 0)
+            {
+                rows.Add(("Bit depth", $"{Bits.ToString(CultureInfo.InvariantCulture)}-bit"));
+            }
+
+            rows.Add(("Samples", SampleCount.ToString("N0", CultureInfo.InvariantCulture)));
+
+            if (LoopStart >= 0 && LoopEnd > LoopStart)
+            {
+                rows.Add(("Loop", $"{LoopStart.ToString("N0", CultureInfo.InvariantCulture)} to {LoopEnd.ToString("N0", CultureInfo.InvariantCulture)}"));
+            }
+
+            rows.Add(("Streaming data", $"{StreamingDataSize.ToString("N0", CultureInfo.InvariantCulture)} bytes"));
+
+            return rows;
+        }
+
+        private static uint ExtractSub(uint l, byte offset, byte nrBits)
+        {
+            var rightShifted = l >> offset;
+            var mask = (1 << nrBits) - 1;
+            return (uint)(rightShifted & mask);
+        }
+
+        /// <summary>
+        /// Returns fully playable sound data.
+        /// In case of WAV files, header is automatically generated as Valve removes it when compiling.
+        /// </summary>
+        /// <returns>Byte array containing sound data.</returns>
+        public byte[] GetSound()
+        {
+            if (StreamingDataSize == 0)
+            {
+                return [];
+            }
+
+            const int WaveHeaderSizeWithoutFmt = 28;
+            var waveHeaderSize = SoundType == AudioFileType.WAV
+                ? WaveHeaderSizeWithoutFmt + (AudioFormat == WaveAudioFormat.ADPCM ? Header.Length : 16)
+                : 0;
+            var totalSize = (int)StreamingDataSize + waveHeaderSize;
+            var data = new byte[totalSize];
+
+            if (SoundType == AudioFileType.WAV)
+            {
+                using var stream = new MemoryStream(data);
+
+                // http://soundfile.sapp.org/doc/WaveFormat/
+                // http://www.codeproject.com/Articles/129173/Writing-a-Proper-Wave-File
+                // https://github.com/microsoft/DirectXTK/wiki/Wave-Formats
+
+                stream.Write("RIFF"u8);
+                stream.Write(MemoryMarshal.AsBytes([totalSize - 8]));
+                stream.Write("WAVE"u8);
+                stream.Write("fmt "u8);
+
+                if (AudioFormat == WaveAudioFormat.ADPCM)
+                {
+                    stream.Write(MemoryMarshal.AsBytes([Header.Length]));
+                    stream.Write(Header); // Quite likely to be ADPCMWAVEFORMAT
+                }
+                else
+                {
+                    var byteRate = SampleRate * Channels * (Bits / 8);
+                    var blockAlign = Channels * (Bits / 8);
+
+                    stream.Write(MemoryMarshal.AsBytes([16])); // size of PCMWAVEFORMAT
+
+                    // PCMWAVEFORMAT
+                    stream.Write(MemoryMarshal.AsBytes([(ushort)AudioFormat, (ushort)Channels]));
+                    stream.Write(MemoryMarshal.AsBytes([SampleRate, byteRate]));
+                    stream.Write(MemoryMarshal.AsBytes([(ushort)blockAlign, (ushort)Bits]));
+                }
+
+                stream.Write("data"u8);
+                stream.Write(MemoryMarshal.AsBytes([StreamingDataSize]));
+
+                Debug.Assert(stream.Position == waveHeaderSize);
+            }
+
+            ReadStreamingData(data.AsSpan(waveHeaderSize));
+
+            return data;
+        }
+
+        /// <summary>
+        /// Reads the raw streaming data as stored, without the container header <see cref="GetSoundStream"/> synthesizes,
+        /// into <paramref name="buffer"/>, which must be exactly <see cref="StreamingDataSize"/> bytes.
+        /// The format is given by <see cref="SoundType"/>, <see cref="AudioFormat"/>, <see cref="Bits"/>,
+        /// <see cref="Channels"/>, <see cref="SampleRate"/> and (for ADPCM) <see cref="Header"/>, so decoders
+        /// can use the data directly without a round-trip through a synthesized RIFF header.
+        /// </summary>
+        public void ReadStreamingData(Span<byte> buffer)
+        {
+            Debug.Assert(buffer.Length == StreamingDataSize);
+            Debug.Assert(Reader != null);
+
+            lock (Resource.ReaderLock)
+            {
+                Reader.BaseStream.Position = Resource.FileSize;
+                Reader.BaseStream.ReadExactly(buffer);
+            }
+        }
+
+        /// <summary>
+        /// Returns fully playable sound data.
+        /// In case of WAV files, header is automatically generated as Valve removes it when compiling.
+        /// </summary>
+        /// <returns>Memory stream containing sound data.</returns>
+        public MemoryStream GetSoundStream() => new(GetSound());
+
+        /// <inheritdoc/>
+        public override void Serialize(Stream stream)
+        {
+            throw new NotImplementedException("Serializing this block is not yet supported. If you need this, send us a pull request!");
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Outputs sound metadata including sample rate, format, and channel information.
+        /// </remarks>
+        public override void WriteText(IndentedTextWriter writer)
+        {
+            writer.WriteLine($"SoundType: {SoundType}");
+            writer.WriteLine($"Sample Rate: {SampleRate}");
+            writer.WriteLine($"Bits: {Bits}");
+            writer.WriteLine($"SampleSize: {SampleSize}");
+            writer.WriteLine($"SampleCount: {SampleCount}");
+            writer.WriteLine($"Format: {AudioFormat}");
+            writer.WriteLine($"Channels: {Channels}");
+
+            // Containers that only reference other sounds have a sample rate of zero
+            if (SampleRate > 0)
+            {
+                var loopStart = TimeSpan.FromSeconds((double)LoopStart / SampleRate);
+                writer.WriteLine(string.Create(CultureInfo.InvariantCulture, $"LoopStart: {LoopStart} ({loopStart})"));
+
+                var loopEnd = TimeSpan.FromSeconds((double)LoopEnd / SampleRate);
+                writer.WriteLine(string.Create(CultureInfo.InvariantCulture, $"LoopEnd: {LoopEnd} ({loopEnd})"));
+            }
+            else
+            {
+                writer.WriteLine(string.Create(CultureInfo.InvariantCulture, $"LoopStart: {LoopStart}"));
+                writer.WriteLine(string.Create(CultureInfo.InvariantCulture, $"LoopEnd: {LoopEnd}"));
+            }
+
+            var duration = TimeSpan.FromSeconds(Duration);
+            writer.WriteLine(string.Create(CultureInfo.InvariantCulture, $"Duration: {duration} ({Duration})"));
+
+            writer.WriteLine($"StreamingDataSize: {StreamingDataSize}");
+
+            if (Sentence != null)
+            {
+                writer.WriteLine($"Sentence[{Sentence.RunTimePhonemes.Length}] (voice duck: {Sentence.ShouldVoiceDuck}):");
+                writer.Indent++;
+                foreach (var phoneme in Sentence.RunTimePhonemes)
+                {
+                    writer.WriteLine(string.Create(CultureInfo.InvariantCulture, $"PhonemeTag(StartTime={phoneme.StartTime}, EndTime={phoneme.EndTime}, PhonemeCode={phoneme.PhonemeCode})"));
+                }
+                foreach (var sample in Sentence.EmphasisSamples)
+                {
+                    writer.WriteLine(string.Create(CultureInfo.InvariantCulture, $"EmphasisSample(Time={sample.Time}, Value={sample.Value})"));
+                }
+                writer.Indent--;
+            }
+        }
+    }
+}

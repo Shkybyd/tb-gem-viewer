@@ -1,0 +1,61 @@
+"ResourceEditInfo"
+{
+	"InputDependencies"
+	{
+		"0"
+		{
+			"ContentRelativeFilename"	"panorama/styles/tooltips/tooltip_spidergraph.vcss"
+			"ContentSearchPath"	"dota"
+			"FileCRC"	"0"
+			"Optional"	"1"
+			"FileExists"	"0"
+			"IsGameFile"	"0"
+		}
+		"1"
+		{
+			"ContentRelativeFilename"	"panorama/styles/tooltips/tooltip_spidergraph.css"
+			"ContentSearchPath"	"dota"
+			"FileCRC"	"3187935984"
+			"Optional"	"0"
+			"FileExists"	"1"
+			"IsGameFile"	"0"
+		}
+	}
+	"AdditionalInputDependencies"
+	{
+	}
+	"ArgumentDependencies"
+	{
+		"0"
+		{
+			"ParameterName"	"___OverrideInputData___"
+			"ParameterType"	"BinaryBlobArg"
+			"Fingerprint"	"0"
+			"FingerprintDefault"	"0"
+		}
+	}
+	"SpecialDependencies"
+	{
+		"0"
+		{
+			"String"	"Panorama Style Compiler Version"
+			"CompilerIdentifier"	"CompilePanorama"
+			"Fingerprint"	"1"
+			"UserData"	"0"
+		}
+	}
+	"AdditionalRelatedFiles"
+	{
+	}
+	"ChildResourceList"
+	{
+	}
+	"SearchableUserData"
+	{
+		"0"
+		{
+			"Key"	"IsChildResource"
+			"Value"	"0"
+		}
+	}
+}

@@ -1,0 +1,686 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Threading;
+using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.SceneEnvironment;
+using ValveResourceFormat.Renderer.SceneNodes;
+using QueryId = System.Int32;
+
+namespace ValveResourceFormat.Renderer;
+
+internal enum Counter
+{
+    SceneObjectInView,
+    SceneObjectCulledByPvs,
+    ShadowCasterCulledByPvs,
+    SceneObjectCulledByVisibilityBox,
+    ShadowCasterCulledByVisibilityBox,
+    DrawCall,
+    MeshletDispatch,
+    MaterialChange,
+    VaoChange,
+    RenderStateApply,
+    RenderStateGroupEmit,
+    RenderStateDriverCall,
+    DirectionalShadowMap,
+    BarnShadowMap,
+    ShadowFaceSubmitted,
+    ShadowFaceMaskCulled,
+    ParticleSystem,
+    ParticleDraw,
+    SoundCacheMegabytes,
+    SoundDecodeQueue,
+}
+
+internal enum Metric
+{
+    ShadowAtlasUsage,
+    SceneLuminance,
+    ExposureTargetLuminance,
+    Exposure,
+    ExposureMin,
+    ExposureMax,
+    TonemapScalar,
+    FullScreenGamma,
+}
+
+/// <summary>
+/// Collects per frame rendering statistics.
+/// </summary>
+public class PerfStats
+{
+    private enum LightGroup
+    {
+        Omni,
+        Spot,
+        Barn,
+        Rect,
+        Environment,
+    }
+
+    private static readonly string[] LightGroupNames = ["omni", "spot", "barn", "rect", "directional"];
+    private static readonly string[] LightCostLabels = ["Static Lights:    ", "Stationary Lights:", "Dynamic Lights:   "];
+
+    // Lines are formatted into the arena each frame, which stays untouched until the text renders
+    private readonly TextRenderer.TextArena displayText = new(8 * 1024);
+    private readonly char[] lightCountText = new char[512];
+
+    // Must follow LightGroupNames, as static initializers run in textual order.
+    /// <summary>Counters for the frame currently being rendered. Collects nothing while <see cref="Capture"/> is off.</summary>
+    internal static PerfStats Active { get; private set; } = new();
+
+    /// <summary>Gets or sets whether statistics are actively collected this frame.</summary>
+    public bool Capture { get; set; }
+
+    /// <summary>
+    /// Returns the counters and metrics of the last frame completed while <see cref="Capture"/> was
+    /// on, keyed by name. All zero until a captured frame has finished.
+    /// </summary>
+    /// <returns>Counter names mapped to their count, and metric names to their value.</returns>
+    internal Dictionary<string, double> Snapshot()
+    {
+        using var _ = threadLock.EnterScope();
+
+        var snapshot = new Dictionary<string, double>(publishedCounts.Length + publishedMetrics.Length);
+
+        foreach (var counter in Enum.GetValues<Counter>())
+        {
+            snapshot[counter.ToString()] = publishedCounts[(int)counter];
+        }
+
+        foreach (var metric in Enum.GetValues<Metric>())
+        {
+            snapshot[metric.ToString()] = publishedMetrics[(int)metric];
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>Gets the CPU and GPU timings for the same frame. Captured independently of <see cref="Capture"/>.</summary>
+    public Timings Timings { get; } = new();
+
+    /// <summary>Gets the managed allocation and GC statistics for the same frame. Captured independently of <see cref="Capture"/>.</summary>
+    public AllocStats Allocations { get; } = new();
+
+    // Debug groups opened outside a marked frame are not timed.
+    private bool timingFrame;
+
+    private int suspendDepth;
+    private bool Counting => Capture && suspendDepth == 0 && !IsNotOwningThread;
+
+    // Need this since our renderer can move threads.
+    private readonly Lock threadLock = new();
+    private int owningThreadId;
+
+    /// <summary>Initializes a new <see cref="PerfStats"/> owned by the current thread until a frame is marked.</summary>
+    public PerfStats()
+    {
+        owningThreadId = Environment.CurrentManagedThreadId;
+    }
+
+    private bool IsNotOwningThread => Environment.CurrentManagedThreadId != owningThreadId;
+
+    private readonly int[] counts = new int[Enum.GetValues<Counter>().Length];
+    private readonly float[] floatMetrics = new float[Enum.GetValues<Metric>().Length];
+
+    // Copied at frame end so Snapshot can be read off the render thread without racing the reset
+    // at the start of the next frame.
+    private readonly int[] publishedCounts = new int[Enum.GetValues<Counter>().Length];
+    private readonly float[] publishedMetrics = new float[Enum.GetValues<Metric>().Length];
+    /// <summary>Lights that passed culling this frame, indexed by <see cref="SceneLight.LightCost"/> then <see cref="LightGroup"/>.</summary>
+    private readonly int[][] lightsInView = CreateLightCounters();
+
+    private static int[][] CreateLightCounters()
+    {
+        var counters = new int[LightCostLabels.Length][];
+
+        for (var i = 0; i < counters.Length; i++)
+        {
+            counters[i] = new int[LightGroupNames.Length];
+        }
+
+        return counters;
+    }
+
+    /// <summary>GPU primitives-generated queries for one in-flight frame, one segment per unsuspended span of draws.</summary>
+    private sealed class TriangleQueryFrame
+    {
+        /// <summary>Query objects, reused once the frame slot comes back around.</summary>
+        public List<int> Segments { get; } = [];
+
+        /// <summary>Segments issued this frame. Entries beyond it are pooled but idle.</summary>
+        public int SegmentsUsed { get; set; }
+
+        public bool Pending { get; set; }
+    }
+
+    // The CPU runs ahead of the GPU, so the displayed count lags a few frames.
+    private const int TriangleFrameCount = 4;
+    private readonly TriangleQueryFrame[] triangleFrames = CreateTriangleFrames();
+    private int triangleFrameWrite;
+    private bool triangleFrameActive;
+    private bool triangleSegmentActive;
+    private long trianglesRendered;
+
+    private static TriangleQueryFrame[] CreateTriangleFrames()
+    {
+        var frames = new TriangleQueryFrame[TriangleFrameCount];
+
+        for (var i = 0; i < frames.Length; i++)
+        {
+            frames[i] = new TriangleQueryFrame();
+        }
+
+        return frames;
+    }
+
+    // Cached scene totals, recomputed once per second
+    private long totalTriangles;
+    private int totalDrawCalls;
+    private int totalSceneObjects;
+    private int totalMaterials;
+    private int totalParticleSystems;
+    private readonly int[][] totalLights = CreateLightCounters();
+    private long lastTotalsUpdate;
+
+    /// <summary>Suspends stat collection for the following draws until <see cref="ResumeTriangleCounter"/> is called. Nestable.</summary>
+    internal void SuspendTriangleCounter()
+    {
+        if (IsNotOwningThread)
+        {
+            return;
+        }
+
+        if (suspendDepth++ == 0)
+        {
+            EndTriangleSegment();
+        }
+    }
+
+    /// <summary>Resumes stat collection suspended by <see cref="SuspendTriangleCounter"/>.</summary>
+    internal void ResumeTriangleCounter()
+    {
+        if (IsNotOwningThread)
+        {
+            return;
+        }
+
+        if (--suspendDepth == 0)
+        {
+            BeginTriangleSegment();
+        }
+    }
+
+    /// <summary>Starts a primitive query covering the draws that follow.</summary>
+    private void BeginTriangleSegment()
+    {
+        if (!triangleFrameActive || triangleSegmentActive)
+        {
+            return;
+        }
+
+        var frame = triangleFrames[triangleFrameWrite];
+
+        if (frame.SegmentsUsed == frame.Segments.Count)
+        {
+            frame.Segments.Add(GraphicsDevice.CreateQuery(QueryTarget.PrimitivesGenerated, "TriangleSegment"));
+        }
+
+        GL.BeginQuery(QueryTarget.PrimitivesGenerated, frame.Segments[frame.SegmentsUsed]);
+        triangleSegmentActive = true;
+    }
+
+    /// <summary>Ends the primitive query opened by <see cref="BeginTriangleSegment"/>, banking it for the frame.</summary>
+    private void EndTriangleSegment()
+    {
+        if (!triangleSegmentActive)
+        {
+            return;
+        }
+
+        GL.EndQuery(QueryTarget.PrimitivesGenerated);
+        triangleSegmentActive = false;
+        triangleFrames[triangleFrameWrite].SegmentsUsed++;
+    }
+
+    /// <summary>Increments a scalar counter.</summary>
+    internal void Count(Counter counter, int amount = 1)
+    {
+        if (!Counting)
+        {
+            return;
+        }
+
+        counts[(int)counter] += amount;
+    }
+
+    /// <summary>Assigns a float counter, replacing any value set earlier this frame.</summary>
+    internal void Set(Metric counter, float value)
+    {
+        if (!Counting)
+        {
+            return;
+        }
+
+        floatMetrics[(int)counter] = value;
+    }
+
+    /// <summary>Counts a direct GL draw call for the given node.</summary>
+    internal void CountDrawCall(SceneNode node)
+    {
+        if (!Counting)
+        {
+            return;
+        }
+
+        counts[(int)Counter.DrawCall]++;
+    }
+
+    internal void CountIndirectDraw(int indirectDrawCount)
+    {
+        if (!Counting)
+        {
+            return;
+        }
+
+        counts[(int)Counter.MeshletDispatch] += indirectDrawCount;
+    }
+
+    /// <summary>Counts a light that passed frustum culling this frame.</summary>
+    internal void CountLightInView(SceneLight light)
+    {
+        if (!Counting)
+        {
+            return;
+        }
+
+        lightsInView[(int)light.Cost][(int)GetLightGroup(light)]++;
+    }
+
+    private static LightGroup GetLightGroup(SceneLight light) => light.Entity switch
+    {
+        SceneLight.EntityType.Omni or SceneLight.EntityType.Omni2 => LightGroup.Omni,
+        SceneLight.EntityType.Spot => LightGroup.Spot,
+        SceneLight.EntityType.Barn => LightGroup.Barn,
+        SceneLight.EntityType.Rect => LightGroup.Rect,
+        _ => LightGroup.Environment,
+    };
+
+    private void UpdateTotals(IEnumerable<Scene> scenes)
+    {
+        if (lastTotalsUpdate != 0 && Stopwatch.GetElapsedTime(lastTotalsUpdate).TotalSeconds < 1.0)
+        {
+            return;
+        }
+
+        lastTotalsUpdate = Stopwatch.GetTimestamp();
+
+        totalTriangles = 0;
+        totalDrawCalls = 0;
+        totalSceneObjects = 0;
+        totalParticleSystems = 0;
+        foreach (var costGroups in totalLights)
+        {
+            Array.Clear(costGroups);
+        }
+
+        RendererContext? rendererContext = null;
+
+        foreach (var scene in scenes)
+        {
+            AccumulateTotals(scene);
+            rendererContext = scene.RendererContext;
+        }
+
+        totalMaterials = rendererContext?.MaterialLoader.MaterialCount ?? 0;
+    }
+
+    private void AccumulateTotals(Scene scene)
+    {
+        foreach (var node in scene.AllNodes)
+        {
+            totalSceneObjects++;
+
+            switch (node)
+            {
+                case SceneAggregate.Fragment:
+                    break; // draw calls are shared with and counted by the parent aggregate
+
+                case SceneAggregate aggregate:
+                {
+                    var instanceCount = Math.Max(1, aggregate.InstanceTransforms.Count);
+
+                    foreach (var drawCall in aggregate.RenderMesh.DrawCalls)
+                    {
+                        totalDrawCalls++;
+                        totalTriangles += (long)(drawCall.IndexCount / 3) * instanceCount;
+                    }
+
+                    break;
+                }
+
+                case MeshCollectionNode meshCollection:
+                {
+                    foreach (var mesh in meshCollection.RenderableMeshes)
+                    {
+                        foreach (var drawCall in mesh.DrawCalls)
+                        {
+                            totalDrawCalls++;
+                            totalTriangles += drawCall.IndexCount / 3;
+                        }
+                    }
+
+                    break;
+                }
+
+                case SceneLight light:
+                    totalLights[(int)light.Cost][(int)GetLightGroup(light)]++;
+                    break;
+
+                case ParticleSceneNode:
+                    totalParticleSystems++;
+                    break;
+
+                default:
+                    break;
+            }
+        }
+    }
+
+    /// <summary>Lists the count of each light group that has any lights, or "none".</summary>
+    private static ReadOnlySpan<char> FormatLightCounts(Span<char> destination, int[] counts, int[] visibleGroups)
+    {
+        var written = 0;
+
+        for (var i = 0; i < counts.Length; i++)
+        {
+            if (visibleGroups[i] == 0)
+            {
+                continue;
+            }
+
+            destination[written..].TryWrite(CultureInfo.InvariantCulture, $"{(written > 0 ? ", " : "")}{counts[i]} {LightGroupNames[i]}", out var charsWritten);
+            written += charsWritten;
+        }
+
+        return written > 0 ? destination[..written] : "none";
+    }
+
+    /// <summary>
+    /// Renders the collected statistics to screen using the provided text renderer.
+    /// </summary>
+    /// <param name="textRenderer">Text renderer to use for display.</param>
+    /// <param name="camera">Camera for positioning text.</param>
+    /// <param name="scenes">Every scene drawn, main scene first.</param>
+    /// <param name="lightBinner">Light binner of the main view, or <see langword="null"/> before the first frame.</param>
+    /// <param name="x">X position (0-1 as fraction of screen width).</param>
+    /// <param name="y">Y position (0-1 as fraction of screen height).</param>
+    /// <param name="scale">Text scale.</param>
+    public void DisplayStats(TextRenderer textRenderer, Camera camera, IReadOnlyList<Scene> scenes, LightBinner? lightBinner, float x = 0.02f, float y = 0.05f, float scale = 11f)
+    {
+        ArgumentNullException.ThrowIfNull(scenes);
+
+        if (!Capture || scenes.Count == 0)
+        {
+            return;
+        }
+
+        var scene = scenes[0];
+
+        UpdateTotals(scenes);
+
+        displayText.Clear();
+
+        var lineHeight = scale * 1.5f / camera.WindowSize.Y;
+        var valueColor = new Color32(150, 255, 150);
+        var offset = y;
+
+        void AddLine(TextRenderer.TextMemory text, Color32 color)
+        {
+            textRenderer.AddTextRelative(new TextRenderer.TextRenderRequest
+            {
+                X = x,
+                Y = offset,
+                Scale = scale,
+                Color = color,
+                Text = text,
+            }, camera);
+
+            offset += lineHeight;
+        }
+
+        AddLine("Render Stats", new Color32(255, 200, 0));
+
+        AddLine(displayText.Format($"Triangles:        rendered {trianglesRendered:N0} of {totalTriangles:N0}"), valueColor);
+        AddLine(displayText.Format($"Scene objects:    drawn {counts[(int)Counter.SceneObjectInView] - counts[(int)Counter.SceneObjectCulledByPvs] - counts[(int)Counter.SceneObjectCulledByVisibilityBox]:N0} of {totalSceneObjects:N0} scene objects ({counts[(int)Counter.SceneObjectCulledByPvs]:N0} vis) in {counts[(int)Counter.DrawCall]:N0} draw calls and {counts[(int)Counter.MeshletDispatch]:N0} meshlet dispatches ({totalDrawCalls:N0} total draw calls)"), valueColor);
+        AddLine(displayText.Format($"Shadow casters:   {counts[(int)Counter.ShadowCasterCulledByPvs]:N0} rejected by the sun visibility row"), valueColor);
+
+        var visibilityBoxes = 0;
+        var insideBoxes = 0;
+        var outsideBoxes = 0;
+
+        for (var i = 0; i < scenes.Count; i++)
+        {
+            visibilityBoxes += scenes[i].VisibilityBoxes.Count;
+            insideBoxes += scenes[i].VisibilityBoxes.View.InsideCount;
+            outsideBoxes += scenes[i].VisibilityBoxes.View.OutsideCount;
+        }
+
+        if (visibilityBoxes > 0)
+        {
+            AddLine(displayText.Format($"Visibility boxes: {counts[(int)Counter.SceneObjectCulledByVisibilityBox]:N0} scene objects and {counts[(int)Counter.ShadowCasterCulledByVisibilityBox]:N0} shadow casters culled by {insideBoxes:N0} inside and {outsideBoxes:N0} outside boxes"), valueColor);
+        }
+
+        AddLine(displayText.Format($"Materials:        {counts[(int)Counter.MaterialChange]:N0} changes between drawcalls, {totalMaterials:N0} total materials in scene"), valueColor);
+        AddLine(displayText.Format($"VAOs:             {counts[(int)Counter.VaoChange]:N0} binds this frame, {scene.RendererContext.MeshBufferCache.VertexArrayObjectCount:N0} cached"), valueColor);
+        AddLine(displayText.Format($"Render state:     {counts[(int)Counter.RenderStateApply]:N0} applies, {counts[(int)Counter.RenderStateGroupEmit]:N0} actual changes, {counts[(int)Counter.RenderStateDriverCall]:N0} driver calls this frame"), valueColor);
+
+        for (var cost = 0; cost < LightCostLabels.Length; cost++)
+        {
+            var inView = FormatLightCounts(lightCountText.AsSpan(0, lightCountText.Length / 2), lightsInView[cost], totalLights[cost]);
+            var inTotal = FormatLightCounts(lightCountText.AsSpan(lightCountText.Length / 2), totalLights[cost], totalLights[cost]);
+
+            AddLine(displayText.Format($"{LightCostLabels[cost]} in view {inView} out of total {inTotal}"), valueColor);
+        }
+
+        AddLine(displayText.Format($"Shadow maps:      {counts[(int)Counter.DirectionalShadowMap]:N0} directional, {counts[(int)Counter.BarnShadowMap]:N0} barn, {counts[(int)Counter.ShadowFaceSubmitted]:N0} faces binned, {counts[(int)Counter.ShadowFaceMaskCulled]:N0} gpu culled, {floatMetrics[(int)Metric.ShadowAtlasUsage]:0%} atlas utilization"), valueColor);
+        AddLine(displayText.Format($"Particle Systems: {counts[(int)Counter.ParticleSystem]:N0} particle systems rendered in {counts[(int)Counter.ParticleDraw]:N0} draw calls out of {totalParticleSystems:N0} total particle systems"), valueColor);
+        if (lightBinner != null)
+        {
+            AddLine(FormatBinnerStats(lightBinner.Stats), valueColor);
+        }
+
+        AddLine(displayText.Format($"Sound cache:      {counts[(int)Counter.SoundCacheMegabytes]:N0} MB decoded, {counts[(int)Counter.SoundDecodeQueue]:N0} queued to decode"), valueColor);
+        AddLine(FormatTonemapStats(), valueColor);
+    }
+
+    /// <summary>
+    /// Auto exposure state: the metered luminance, its target, and the exposure within the post process
+    /// volume's range. Exposure pinned to a bound is flagged, as the scene's own brightness then decides.
+    /// </summary>
+    private TextRenderer.TextMemory FormatTonemapStats()
+    {
+        var scalar = floatMetrics[(int)Metric.TonemapScalar];
+        var gamma = floatMetrics[(int)Metric.FullScreenGamma];
+        var luminance = floatMetrics[(int)Metric.SceneLuminance];
+        var min = floatMetrics[(int)Metric.ExposureMin];
+        var max = floatMetrics[(int)Metric.ExposureMax];
+
+        if (max <= 0f)
+        {
+            return displayText.Format($"Tonemapping:      scene luminance {luminance:0.0000}, fixed exposure, tonemap scalar {scalar:0.00}, gamma {gamma:0.00}");
+        }
+
+        var exposure = floatMetrics[(int)Metric.Exposure];
+        var pinned = exposure <= min * 1.001f ? " (pinned low)"
+            : exposure >= max * 0.999f ? " (pinned high)"
+            : string.Empty;
+
+        return displayText.Format($"Tonemapping:      scene luminance {luminance:0.0000} aiming at {floatMetrics[(int)Metric.ExposureTargetLuminance]:0.0000}, "
+            + $"exposure {exposure:0.00} of [{min:0.00}-{max:0.00}]{pinned}, tonemap scalar {scalar:0.00}, gamma {gamma:0.00}");
+    }
+
+    /// <summary>
+    /// Binning results, counted per barn light face, the unit the binner works in. Not the same set as
+    /// the shadow line, which counts faces submitted for shadow rendering.
+    /// </summary>
+    private TextRenderer.TextMemory FormatBinnerStats(LightBinner.BinnerStats stats)
+    {
+        if (!stats.Active)
+        {
+            return "Light binning:    off, all masks visible";
+        }
+
+        return displayText.Format($"Light binning:    {stats.Faces:N0} of {stats.FaceSlots:N0} barn faces, {stats.Probes:N0} of {stats.ProbeSlots:N0} probes binned, {stats.HullVertices:N0} hull verts, {stats.MaskBytes / 1024.0:0.#} KB masks, slices to {stats.SliceFar:N0} at {stats.SliceWidth:N0} each");
+    }
+
+    /// <summary>Resets per-frame counters, reads back the previous frame's results.</summary>
+    public void MarkFrameBegin()
+    {
+        // Held for the rest of the method, and spanning Timings, so that one edge publishes both collectors.
+        using var _ = threadLock.EnterScope();
+        owningThreadId = Environment.CurrentManagedThreadId;
+
+        Active = this;
+
+        Timings.MarkFrameBegin();
+        timingFrame = Timings.Capture;
+
+        Allocations.MarkFrameBegin();
+
+        if (!Capture)
+        {
+            return;
+        }
+
+        suspendDepth = 0;
+        Array.Clear(counts);
+        Array.Clear(floatMetrics);
+
+        foreach (var costGroups in lightsInView)
+        {
+            Array.Clear(costGroups);
+        }
+
+        // Oldest first, keeping the newest result that has landed. The slot about to be written is the oldest.
+        for (var i = 0; i < TriangleFrameCount; i++)
+        {
+            var frame = triangleFrames[(triangleFrameWrite + i) % TriangleFrameCount];
+
+            if (!frame.Pending)
+            {
+                continue;
+            }
+
+            // Segments complete in submission order, so the last one stands in for the whole frame.
+            var lastSegment = frame.Segments[frame.SegmentsUsed - 1];
+            GL.GetQueryObject(lastSegment, GetQueryObjectParam.QueryResultAvailable, out long available);
+
+            if (available == 0)
+            {
+                break; // nothing newer is ready either
+            }
+
+            trianglesRendered = SumTriangleSegments(frame);
+        }
+
+        var writeFrame = triangleFrames[triangleFrameWrite];
+
+        if (writeFrame.Pending)
+        {
+            // Every slot is in flight, so block rather than reuse these query objects and drop their result.
+            trianglesRendered = SumTriangleSegments(writeFrame);
+        }
+
+        writeFrame.SegmentsUsed = 0;
+        triangleFrameActive = true;
+        BeginTriangleSegment();
+    }
+
+    /// <summary>Reads and totals a frame's segment results, blocking until the GPU has finished them.</summary>
+    private static long SumTriangleSegments(TriangleQueryFrame frame)
+    {
+        var total = 0L;
+
+        for (var i = 0; i < frame.SegmentsUsed; i++)
+        {
+            GL.GetQueryObject(frame.Segments[i], GetQueryObjectParam.QueryResult, out long result);
+            total += result;
+        }
+
+        frame.Pending = false;
+
+        return total;
+    }
+
+    /// <summary>Ends this frame's counters and timings.</summary>
+    public void MarkFrameEnd()
+    {
+        using var _ = threadLock.EnterScope();
+
+        // Keyed off the query having begun rather than Capture, which may have been toggled mid-frame.
+        if (triangleFrameActive)
+        {
+            EndTriangleSegment();
+
+            var frame = triangleFrames[triangleFrameWrite];
+            frame.Pending = frame.SegmentsUsed > 0;
+            triangleFrameActive = false;
+            triangleFrameWrite = (triangleFrameWrite + 1) % TriangleFrameCount;
+        }
+
+        // Timed up to here, so that text rendering is still measured.
+        timingFrame = false;
+        Timings.MarkFrameEnd();
+        Allocations.MarkFrameEnd();
+
+        if (Capture)
+        {
+            Array.Copy(counts, publishedCounts, counts.Length);
+            Array.Copy(floatMetrics, publishedMetrics, floatMetrics.Length);
+        }
+    }
+
+    /// <summary>Begins a timing query for a debug group, or returns 0 if this frame is not being timed.</summary>
+    internal QueryId BeginTimingQuery(string name, bool cpuOnly = false, bool collapsed = false)
+    {
+        if (!timingFrame || IsNotOwningThread)
+        {
+            return 0;
+        }
+
+        return Timings.BeginQuery(name, cpuOnly, collapsed);
+    }
+
+    /// <summary>Ends a timing query opened by <see cref="BeginTimingQuery"/>.</summary>
+    internal void EndTimingQuery(QueryId id)
+    {
+        if (!timingFrame || IsNotOwningThread)
+        {
+            return;
+        }
+
+        Timings.EndQuery(id);
+    }
+
+    /// <summary>
+    /// Releases resources.
+    /// </summary>
+    public void Dispose()
+    {
+        Timings.Dispose();
+        Allocations.Dispose();
+
+        foreach (var frame in triangleFrames)
+        {
+            foreach (var segment in frame.Segments)
+            {
+                GL.DeleteQuery(segment);
+            }
+
+            frame.Segments.Clear();
+            frame.SegmentsUsed = 0;
+            frame.Pending = false;
+        }
+    }
+}

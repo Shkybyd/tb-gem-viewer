@@ -1,0 +1,171 @@
+using System.Collections.Immutable;
+using System.IO;
+using System.Linq;
+using System.Threading;
+
+namespace ValveResourceFormat.Renderer.Shaders
+{
+    /// <summary>
+    /// Registry of user provided shader directories and shader name mappings.
+    ///
+    /// <para>
+    /// Mounted directories take priority over the shaders shipped with the renderer, like search paths in
+    /// <see cref="ValveResourceFormat.IO.GameFileLoader"/>. A file in a mounted directory overrides the built-in file with
+    /// the same relative path, for entry points (<c>fallback.vert.slang</c>) and includes (<c>common/lighting.slang</c>) alike.
+    /// </para>
+    ///
+    /// <para>
+    /// Mappings take priority over the built-in table, translating a Source 2 shader name (<c>shader.vfx</c>) to a
+    /// renderer shader file.
+    /// </para>
+    ///
+    /// <para>
+    /// Configure before creating a <see cref="RendererContext"/>. Changing the registry drops the parsed shader cache, but
+    /// already compiled shader programs keep running the old code.
+    /// </para>
+    /// </summary>
+    public static class ShaderRegistry
+    {
+        private static readonly Lock RegistryLock = new();
+        private static ImmutableArray<string> directories = [];
+        private static ImmutableDictionary<string, string> mappings = ImmutableDictionary.Create<string, string>(StringComparer.Ordinal);
+
+        /// <summary>Gets the mounted shader directories, highest priority first.</summary>
+        public static ImmutableArray<string> Directories => directories;
+
+        /// <summary>Gets the registered shader name mappings, keyed by the Source 2 shader name (e.g. <c>shader.vfx</c>).</summary>
+        public static ImmutableDictionary<string, string> Mappings => mappings;
+
+        /// <summary>
+        /// Mounts a shader directory above the shaders shipped with the renderer. The most recently added directory has
+        /// the highest priority.
+        /// </summary>
+        /// <param name="path">Path to the directory that mirrors the layout of the built-in <c>Renderer/Shaders</c> folder.</param>
+        /// <returns><see langword="true"/> if the directory was added, <see langword="false"/> if it was already mounted.</returns>
+        /// <exception cref="DirectoryNotFoundException">The directory does not exist.</exception>
+        public static bool AddShaderDirectory(string path)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(path);
+
+            var fullPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+
+            if (!Directory.Exists(fullPath))
+            {
+                throw new DirectoryNotFoundException($"Shader directory '{fullPath}' does not exist.");
+            }
+
+            using (RegistryLock.EnterScope())
+            {
+                if (directories.Any(dir => string.Equals(dir, fullPath, StringComparison.Ordinal)))
+                {
+                    return false;
+                }
+
+                directories = directories.Insert(0, fullPath);
+            }
+
+            ShaderLoader.InvalidateParsedShaders();
+            return true;
+        }
+
+        /// <summary>
+        /// Maps a Source 2 shader name to the renderer shader file used to draw it, overriding the built-in mapping.
+        /// </summary>
+        /// <param name="shaderName">The Source 2 shader name, including the extension (e.g. <c>shader.vfx</c>).</param>
+        /// <param name="shaderFileName">The renderer shader name without stage or extension (e.g. <c>my_shader</c> for <c>my_shader.vert.slang</c>).</param>
+        public static void AddShaderMapping(string shaderName, string shaderFileName)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(shaderName);
+            ArgumentException.ThrowIfNullOrEmpty(shaderFileName);
+
+            using (RegistryLock.EnterScope())
+            {
+                mappings = mappings.SetItem(shaderName, shaderFileName);
+            }
+
+            ShaderLoader.InvalidateParsedShaders();
+        }
+
+        /// <summary>Removes all mounted directories and registered mappings.</summary>
+        public static void Reset()
+        {
+            using (RegistryLock.EnterScope())
+            {
+                directories = [];
+                mappings = mappings.Clear();
+            }
+
+            ShaderLoader.InvalidateParsedShaders();
+        }
+
+        /// <summary>
+        /// Opens a shader file from the mounted directories, or returns <see langword="null"/> to use the built-in shader.
+        /// </summary>
+        /// <param name="name">Root relative shader file name using forward slashes (e.g. <c>common/lighting.slang</c>).</param>
+        internal static Stream? TryOpenShaderFile(string name)
+        {
+            var mounted = directories;
+
+            if (mounted.IsEmpty)
+            {
+                return null;
+            }
+
+            var relativePath = name.Replace('/', Path.DirectorySeparatorChar);
+
+            foreach (var directory in mounted)
+            {
+                var path = Path.Combine(directory, relativePath);
+
+                if (!File.Exists(path))
+                {
+                    continue;
+                }
+
+                return File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            }
+
+            return null;
+        }
+
+        /// <summary>Enumerates the shader entry point files in the mounted directories, as root relative names using forward slashes.</summary>
+        /// <param name="searchPattern">The file search pattern to match against file names.</param>
+        internal static IEnumerable<string> EnumerateShaderFiles(string searchPattern)
+        {
+            foreach (var directory in directories)
+            {
+                foreach (var file in EnumerateEntryFiles(directory, searchPattern))
+                {
+                    yield return file;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Enumerates the files of a shader directory and of its game folders, one level down, as root relative
+        /// names using forward slashes.
+        /// </summary>
+        internal static IEnumerable<string> EnumerateEntryFiles(string directory, string searchPattern)
+        {
+            if (!Directory.Exists(directory))
+            {
+                yield break;
+            }
+
+            foreach (var file in Directory.EnumerateFiles(directory, searchPattern, SearchOption.TopDirectoryOnly))
+            {
+                yield return Path.GetFileName(file);
+            }
+
+            foreach (var subdirectory in Directory.EnumerateDirectories(directory))
+            {
+                var folderName = Path.GetFileName(subdirectory);
+
+                foreach (var file in Directory.EnumerateFiles(subdirectory, searchPattern, SearchOption.TopDirectoryOnly))
+                {
+                    yield return $"{folderName}/{Path.GetFileName(file)}";
+                }
+            }
+        }
+    }
+}

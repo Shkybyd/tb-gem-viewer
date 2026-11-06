@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>TBGemViewer</AssemblyName>
+    <RootNamespace>TBGemViewer</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <PublishSingleFile Condition="'$(Configuration)' != 'Debug'">true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <ApplicationIcon>..\Misc\Icons\source2viewer.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="OpenTK.Windowing.Desktop" Version="4.9.4" />
+    <PackageReference Include="ImGui.NET" Version="1.91.6.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="$(BundledNETCoreAppPackageVersion)" />
+    <ProjectReference Include="..\ValveResourceFormat\ValveResourceFormat.csproj" />
+    <ProjectReference Include="..\Renderer\Renderer.csproj" />
+    <EmbeddedResource Include="industrial_sunset_puresky.vtex_c" LogicalName="DefaultCubemap" />
+  </ItemGroup>
+</Project>

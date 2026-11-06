@@ -1,0 +1,85 @@
+"ResourceEditInfo"
+{
+	"InputDependencies"
+	{
+	}
+	"AdditionalInputDependencies"
+	{
+	}
+	"ArgumentDependencies"
+	{
+		"0"
+		{
+			"ParameterName"	"___OverrideInputData___"
+			"ParameterType"	"BinaryBlobArg"
+			"Fingerprint"	"0"
+			"FingerprintDefault"	"0"
+		}
+		"1"
+		{
+			"ParameterName"	"fulltangent"
+			"ParameterType"	"IntArg"
+			"Fingerprint"	"0"
+			"FingerprintDefault"	"0"
+		}
+		"2"
+		{
+			"ParameterName"	"force_up_to_date_materials"
+			"ParameterType"	"IntArg"
+			"Fingerprint"	"0"
+			"FingerprintDefault"	"0"
+		}
+		"3"
+		{
+			"ParameterName"	"randomize_mesh"
+			"ParameterType"	"IntArg"
+			"Fingerprint"	"0"
+			"FingerprintDefault"	"0"
+		}
+		"4"
+		{
+			"ParameterName"	"skip_mesh_optimization"
+			"ParameterType"	"IntArg"
+			"Fingerprint"	"0"
+			"FingerprintDefault"	"0"
+		}
+		"5"
+		{
+			"ParameterName"	"static_prop"
+			"ParameterType"	"IntArg"
+			"Fingerprint"	"0"
+			"FingerprintDefault"	"0"
+		}
+		"6"
+		{
+			"ParameterName"	"enable_cloth_processing"
+			"ParameterType"	"IntArg"
+			"Fingerprint"	"1"
+			"FingerprintDefault"	"1"
+		}
+	}
+	"SpecialDependencies"
+	{
+		"0"
+		{
+			"String"	"Mesh Compiler Version"
+			"CompilerIdentifier"	"CompileRenderMesh"
+			"Fingerprint"	"28"
+			"UserData"	"0"
+		}
+	}
+	"AdditionalRelatedFiles"
+	{
+	}
+	"ChildResourceList"
+	{
+	}
+	"SearchableUserData"
+	{
+		"0"
+		{
+			"Key"	"IsChildResource"
+			"Value"	"1"
+		}
+	}
+}

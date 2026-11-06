@@ -1,0 +1,1097 @@
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using ValveResourceFormat.CompiledShader;
+using ValveResourceFormat.ResourceTypes;
+using Channel = ValveResourceFormat.CompiledShader.ChannelMapping;
+
+namespace ValveResourceFormat.IO
+{
+    /// <summary>
+    /// Provides shader data information for materials, including texture input mappings and suffixes.
+    /// </summary>
+    public interface IShaderDataProvider
+    {
+        /// <summary>
+        /// Gets the input texture channels and names for a given texture type in a material.
+        /// </summary>
+        /// <param name="textureType">The type of texture to query.</param>
+        /// <param name="material">The material containing the texture.</param>
+        /// <returns>A collection of channel mappings and their corresponding input names.</returns>
+        public IEnumerable<(Channel Channel, string Name)> GetInputsForTexture(string textureType, Material material);
+
+        /// <summary>
+        /// Gets the file suffix for a given input texture name.
+        /// </summary>
+        /// <param name="inputName">The name of the input texture.</param>
+        /// <param name="material">The material containing the texture.</param>
+        /// <returns>The suffix string for the input texture, or null if not found.</returns>
+        public string? GetSuffixForInputTexture(string inputName, Material material);
+
+        /// <summary>
+        /// Gets the blend state of a material for the default dynamic combo.
+        /// </summary>
+        /// <param name="material">The material.</param>
+        /// <param name="combos">Integer parameters overriding those of the material, as F_ features or S_ and D_ combos.</param>
+        public RsBlendStateDesc GetBlendState(Material material, IReadOnlyDictionary<string, long>? combos = null);
+
+        /// <summary>
+        /// Gets whether a blended material writes depth while it blends.
+        /// </summary>
+        /// <param name="material">The material.</param>
+        /// <param name="combos">Integer parameters overriding those of the material, as F_ features or S_ and D_ combos.</param>
+        /// <returns><see langword="false"/> for materials that do not blend, or when the provider cannot tell.</returns>
+        public bool GetTranslucentDepthWrite(Material material, IReadOnlyDictionary<string, long>? combos = null);
+
+        /// <summary>
+        /// Gets whether a material draws both faces of its geometry.
+        /// </summary>
+        /// <param name="material">The material.</param>
+        /// <param name="combos">Integer parameters overriding those of the material, as F_ features or S_ and D_ combos.</param>
+        public bool GetRenderBackfaces(Material material, IReadOnlyDictionary<string, long>? combos = null);
+
+        /// <summary>
+        /// Gets whether a material's vertex shader animates vertices, such as foliage swaying.
+        /// </summary>
+        /// <param name="material">The material.</param>
+        /// <param name="combos">Integer parameters overriding those of the material, as F_ features or S_ and D_ combos.</param>
+        public bool GetVertexAnimation(Material material, IReadOnlyDictionary<string, long>? combos = null);
+
+        /// <summary>
+        /// Gets the integer attributes of a material combined with those of its shader, the material taking precedence.
+        /// </summary>
+        /// <param name="material">The material.</param>
+        /// <param name="combos">Overrides for the integer parameters of the material.</param>
+        public IReadOnlyDictionary<string, long> GetIntAttributes(Material material, IReadOnlyDictionary<string, long>? combos = null);
+    }
+
+    /// <summary>
+    /// Provides shader data by querying compiled shader files, with optional fallback to basic hardcoded mappings.
+    /// </summary>
+    public class ShaderDataProvider : IShaderDataProvider
+    {
+#pragma warning disable CA1859 // Use concrete types when possible for improved performance
+        private readonly IFileLoader fileLoader;
+        private readonly IShaderDataProvider? basicProvider;
+#pragma warning restore CA1859
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ShaderDataProvider"/> class.
+        /// </summary>
+        /// <param name="fileLoader">The file loader used to load shader files.</param>
+        /// <param name="useFallback">Whether to use the basic provider as a fallback when shader files are unavailable.</param>
+        public ShaderDataProvider(IFileLoader fileLoader, bool useFallback = true)
+        {
+            this.fileLoader = fileLoader;
+            basicProvider = useFallback ? new BasicShaderDataProvider() : null;
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Returns texture inputs for the specified texture type, falling back to basic provider if available.
+        /// </remarks>
+        public IEnumerable<(Channel Channel, string Name)> GetInputsForTexture(string textureType, Material material)
+        {
+            return GetInputsForTexture_Internal(textureType, material) ?? basicProvider?.GetInputsForTexture(textureType, material) ?? [];
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Returns the filename suffix for the input texture, falling back to basic provider if available.
+        /// </remarks>
+        public string? GetSuffixForInputTexture(string inputName, Material material)
+        {
+            return GetSuffixForInputTexture_Internal(inputName, material) ?? basicProvider?.GetSuffixForInputTexture(inputName, material);
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Returns the basic provider's guess if available. The blend state compiled into the shader is not used,
+        /// see <see cref="GetCompiledBlendState"/>.
+        /// </remarks>
+        public RsBlendStateDesc GetBlendState(Material material, IReadOnlyDictionary<string, long>? combos = null)
+        {
+            ArgumentNullException.ThrowIfNull(material);
+
+            return basicProvider?.GetBlendState(material, combos) ?? default;
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Reads the constant attributes compiled into the pixel shader, falling back to basic provider
+        /// for the attributes the shader does not compile to a constant.
+        /// </remarks>
+        public IReadOnlyDictionary<string, long> GetIntAttributes(Material material, IReadOnlyDictionary<string, long>? combos = null)
+        {
+            ArgumentNullException.ThrowIfNull(material);
+
+            var attributes = basicProvider?.GetIntAttributes(material, combos) ?? material.IntAttributes;
+            var shaderAttributes = GetIntAttributes_Internal(material, combos ?? material.IntParams);
+
+            if (shaderAttributes == null)
+            {
+                return attributes;
+            }
+
+            var combined = new Dictionary<string, long>(attributes);
+
+            foreach (var (name, value) in shaderAttributes)
+            {
+                if (!material.IntAttributes.ContainsKey(name))
+                {
+                    combined[name] = value;
+                }
+            }
+
+            return combined;
+        }
+
+        /// <summary>
+        /// Extracts the material feature state from integer parameters.
+        /// </summary>
+        /// <param name="material">The material to extract feature state from.</param>
+        /// <returns>A dictionary of feature names (with 'F_' prefix) and their values.</returns>
+        public static IDictionary<string, byte> GetMaterialFeatureState(Material material)
+            => GetComboState(material.IntParams, "F_");
+
+        private static Dictionary<string, byte> GetComboState(IReadOnlyDictionary<string, long> combos, string prefix)
+            => combos
+                .Where(p => p.Key.StartsWith(prefix, StringComparison.Ordinal))
+                .ToDictionary(p => p.Key, p => (byte)p.Value);
+
+        /// <summary>
+        /// Produce a static configuration that fits the material's feature state.
+        /// This configuration can be used to select one of the static variants contained in the shader file.
+        /// </summary>
+        /// <param name="features">Features vcs file that contains the feature definitions.</param>
+        /// <param name="program">Stage for which the configuration will be generated.</param>
+        /// <param name="featureParams">Feature parameters have the 'F_' prefix.</param>
+        /// <param name="staticParams">Statics (not tied to a feature) that you want to override. Static parameters have the 'S_' prefix.</param>
+        /// <returns>A tuple containing the static configuration array and the corresponding static combo identifier.</returns>
+        public static (int[] StaticConfig, long StaticComboId) GetStaticConfiguration_ForFeatureState(
+            VfxProgramData features,
+            VfxProgramData program,
+            IDictionary<string, byte> featureParams,
+            IDictionary<string, byte>? staticParams = null)
+        {
+            ArgumentNullException.ThrowIfNull(features, nameof(features));
+            ArgumentNullException.ThrowIfNull(program, nameof(program));
+
+            if (features.VcsProgramType != VcsProgramType.Features)
+            {
+                throw new ArgumentOutOfRangeException(nameof(features), $"Argument needs to be a shader file of type: {VcsProgramType.Features}");
+            }
+
+            if (program.VcsProgramType == VcsProgramType.Features)
+            {
+                throw new ArgumentOutOfRangeException(nameof(program), $"Static config cannot be built for shader files of type: {VcsProgramType.Features}");
+            }
+
+            var staticConfiguration = new int[program.StaticComboArray.Length];
+            var configMapping = new ComboConfigMapping(program);
+
+            foreach (var condition in program.StaticComboArray)
+            {
+                if (condition.FeatureIndex == -1)
+                {
+                    if (staticParams != null && staticParams.TryGetValue(condition.Name, out var value))
+                    {
+                        staticConfiguration[condition.Index] = value;
+                    }
+
+                    continue;
+                }
+
+                var feature = features.StaticComboArray[condition.FeatureIndex];
+                featureParams.TryGetValue(feature.Name, out var featureValue);
+
+                var sourceType = (VfxStaticComboSourceType)condition.ComboSourceType;
+
+                if (sourceType == VfxStaticComboSourceType.__SET_BY_FEATURE__)
+                {
+                    var configValue = (int)featureValue;
+
+                    // Check that data coming from the material is within the allowed range
+                    if (featureValue > feature.RangeMax)
+                    {
+                        Console.WriteLine($"Value for feature '{feature.Name}' is higher ({featureValue}) than the maximum ({feature.RangeMax})."); // TODO: logger
+                        configValue = feature.RangeMax;
+                    }
+                    else if (featureValue < feature.RangeMin)
+                    {
+                        Console.WriteLine($"Value for feature '{feature.Name}' is lower ({featureValue}) than the minimum ({feature.RangeMin})."); // TODO: logger
+                        configValue = feature.RangeMin;
+                    }
+
+                    staticConfiguration[condition.Index] = configValue;
+                }
+                else if (sourceType == VfxStaticComboSourceType.__SET_BY_FEATURE_EQ__)
+                {
+                    Debug.Assert(condition.RangeMin == 0 && condition.RangeMax == 1);
+                    staticConfiguration[condition.Index] = featureValue == condition.FeatureComparisonValue ? 1 : 0;
+                }
+                else if (sourceType == VfxStaticComboSourceType.__SET_BY_FEATURE_NE__)
+                {
+                    Debug.Assert(condition.RangeMin == 0 && condition.RangeMax == 1);
+                    staticConfiguration[condition.Index] = featureValue != condition.FeatureComparisonValue ? 1 : 0;
+                }
+                else
+                {
+                    throw new InvalidOperationException(
+                        $"Unexpected combo source type '{sourceType}' for feature-linked static combo '{condition.Name}'.");
+                }
+            }
+
+            return (staticConfiguration, configMapping.CalcComboIdFromValues(staticConfiguration));
+        }
+
+        /// <summary>
+        /// Produce the static configuration that a material's feature state selects, reduced by the combo rules
+        /// when the configuration the features produce was not compiled.
+        /// </summary>
+        /// <param name="features">Features vcs file that contains the feature definitions.</param>
+        /// <param name="program">Stage for which the configuration will be generated.</param>
+        /// <param name="featureParams">Feature parameters have the 'F_' prefix.</param>
+        /// <param name="staticParams">Statics (not tied to a feature) that you want to override. Static parameters have the 'S_' prefix.</param>
+        /// <returns>The static configuration and its static combo identifier, which may still be missing from <paramref name="program"/> if reducing did not help.</returns>
+        public static (int[] StaticConfig, long StaticComboId) ResolveStaticConfiguration(
+            VfxProgramData features,
+            VfxProgramData program,
+            IDictionary<string, byte> featureParams,
+            IDictionary<string, byte>? staticParams = null)
+        {
+            var (staticConfig, staticComboId) = GetStaticConfiguration_ForFeatureState(features, program, featureParams, staticParams);
+
+            // The shader feature rules may not match the static rules, producing a configuration that was never compiled
+            if (!program.StaticComboEntries.ContainsKey(staticComboId) && TryReduceStaticConfiguration(program, staticConfig, out var reducedConfig))
+            {
+                staticConfig = reducedConfig;
+                staticComboId = new ComboConfigMapping(program).CalcComboIdFromValues(reducedConfig);
+            }
+
+            return (staticConfig, staticComboId);
+        }
+
+        /// <summary>
+        /// Removes switches that would point to a non-existent static combo.
+        /// </summary>
+        /// <param name="program">The file that contains the combos and combo rules.</param>
+        /// <param name="staticConfiguration">The original static configuration.</param>
+        /// <param name="reducedConfiguration">The reduced configuration with invalid switches removed.</param>
+        /// <returns>True if the configuration was modified, false otherwise.</returns>
+        public static bool TryReduceStaticConfiguration(VfxProgramData program, int[] staticConfiguration, out int[] reducedConfiguration)
+        {
+            reducedConfiguration = [.. staticConfiguration];
+
+            // Iterate until stable -- disabling one combo may create new violations.
+            for (var loop = 0; loop < 100; loop++)
+            {
+                var changed = false;
+
+                foreach (var constraint in program.StaticComboRules)
+                {
+                    var indexCount = constraint.ExtraRuleData[1];
+
+                    if (loop == 0)
+                    {
+                        for (var i = 0; i < indexCount; i++)
+                        {
+                            if (constraint.ArgTypes[i] is not VfxRuleType.Static)
+                            {
+                                Console.WriteLine($"WARNING: Static combo rule {constraint.RuleMethod} has non-static arg type {constraint.ArgTypes[i]} at index {i}");
+                                break;
+                            }
+                        }
+                    }
+
+                    if (constraint.RuleMethod is VfxRuleMethod.ChildOf or VfxRuleMethod.Requires)
+                    {
+                        if (!ArgMatches(constraint, 0, reducedConfiguration))
+                        {
+                            continue;
+                        }
+
+                        var numEnabled = 0;
+                        for (var i = 1; i < indexCount; i++)
+                        {
+                            if (ArgMatches(constraint, i, reducedConfiguration))
+                            {
+                                numEnabled++;
+                            }
+                        }
+
+                        if (numEnabled < constraint.ExtraRuleData[0])
+                        {
+                            reducedConfiguration[constraint.ArgIndices[0]] = 0;
+                            changed = true;
+                        }
+                    }
+                    else if (constraint.RuleMethod == VfxRuleMethod.AllowNum)
+                    {
+                        var allowedCount = constraint.ExtraRuleData[0];
+
+                        var numEnabled = 0;
+                        for (var i = 0; i < indexCount; i++)
+                        {
+                            if (ArgMatches(constraint, i, reducedConfiguration))
+                            {
+                                if (numEnabled >= allowedCount)
+                                {
+                                    if (constraint.ArgTypes[i] == constraint.RuleType)
+                                    {
+                                        reducedConfiguration[constraint.ArgIndices[i]] = 0;
+                                        changed = true;
+                                    }
+                                }
+                                else
+                                {
+                                    numEnabled++;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!changed)
+                {
+                    break;
+                }
+            }
+
+            return !reducedConfiguration.AsSpan().SequenceEqual(staticConfiguration);
+
+            static bool ArgMatches(VfxRule constraint, int argIndex, int[] values)
+            {
+                if (constraint.ArgTypes[argIndex] != VfxRuleType.Static)
+                {
+                    return false;
+                }
+
+                var value = values[constraint.ArgIndices[argIndex]];
+                var expected = constraint.ArgValues[argIndex];
+
+                if (expected == -1)
+                {
+                    return value != 0;
+                }
+
+                return value == expected;
+            }
+        }
+
+        /// <summary>
+        /// Get precise texture inputs by querying the shader files.
+        /// </summary>
+        private List<(Channel Channel, string Name)>? GetInputsForTexture_Internal(string textureType, Material material)
+        {
+            var shader = fileLoader.LoadShader(material.ShaderName);
+            if (shader?.Features == null)
+            {
+                return null;
+            }
+
+            var @params = Array.FindAll(shader.Features.VariableDescriptions, p => p.Name == textureType);
+
+            if (@params.Length == 0)
+            {
+                // Texture not defined in the shader file, export the texture anyway.
+                // Most likely, the texture was removed by a shader update, and the material was not recompiled.
+                return [(Channel.RGBA, BasicShaderDataProvider.ConvertTextureToInput(textureType))];
+            }
+
+            // vr_simple (hlvr): g_tAmbientOcclusion[1] ChannelIndices (-1,-1,-1,-1)
+            @params = [.. @params.Where(static p => p.ChannelCount > 0)];
+
+            if (@params.Length == 0)
+            {
+                throw new InvalidDataException($"None of the variants of '{textureType}' had any channel defined in shader '{shader.Features.ShaderName}'.");
+            }
+
+            var determinedParameter = @params[0];
+            var originatingShaderFile = shader.Features;
+
+            if (@params.Length > 1)
+            {
+                (determinedParameter, originatingShaderFile) = DetermineParameterReferencedByMaterial(shader, material, textureType);
+
+                if (determinedParameter == null)
+                {
+                    return [(Channel.RGBA, BasicShaderDataProvider.ConvertTextureToInput(textureType))];
+                }
+            }
+
+            return [.. GetParameterInputs(determinedParameter, originatingShaderFile)];
+
+            // <summary>
+            // Determine which of the parameter variants is the one referenced by the material.
+            // </summary>
+            (VfxVariableDescription, VfxProgramData) DetermineParameterReferencedByMaterial(ShaderCollection shader, Material material, string paramName,
+                KeyValuePair<string, byte> forcedStatic = default)
+            {
+                var featureState = GetMaterialFeatureState(material);
+
+                // Pixel shader first
+                var collectionOrdered = shader
+                    .Where(sh => sh.VcsProgramType != VcsProgramType.Features && sh.StaticComboEntries.Count > 0)
+                    .OrderByDescending(sh => sh.VcsProgramType == VcsProgramType.PixelShader);
+
+                foreach (var shaderFile in collectionOrdered)
+                {
+                    var fileParams = Array.FindAll(shaderFile.VariableDescriptions, p => p.Name == paramName);
+                    if (fileParams.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    // Dota seems to want one of S_MODE_FORWARD / S_MODE_DEFERRED enabled for textures
+                    // to be referenced in the write sequences.
+                    var staticState = new Dictionary<string, byte>(2) { { "S_MODE_FORWARD", 1 } };
+
+                    if (forcedStatic.Key is not null)
+                    {
+                        staticState.Add(forcedStatic.Key, forcedStatic.Value);
+                    }
+
+                    var (staticConfig, staticComboId) = ResolveStaticConfiguration(shader.Features!, shaderFile, featureState, staticState);
+
+                    // That or the material data is just bad/incompatible
+                    if (!shaderFile.StaticComboEntries.ContainsKey(staticComboId))
+                    {
+                        throw new InvalidOperationException("Feature state points to a missing static combo, and the combo rules could not reduce it to a compiled one.");
+                    }
+
+                    shaderFile.StaticComboCache.EnsureMinimumCacheSize(staticConfig.Length);
+
+                    var staticVariant = shaderFile.StaticComboCache.Get(staticComboId);
+
+                    // Should non-leading write sequences be checked too?
+                    foreach (var writeSequenceField in staticVariant.AllVariables.Fields)
+                    {
+                        var referencedParam = fileParams.FirstOrDefault(p => p.Index == writeSequenceField.VariableIndex);
+                        if (referencedParam != null)
+                        {
+                            return (referencedParam, shaderFile);
+                        }
+                    }
+
+                    if (forcedStatic.Key is null)
+                    {
+                        // Try again with S_MODE_TOOLS_VIS
+                        // Fixes hlvr/pak01/materials/skybox/sky_stars_01.vmat
+                        // Jumps from static combo 0x230a to 0x280230a, ends up matching the 2nd g_tNormal, with Box mips.
+                        return DetermineParameterReferencedByMaterial(shader, material, paramName, forcedStatic: new KeyValuePair<string, byte>("S_MODE_TOOLS_VIS", 1));
+                    }
+                }
+
+                // Parameter not found in write sequence for any shader file.
+                // Most likely the material was compiled against an older shader version, and the
+                // feature combination that references this parameter no longer exists.
+                Console.WriteLine($"WARNING: Varying parameter '{paramName}' in '{shader.Features!.ShaderName}' could not be resolved. "
+                    + $"Features ({string.Join(", ", featureState.Select(p => $"{p.Key}={p.Value}"))}). "
+                    + "The material may reference a texture that no longer exists in the shader.");
+                return default;
+            }
+
+            IEnumerable<(Channel Channel, string Name)> GetParameterInputs(VfxVariableDescription param, VfxProgramData program)
+            {
+                for (var i = 0; i < param.ChannelCount; i++)
+                {
+                    var channelIndex = param.ChannelInfoIndices[i];
+                    var channel = program.TextureChannelProcessors[channelIndex];
+
+                    var cutoff = Array.IndexOf(channel.InputTextureIndices, -1);
+                    var textureProcessorInputs = channel.InputTextureIndices[..cutoff].Select(idx => program.VariableDescriptions[idx].Name).ToArray();
+
+                    if (channel.MipProcessingCommand == "HemiOctIsoRoughness_RG_B" || channel.MipProcessingCommand == "AnisoNormal")
+                    {
+                        yield return (Channel.RGB, textureProcessorInputs[0]);
+                        if (textureProcessorInputs.Length == 2)
+                        {
+                            yield return (Channel.A, textureProcessorInputs[1]);
+                        }
+
+                        yield break;
+                    }
+
+                    // Compiler generated texture
+                    // https://github.com/ValveResourceFormat/ValveResourceFormat/issues/630
+                    if (channel.MipProcessingCommand == "AnisoRoughness_RG" && textureProcessorInputs.Length > 1)
+                    {
+                        Debug.Assert(textureProcessorInputs[0] == "TextureNormal" && textureProcessorInputs[1] == "TextureRoughness");
+                        yield break;
+                    }
+
+                    // Seems like we already undo the swizzle in texture decoder. Issue: #591
+                    if (channel.Channel == Channel.AG)
+                    {
+                        yield return (Channel.RG, textureProcessorInputs[0]);
+                        yield break;
+                    }
+
+                    yield return (channel.Channel, textureProcessorInputs[0]);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets the file suffix for an input texture by querying the shader file.
+        /// </summary>
+        private string? GetSuffixForInputTexture_Internal(string inputName, Material material)
+        {
+            var shader = fileLoader.LoadShader(material.ShaderName);
+            if (shader?.Features != null)
+            {
+                foreach (var param in shader.Features.VariableDescriptions)
+                {
+                    if (param.Name == inputName && !string.IsNullOrEmpty(param.TextureFileEnding))
+                    {
+                        return "_" + param.TextureFileEnding;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Gets the blend state compiled into the pixel shader render state for the default dynamic combo.
+        /// </summary>
+        /// <remarks>
+        /// This is the state of the pass the combo was compiled for, not how the material blends:
+        /// deferred shaders compile their GBuffer write state, translucent combos may leave blending off for the pass to set,
+        /// and alpha tested combos that discard do not enable alpha to coverage.
+        /// </remarks>
+        /// <param name="material">The material.</param>
+        /// <param name="combos">Integer parameters overriding those of the material, as F_ features or S_ and D_ combos.</param>
+        /// <returns>The compiled blend state, or null if the shader or its static combo is not available.</returns>
+        public RsBlendStateDesc? GetCompiledBlendState(Material material, IReadOnlyDictionary<string, long>? combos = null)
+        {
+            ArgumentNullException.ThrowIfNull(material);
+
+            combos ??= material.IntParams;
+
+            var shader = fileLoader.LoadShader(material.ShaderName);
+            var program = shader?.PixelShaderRenderState ?? shader?.Pixel;
+
+            if (shader == null || program == null || GetStaticCombo(shader, program, combos) is not { } staticCombo)
+            {
+                return null;
+            }
+
+            var dynamicConfig = Array.ConvertAll(program.DynamicComboArray, combo => (int)combos.GetValueOrDefault(combo.Name, combo.RangeMin));
+            var dynamicComboId = new ComboConfigMapping(program, isDynamic: true).CalcComboIdFromValues(dynamicConfig);
+
+            var renderState = staticCombo.DynamicComboRenderStates
+                .FirstOrDefault(renderState => renderState.DynamicComboId == dynamicComboId) as VfxRenderStateInfoPixelShader;
+
+            return renderState?.BlendStateDesc;
+        }
+
+        /// <inheritdoc/>
+        public bool GetTranslucentDepthWrite(Material material, IReadOnlyDictionary<string, long>? combos = null)
+            => basicProvider?.GetTranslucentDepthWrite(material, combos) ?? false;
+
+        /// <inheritdoc/>
+        public bool GetRenderBackfaces(Material material, IReadOnlyDictionary<string, long>? combos = null)
+            => basicProvider?.GetRenderBackfaces(material, combos) ?? false;
+
+        /// <inheritdoc/>
+        public bool GetVertexAnimation(Material material, IReadOnlyDictionary<string, long>? combos = null)
+            => basicProvider?.GetVertexAnimation(material, combos) ?? false;
+
+        /// <summary>
+        /// Gets the integer and boolean attributes compiled as constants into the pixel shader static combo.
+        /// Attributes compiled to an expression are left out.
+        /// </summary>
+        private Dictionary<string, long>? GetIntAttributes_Internal(Material material, IReadOnlyDictionary<string, long> combos)
+        {
+            var shader = fileLoader.LoadShader(material.ShaderName);
+
+            if (shader?.Pixel == null || GetStaticComboEntry(shader, shader.Pixel, combos) is not { } staticComboEntry)
+            {
+                return null;
+            }
+
+            var attributes = new Dictionary<string, long>();
+
+            foreach (var attribute in staticComboEntry.UnserializeAttributes())
+            {
+                long? value = attribute.ConstValue switch
+                {
+                    int intValue => intValue,
+                    bool boolValue => boolValue ? 1 : 0,
+                    _ => null,
+                };
+
+                if (value.HasValue)
+                {
+                    attributes.TryAdd(attribute.Name, value.Value);
+                }
+            }
+
+            return attributes;
+        }
+
+        private static VfxStaticComboData? GetStaticCombo(ShaderCollection shader, VfxProgramData program, IReadOnlyDictionary<string, long> combos)
+        {
+            var entry = GetStaticComboEntry(shader, program, combos);
+
+            if (entry == null)
+            {
+                return null;
+            }
+
+            return program.StaticComboCache.Get(entry.StaticComboId);
+        }
+
+        private static VfxStaticComboVcsEntry? GetStaticComboEntry(ShaderCollection shader, VfxProgramData program, IReadOnlyDictionary<string, long> combos)
+        {
+            if (shader.Features == null)
+            {
+                return null;
+            }
+
+            var (_, staticComboId) = ResolveStaticConfiguration(shader.Features, program, GetComboState(combos, "F_"), GetComboState(combos, "S_"));
+
+            return program.StaticComboEntries.GetValueOrDefault(staticComboId);
+        }
+    }
+
+    /// <summary>
+    /// Provides hardcoded shader data mappings for common shaders as a fallback when shader files are unavailable.
+    /// </summary>
+    public class BasicShaderDataProvider : IShaderDataProvider
+    {
+        /// <summary>
+        /// Hardcoded texture channel mappings for known shader types.
+        /// </summary>
+        public static readonly Dictionary<string, Dictionary<string, (Channel Channel, string Name)[]>> TextureMappings = new()
+        {
+            ["global_lit_simple"] = new()
+            {
+                ["g_tColor"] = [(Channel.RGB, "TextureColor"), (Channel.A, "TextureTranslucency")],
+                ["g_tNormal"] = [(Channel.RGB, "TextureNormal")],
+                ["g_tSpecular"] = [(Channel.R, "TextureReflectance"), (Channel.G, "TextureSelfIllum"), (Channel.B, "TextureBloom")],
+            },
+
+            ["multiblend"] = new()
+            {
+                ["g_tColor0"] = [(Channel.RGB, "TextureColor0")],
+                ["g_tColor1"] = [(Channel.RGB, "TextureColor1"), (Channel.A, "TextureRevealMask1")],
+                ["g_tColor2"] = [(Channel.RGB, "TextureColor2"), (Channel.A, "TextureRevealMask2")],
+                ["g_tColor3"] = [(Channel.RGB, "TextureColor3"), (Channel.A, "TextureRevealMask3")],
+                ["g_tSpecular0"] = [(Channel.R, "TextureReflectance0"), (Channel.G, "TextureSelfIllum0"), (Channel.B, "TextureBloom0")],
+                ["g_tSpecular1"] = [(Channel.R, "TextureReflectance1"), (Channel.G, "TextureSelfIllum1"), (Channel.B, "TextureBloom1")],
+                ["g_tSpecular2"] = [(Channel.R, "TextureReflectance2"), (Channel.G, "TextureSelfIllum2"), (Channel.B, "TextureBloom2")],
+                ["g_tSpecular3"] = [(Channel.R, "TextureReflectance3"), (Channel.G, "TextureSelfIllum3"), (Channel.B, "TextureBloom3")],
+                ["g_tTintMasks"] = [(Channel.R, "TextureTintMask0"), (Channel.G, "TextureTintMask1"), (Channel.B, "TextureTintMask2"), (Channel.A, "TextureTintMask3")],
+                ["g_tTint2Masks"] = [(Channel.R, "TextureTint2Mask0"), (Channel.G, "TextureTint2Mask1"), (Channel.B, "TextureTint2Mask2"), (Channel.A, "TextureTint2Mask3")],
+            },
+
+            ["hero"] = new()
+            {
+                ["g_tColor"] = [(Channel.RGB, "TextureColor"), (Channel.A, "TextureTranslucency")],
+                ["g_tNormal"] = [(Channel.RGB, "TextureNormal")],
+                ["g_tCubeMap"] = [(Channel.RGBA, "TextureCubeMap")],
+                ["g_tCubeMapSeparateMask"] = [(Channel.G, "TextureCubeMapSeparateMask")],
+                ["g_tFresnelWarp"] = [(Channel.R, "TextureFresnelWarpRim"), (Channel.G, "TextureFresnelWarpColor"), (Channel.B, "TextureFresnelWarpSpec")],
+                ["g_tMasks1"] = [(Channel.R, "TextureDetailMask"), (Channel.G, "TextureDiffuseWarpMask"), (Channel.B, "TextureMetalnessMask"), (Channel.A, "TextureSelfIllumMask")],
+                ["g_tMasks2"] = [(Channel.R, "TextureSpecularMask"), (Channel.G, "TextureRimMask"), (Channel.B, "TextureTintByBaseMask"), (Channel.A, "TextureSpecularExponent")],
+                ["g_tDetail"] = [(Channel.RGBA, "TextureDetail")],
+                ["g_tDetail2"] = [(Channel.RGBA, "TextureDetail2")],
+            },
+
+            ["grasstile_preview"] = new()
+            {
+                ["g_tColor"] = [(Channel.RGB, "TextureColor"), (Channel.A, "TextureTranslucency")],
+                ["g_tTintMask"] = [(Channel.G, "TextureTintMask")],
+                ["g_tSpecular"] = [(Channel.G, "TextureReflectance")],
+                ["g_tSelfIllum"] = [(Channel.G, "TextureSelfIllum")],
+            },
+
+            ["generic"] = new()
+            {
+                ["g_tColor"] = [(Channel.RGB, "TextureColor")],
+                ["g_tNormal"] = [(Channel.RGB, "TextureNormal")],
+                ["g_tMetalnessReflectanceFresnel"] = [(Channel.R, "TextureMetalness"), (Channel.G, "TextureReflectance"), (Channel.B, "TextureFresnel")],
+                ["g_tRoughness"] = [(Channel.R, "TextureRoughness"),],
+            },
+
+            ["vr_standard"] = new()
+            {
+                ["g_tColor"] = [(Channel.RGB, "TextureColor"), (Channel.A, "TextureTranslucency")],
+                ["g_tColor1"] = [(Channel.RGB, "TextureColor")],
+                ["g_tColor2"] = [(Channel.RGB, "TextureColor")],
+                ["g_tNormal"] = [(Channel.RGB, "TextureNormal")],
+                ["g_tNormal1"] = [(Channel.RGB, "TextureNormal")],
+                ["g_tNormal2"] = [(Channel.RGB, "TextureNormal")],
+            },
+
+            ["vr_complex"] = new()
+            {
+                ["g_tColor"] = [(Channel.RGB, "TextureColor"), (Channel.A, string.Empty)], // Alpha can be metal or translucency
+                ["g_tNormal"] = [(Channel.RGB, "TextureNormal"), (Channel.A, "TextureRoughness")], // TODO: Figure out anisotropic gloss
+
+                // These all work fine thanks to consistent names, but we can clean them up to save disk size.
+                // E.g. RGBA -> R (Grayscale)
+                ["g_tAmbientOcclusion"] = [(Channel.R, "TextureAmbientOcclusion")],
+                ["g_tTintMask"] = [(Channel.R, "TextureTintMask")],
+
+                ["g_tMetalness"] = [(Channel.R, "TextureMetalness")],
+                ["g_tSelfIllumMask"] = [(Channel.R, "TextureSelfIllumMask")],
+                ["g_tBentNormal"] = [(Channel.RGB, "TextureBentNormal")], // ATI2N
+
+                ["g_tDetail"] = [(Channel.RGB, "TextureDetail")],
+                ["g_tDetailMask"] = [(Channel.R, "TextureDetailMask")],
+                ["g_tNormalDetail"] = [(Channel.RGB, "TextureNormalDetail")], // ATI2N
+
+                ["g_tSquishColor"] = [(Channel.RGB, "TextureSquishColor")],
+                ["g_tStretchColor"] = [(Channel.RGB, "TextureStretchColor")],
+                ["g_tSquishNormal"] = [(Channel.RGB, "TextureSquishNormal")],
+                ["g_tStretchNormal"] = [(Channel.RGB, "TextureStretchNormal")],
+                ["g_tSquishAmbientOcclusion"] = [(Channel.R, "TextureSquishAmbientOcclusion")],
+                ["g_tStretchAmbientOcclusion"] = [(Channel.R, "TextureStretchAmbientOcclusion")],
+
+            },
+
+            ["vr_simple"] = new()
+            {
+                ["g_tColor"] = [(Channel.RGB, "TextureColor"), (Channel.A, string.Empty)], // Alpha can be ao, metal or nothing at all
+                ["g_tNormal"] = [(Channel.RGB, "TextureNormal"), (Channel.A, "TextureRoughness")],
+
+                ["g_tAmbientOcclusion"] = [(Channel.R, "TextureAmbientOcclusion")],
+                ["g_tTintMask"] = [(Channel.R, "TextureTintMask")],
+            },
+
+            ["vr_simple_2way_blend"] = new()
+            {
+                ["g_tColorA"] = [(Channel.RGB, "TextureColorA"), (Channel.A, "TextureMetalnessA")],
+                ["g_tNormalA"] = [(Channel.RGB, "TextureNormalA"), (Channel.A, "TextureRoughnessA")],
+                ["g_tColorB"] = [(Channel.RGB, "TextureColorB"), (Channel.A, "TextureMetalnessB")],
+                ["g_tNormalB"] = [(Channel.RGB, "TextureNormalB"), (Channel.A, "TextureRoughnessB")],
+
+                ["g_tMask"] = [(Channel.R, "TextureMask")],
+            },
+
+            ["vr_eyeball"] = new()
+            {
+                ["g_tColor"] = [(Channel.RGB, "TextureColor"), (Channel.A, "TextureReflectance")],
+                ["g_tIris"] = [(Channel.RGB, "IrisNormal"), (Channel.A, "IrisRoughness")],
+                ["g_tNormal"] = [(Channel.AG, "TextureNormal")],
+
+                ["g_tIrisMask"] = [(Channel.R, "TextureIrisMask")],
+                ["g_tSelfIllumMask"] = [(Channel.R, "TextureSelfIllumMask")],
+            },
+
+            ["csgo_weapon"] = new()
+            {
+                ["g_tColor"] = [(Channel.RGB, "TextureColor")],
+                ["g_tMetalness"] = [(Channel.R, "TextureRoughness"), (Channel.G, "TextureMetalness")],
+                ["g_tAmbientOcclusion"] = [(Channel.R, "TextureAmbientOcclusion")],
+            },
+
+            ["sky"] = new()
+            {
+                ["g_tSkyTexture"] = [(Channel.RGBA, "SkyTexture")],
+            }
+        };
+
+        /// <summary>
+        /// Common texture input names and their corresponding file suffixes.
+        /// </summary>
+        public static readonly Dictionary<string, string> CommonTextureSuffixes = new()
+        {
+            { "TextureDetailMask", "_detailmask" },
+            { "TextureDiffuseWarpMask", "_diffusemask" },
+            { "TextureMetalnessMask", "_metalnessmask" },
+            { "TextureSelfIllumMask", "_selfillummask" },
+
+            { "TextureSpecularMask", "_specmask" },
+            { "TextureRimMask", "_rimmask" },
+            { "TextureTintByBaseMask", "_basetintmask" },
+            { "TextureSpecularExponent", "_specexp" },
+            { "TextureRevealMask", "_blend" },
+
+            { "TextureColor", "_color" },
+            { "TextureNormal", "_normal" },
+            { "TextureRoughness", "_rough" },
+            { "TextureMetalness", "_metal" },
+            { "TextureAmbientOcclusion", "_ao" },
+            { "TextureReflectance", "_refl"},
+            { "TextureTranslucency", "_trans"},
+        };
+
+        private static readonly string[] TranslucentShaders =
+        [
+            "vr_glass",
+            "vr_glass_markable",
+            "vr_energy_field",
+            "csgo_glass",
+            "csgo_effects",
+            "citadel_overlay",
+        ];
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Guesses the blend state from material flags and a few known shaders.
+        /// </remarks>
+        public RsBlendStateDesc GetBlendState(Material material, IReadOnlyDictionary<string, long>? combos = null)
+        {
+            ArgumentNullException.ThrowIfNull(material);
+
+            combos ??= material.IntParams;
+            var shaderName = Path.GetFileNameWithoutExtension(material.ShaderName);
+
+            if (shaderName == "csgo_decalmodulate")
+            {
+                return CreateBlendState(RsBlendMode.DestColor, RsBlendMode.SrcColor);
+            }
+
+            var blendModeParam = shaderName.EndsWith("static_overlay", StringComparison.Ordinal) || shaderName == "csgo_unlitgeneric"
+                ? combos.GetValueOrDefault("F_BLEND_MODE")
+                : 0;
+
+            return blendModeParam switch
+            {
+                2 => new RsBlendStateDesc { AlphaToCoverageEnable = true },
+                3 => CreateBlendState(RsBlendMode.DestColor, RsBlendMode.SrcColor),
+                5 => CreateBlendState(RsBlendMode.Zero, RsBlendMode.SrcColor),
+                6 => CreateBlendState(RsBlendMode.DestColor, RsBlendMode.InvSrcAlpha),
+                > 0 => GetPassBlendState(combos),
+                _ when shaderName == "vr_energy_field" && combos.GetValueOrDefault("F_TRANSLUCENT") == 3
+                    => CreateBlendState(RsBlendMode.SrcAlpha, RsBlendMode.One),
+                _ when combos.GetValueOrDefault("F_TRANSLUCENT") == 1
+                    || combos.GetValueOrDefault("F_ADDITIVE_BLEND") == 1
+                    || (TranslucentShaders.AsSpan().Contains(shaderName) && combos.GetValueOrDefault("F_OPAQUE_CUBEMAP_REFRACTION") != 1)
+                    || material.IntAttributes.ContainsKey("mapbuilder.water") => GetPassBlendState(combos),
+                _ => new RsBlendStateDesc { AlphaToCoverageEnable = combos.GetValueOrDefault("F_ALPHA_TEST") > 0 },
+            };
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Guesses from a few known shaders. Translucent materials do not write depth unless their shader is known to.
+        /// </remarks>
+        public bool GetTranslucentDepthWrite(Material material, IReadOnlyDictionary<string, long>? combos = null)
+        {
+            ArgumentNullException.ThrowIfNull(material);
+
+            combos ??= material.IntParams;
+
+            if (!GetBlendState(material, combos).BlendEnable[0])
+            {
+                return false;
+            }
+
+            var shaderName = Path.GetFileNameWithoutExtension(material.ShaderName);
+
+            return shaderName switch
+            {
+                "pbr" => combos.GetValueOrDefault("F_DISABLE_DEPTH_WRITE") == 0,
+                "csgo_complex" => combos.GetValueOrDefault("F_DISABLE_Z_BUFFERING") == 0 && combos.GetValueOrDefault("F_DEPTH_BIAS") == 0,
+                "generic" or "zipline" or "black_unlit" or "environment_texture_set" or "water_dota" or "crystal" => true,
+                _ => false,
+            };
+        }
+
+        /// <inheritdoc/>
+        public bool GetRenderBackfaces(Material material, IReadOnlyDictionary<string, long>? combos = null)
+        {
+            ArgumentNullException.ThrowIfNull(material);
+
+            combos ??= material.IntParams;
+
+            if (combos.GetValueOrDefault("F_RENDER_BACKFACES") == 1)
+            {
+                return true;
+            }
+
+            var shaderName = Path.GetFileNameWithoutExtension(material.ShaderName);
+
+            return shaderName == "cosmic_veil" && combos.GetValueOrDefault("g_bDoubleSidedVeil") == 1;
+        }
+
+        /// <inheritdoc/>
+        public bool GetVertexAnimation(Material material, IReadOnlyDictionary<string, long>? combos = null)
+        {
+            ArgumentNullException.ThrowIfNull(material);
+
+            combos ??= material.IntParams;
+
+            var shaderName = Path.GetFileNameWithoutExtension(material.ShaderName);
+
+            if (shaderName is "csgo_foliage" or "vr_xen_foliage")
+            {
+                return true;
+            }
+
+            return combos.GetValueOrDefault("F_VERTEX_ANIMATION") > 0
+                || combos.GetValueOrDefault("F_FOLIAGE_ANIMATION") > 0
+                || combos.GetValueOrDefault("F_JITTER_VERTICES") > 0;
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Adds the attributes that material flags and a few known shaders would compile to.
+        /// </remarks>
+        public IReadOnlyDictionary<string, long> GetIntAttributes(Material material, IReadOnlyDictionary<string, long>? combos = null)
+        {
+            ArgumentNullException.ThrowIfNull(material);
+
+            combos ??= material.IntParams;
+            var shaderName = Path.GetFileNameWithoutExtension(material.ShaderName);
+            var attributes = new Dictionary<string, long>(material.IntAttributes);
+
+            if (shaderName == "csgo_water_fancy")
+            {
+                attributes.TryAdd("bCsgoWater", 1);
+                attributes.TryAdd("DoNotCastShadows", 1);
+                attributes.TryAdd("translucent", 1);
+            }
+
+            var isTranslucent = GetBlendState(material, combos).BlendEnable[0];
+            var hasDepthBias = combos.GetValueOrDefault("F_DEPTHBIAS") == 1 || combos.GetValueOrDefault("F_DEPTH_BIAS") == 1;
+
+            // :MaterialIsOverlay
+            if (combos.GetValueOrDefault("F_OVERLAY") == 1
+                || shaderName.EndsWith("static_overlay", StringComparison.Ordinal)
+                || shaderName == "citadel_overlay"
+                || (isTranslucent && hasDepthBias && shaderName is "csgo_vertexlitgeneric" or "csgo_complex"))
+            {
+                attributes.TryAdd("overlay", 1);
+            }
+
+            if (combos.GetValueOrDefault("F_DO_NOT_CAST_SHADOWS") == 1 || material.IntAttributes.GetValueOrDefault("F_DO_NOT_CAST_SHADOWS") == 1)
+            {
+                attributes.TryAdd("DoNotCastShadows", 1);
+            }
+
+            if (isTranslucent)
+            {
+                attributes.TryAdd("translucent", 1);
+            }
+
+            return attributes;
+        }
+
+        /// <summary>
+        /// Gets the blend state of the pass that draws translucent materials, additive when the material asks for it.
+        /// </summary>
+        private static RsBlendStateDesc GetPassBlendState(IReadOnlyDictionary<string, long> combos)
+            => combos.GetValueOrDefault("F_ADDITIVE_BLEND") == 1 || combos.GetValueOrDefault("F_BLEND_MODE") == 4
+                ? CreateBlendState(RsBlendMode.SrcAlpha, RsBlendMode.One)
+                : CreateBlendState(RsBlendMode.SrcAlpha, RsBlendMode.InvSrcAlpha);
+
+        private static RsBlendStateDesc CreateBlendState(RsBlendMode src, RsBlendMode dest)
+        {
+            var blendState = new RsBlendStateDesc();
+            blendState.SetBlendEnable(0, true);
+            blendState.SetSrcBlend(0, src);
+            blendState.SetDestBlend(0, dest);
+            return blendState;
+        }
+
+        /// <summary>
+        /// Gets hardcoded texture inputs. If no mappings are found it will be a single guessed RGBA input.
+        /// </summary>
+        /// <param name="textureType">The type of texture to query.</param>
+        /// <param name="material">The material containing the texture.</param>
+        /// <returns>A collection of channel mappings and their corresponding input names.</returns>
+        public IEnumerable<(Channel Channel, string Name)> GetInputsForTexture(string textureType, Material material)
+        {
+            var shaderName = Path.ChangeExtension(material.ShaderName, null); // strip '.vfx'
+
+            if (!(TextureMappings.TryGetValue(shaderName, out var shaderSpecific) && shaderSpecific.TryGetValue(textureType, out var channelMappings)))
+            {
+                yield return (Channel.RGBA, ConvertTextureToInput(textureType));
+                yield break;
+            }
+
+            foreach (var mapping in channelMappings)
+            {
+                var (channel, newTextureType) = mapping;
+                if (newTextureType.Length == 0 && !TryFigureOutNonStaticMap(shaderName, textureType, material.IntParams, out newTextureType))
+                {
+                    continue;
+                }
+
+                if (newTextureType == null)
+                {
+                    continue;
+                }
+
+                yield return (channel, newTextureType);
+            }
+        }
+
+        /// <summary>
+        /// Converts a shader texture parameter name to an input texture name.
+        /// </summary>
+        /// <param name="textureType">The shader texture parameter name (e.g., "g_tColor").</param>
+        /// <returns>The input texture name (e.g., "TextureColor").</returns>
+        public static string ConvertTextureToInput(string textureType)
+        {
+            return textureType.Replace("g_t", "Texture", StringComparison.Ordinal);
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Provides a filename suffix based on common texture type conventions.
+        /// </remarks>
+        public string? GetSuffixForInputTexture(string inputName, Material material)
+        {
+            foreach (var (commonType, commonSuffix) in CommonTextureSuffixes)
+            {
+                // Allow matching TextureColorB with TextureColor
+                if (inputName.StartsWith(commonType, StringComparison.OrdinalIgnoreCase))
+                {
+                    return commonSuffix;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Attempts to determine the correct texture mapping for shaders with non-static channel assignments.
+        /// </summary>
+        /// <param name="shader">The shader name.</param>
+        /// <param name="textureType">The texture type to resolve.</param>
+        /// <param name="intParams">The material's integer parameters.</param>
+        /// <param name="newTextureType">The resolved texture type name.</param>
+        /// <returns>True if the texture type was resolved, false otherwise.</returns>
+        private static bool TryFigureOutNonStaticMap(string shader, string textureType, Dictionary<string, long> intParams, out string? newTextureType)
+        {
+            if (shader == "vr_simple" && textureType == "g_tColor")
+            {
+                if (intParams.GetValueOrDefault("F_METALNESS_TEXTURE") != 0)
+                {
+                    newTextureType = "TextureMetalness";
+                    return true;
+                }
+
+                if (intParams.GetValueOrDefault("F_AMBIENT_OCCLUSION_TEXTURE") != 0)
+                {
+                    newTextureType = "TextureAmbientOcclusion";
+                    return true;
+                }
+            }
+
+            else if (shader == "vr_complex" && textureType == "g_tColor")
+            {
+                newTextureType = "TextureMetalness";
+
+                if (intParams.GetValueOrDefault("F_TRANSLUCENT") != 0
+                || intParams.GetValueOrDefault("F_ALPHA_TEST") != 0)
+                {
+                    newTextureType = "TextureTranslucency";
+                }
+
+                return true;
+            }
+
+            newTextureType = null;
+            return false;
+        }
+    }
+}

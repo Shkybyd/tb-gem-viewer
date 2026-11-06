@@ -1,0 +1,375 @@
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.World;
+
+namespace ValveResourceFormat.Renderer
+{
+    /// <summary>
+    /// Sorts and dispatches batched mesh draw calls for a render pass.
+    /// </summary>
+    public static class MeshBatchRenderer
+    {
+        /// <summary>
+        /// Draw call request with distance and render order for sorting.
+        /// </summary>
+#if DEBUG
+        [DebuggerDisplay("{Node.DebugName,nq}")]
+#endif
+        public readonly record struct Request(RenderableMesh Mesh, DrawCall? Call, float DistanceFromCamera, int RenderOrder, SceneNode Node);
+        record struct BatchRequest(RenderableMesh Mesh, DrawCall Call, SceneNode Node);
+
+        /// <summary>Compares two requests by shader pipeline sort ID, placing custom-render nodes at the boundary.</summary>
+        public static int CompareCustomPipeline(Request a, Request b)
+        {
+            const int CustomRenderSortId = 500 * -RenderMaterial.PerShaderSortIdRange;
+
+            return (a.Call, b.Call) switch
+            {
+                ({ }, { }) => b.Call.Material.SortId - a.Call.Material.SortId,
+                (null, { }) => b.Call.Material.SortId - CustomRenderSortId,
+                ({ }, null) => CustomRenderSortId - a.Call.Material.SortId,
+                (null, null) => 0,
+            };
+        }
+
+        /// <summary>Compares two requests first by render order, then by shader pipeline sort ID.</summary>
+        public static int CompareRenderOrderThenPipeline(Request a, Request b)
+        {
+            if (a.RenderOrder == b.RenderOrder)
+            {
+                return a.Call!.Material.SortId - b.Call!.Material.SortId;
+            }
+
+            return a.RenderOrder - b.RenderOrder;
+        }
+
+        /// <summary>
+        /// Compares two requests by distance from camera in hundredths of a unit, furthest first (back-to-front).
+        /// Ties are ordered by material, then in a stable order.
+        /// </summary>
+        public static int CompareCameraDistance(Request a, Request b)
+        {
+            var byDistance = DistanceSortKey(b).CompareTo(DistanceSortKey(a));
+            if (byDistance != 0)
+            {
+                return byDistance;
+            }
+
+            if (a.Call != null && b.Call != null)
+            {
+                var byMaterial = a.Call.Material.SortId.CompareTo(b.Call.Material.SortId);
+                if (byMaterial != 0)
+                {
+                    return byMaterial;
+                }
+            }
+
+            var byNode = a.Node.Id.CompareTo(b.Node.Id);
+            if (byNode != 0 || a.Call == null || b.Call == null)
+            {
+                return byNode;
+            }
+
+            var byMesh = a.Mesh.MeshIndex.CompareTo(b.Mesh.MeshIndex);
+            if (byMesh != 0)
+            {
+                return byMesh;
+            }
+
+            return a.Call.Index.CompareTo(b.Call.Index);
+        }
+
+        private static int DistanceSortKey(Request request) => (int)MathF.Min(request.DistanceFromCamera * 100f, int.MaxValue);
+
+        /// <summary>Compares two requests by draw stage first, then by shader program sort ID.</summary>
+        public static int CompareStageThenProgram(Request a, Request b)
+        {
+            Debug.Assert(a.Call != null && b.Call != null);
+            var stageA = DrawStage(a.Call.Material);
+            var stageB = DrawStage(b.Call.Material);
+
+            if (stageA == stageB)
+            {
+                return a.Call.Material.SortId - b.Call.Material.SortId;
+            }
+
+            return stageA - stageB;
+        }
+
+        private static int DrawStage(RenderMaterial material) => material switch
+        {
+            { IsOverlay: true } => 2,
+            { IsAlphaTest: true } => 1,
+            _ => 0,
+        };
+
+        /// <summary>Sorts requests according to the active render pass and issues all draw calls.</summary>
+        /// <param name="requests">Draw call requests to process.</param>
+        /// <param name="context">Render context describing the current pass and scene state.</param>
+        /// <param name="staticCount">
+        /// For the translucent pass, the number of leading requests that come from static nodes.
+        /// They are sorted and drawn before the rest, which are sorted on their own.
+        /// </param>
+        public static void Render(List<Request> requests, Scene.RenderContext context, int staticCount = 0)
+        {
+            // Material-ignoring replacement shaders draw without applying render state, so a scope
+            // latches the pass baseline for them.
+            using var batchScope = context.ReplacementShader?.IgnoreMaterialData == true
+                ? GraphicsContext.RenderState.Scope()
+                : default;
+
+            if (context.RenderPass is RenderPass.Opaque or RenderPass.OpaqueRefract)
+            {
+                requests.Sort(CompareCustomPipeline);
+            }
+            else if (context.RenderPass == RenderPass.OpaqueAggregate)
+            {
+                requests.Sort(CompareStageThenProgram);
+            }
+            else if (context.RenderPass == RenderPass.StaticOverlay)
+            {
+                requests.Sort(CompareRenderOrderThenPipeline);
+            }
+            else if (context.RenderPass == RenderPass.Translucent)
+            {
+                var span = CollectionsMarshal.AsSpan(requests);
+                span[..staticCount].Sort(CompareCameraDistance);
+                span[staticCount..].Sort(CompareCameraDistance);
+            }
+
+            BindReservedTextures(context);
+
+            DrawBatch(requests, context);
+        }
+
+        /// <summary>Binds the scene-wide textures to their reserved texture units for this pass.</summary>
+        private static void BindReservedTextures(Scene.RenderContext context)
+        {
+            foreach (var (slot, _, texture) in context.Textures)
+            {
+                GL.BindTextureUnit((int)slot, texture.Handle);
+            }
+
+            context.Scene.LightingInfo.BindLightmapTextures();
+        }
+
+        private ref struct Uniforms
+        {
+            public int MeshId = -1;
+            public int ShaderId = -1;
+            public int ShaderProgramId = -1;
+
+            public Uniforms() { }
+        }
+
+        private ref struct Config
+        {
+            public bool IndirectDraw;
+        }
+
+        /// <summary>Picks the program a draw runs with: the pass's replacement shader, the material's mode for this pass, or the material's own.</summary>
+        private static Shader ResolveShader(Scene.RenderContext context, RenderableMesh mesh, RenderMaterial material)
+        {
+            if (context.ReplacementShader is { } replacement)
+            {
+                return replacement.WithSkinning(mesh.ActiveSkinning).WithAlphaTest(material.IsAlphaTest).WithMorph(material.Shader);
+            }
+
+            if (context.Layer == RenderLayer.BloomAmount)
+            {
+                return material.Shader.BloomAmountMode ?? material.Shader;
+            }
+
+            if (context.DepthOnlyShader is { } depthOnly)
+            {
+                return material.Shader.DepthMode
+                    ?? depthOnly.WithSkinning(mesh.ActiveSkinning).WithAlphaTest(material.IsAlphaTest).WithMorph(material.Shader);
+            }
+
+            if (context.OverdrawShader is { } overdraw)
+            {
+                return material.Shader.OverdrawMode
+                    ?? overdraw.WithSkinning(mesh.ActiveSkinning).WithAlphaTest(material.IsAlphaTest);
+            }
+
+            return material.Shader;
+        }
+
+        private static void DrawBatch(List<Request> requests, Scene.RenderContext context)
+        {
+            var vao = -1;
+            Shader? shader = null;
+            RenderMaterial? material = null;
+            Uniforms uniforms = new();
+            Config config = new()
+            {
+                IndirectDraw = context.Scene.DrawMeshletsIndirect
+                    && context.RenderPass is RenderPass.DepthOnly or RenderPass.OpaqueAggregate or RenderPass.StaticOverlay,
+            };
+
+            var counters = PerfStats.Active;
+
+            foreach (var request in requests)
+            {
+                if (request.Call == null)
+                {
+                    if (context.RenderPass is RenderPass.Opaque or RenderPass.Translucent or RenderPass.All or RenderPass.DepthOnly)
+                    {
+                        material?.PostRender();
+
+                        // Custom nodes render themselves and may issue several draws internally; count them as one draw call.
+                        counters.Count(Counter.DrawCall);
+                        request.Node.Render(context);
+
+                        if (context.ReplacementShader?.IgnoreMaterialData == true)
+                        {
+                            // The node's scope left its own state latched, and the stateless draws
+                            // that follow cannot set any themselves.
+                            GraphicsContext.RenderState.RestorePassBaseline();
+                        }
+
+                        shader = null;
+                        material = null;
+                        vao = -1;
+                    }
+
+                    continue;
+                }
+
+                var requestMaterial = request.Call.Material;
+
+                var requestShader = ResolveShader(context, request.Mesh, requestMaterial);
+
+                if (material != requestMaterial || shader != requestShader)
+                {
+                    counters.Count(Counter.MaterialChange);
+
+                    if (context.ReplacementShader?.IgnoreMaterialData != true)
+                    {
+                        material?.PostRender();
+                    }
+
+                    if (shader != requestShader)
+                    {
+                        shader = requestShader;
+                        uniforms = new Uniforms();
+
+                        if (shader.Name == "picking")
+                        {
+                            uniforms.MeshId = shader.GetUniformLocation("meshId");
+                            uniforms.ShaderId = shader.GetUniformLocation("shaderId");
+                            uniforms.ShaderProgramId = shader.GetUniformLocation("shaderProgramId");
+                        }
+
+                        shader.Use();
+
+                        Debug.Assert(context.Scene.InstanceBufferGpu != null && context.Scene.TransformBufferGpu != null);
+                        context.Scene.TransformBufferGpu.BindBufferBase();
+                        context.Scene.InstanceBufferGpu.BindBufferBase();
+                    }
+
+                    material = requestMaterial;
+                    material.Render(shader, depthPass: context.DepthOnlyShader != null);
+                }
+
+                var requestVao = request.Call.GetVertexArrayObject();
+
+                VertexArray.Validate(requestVao, shader!);
+
+                if (vao != requestVao)
+                {
+                    vao = requestVao;
+                    GL.BindVertexArray(vao);
+                    counters.Count(Counter.VaoChange);
+                }
+
+                var batchRequest = new BatchRequest(request.Mesh, request.Call, request.Node);
+
+                if (requestMaterial.WritesDepthBeforeBlending
+                    && context.RenderPass == RenderPass.Translucent
+                    && context.ReplacementShader == null
+                    && context.DepthOnlyShader == null)
+                {
+                    var renderState = GraphicsContext.RenderState;
+                    var materialState = requestMaterial.ComposeRenderState(renderState.CurrentPass);
+                    var depthOnlyState = materialState;
+                    depthOnlyState.ColorWriteMask = RsColorWriteEnableBits.None;
+
+                    renderState.Apply(in depthOnlyState);
+                    Draw(shader!, ref uniforms, ref config, batchRequest);
+                    renderState.Apply(in materialState);
+                }
+
+                Draw(shader!, ref uniforms, ref config, batchRequest);
+            }
+
+            if (vao > -1)
+            {
+                material!.PostRender();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void Draw(Shader shader, ref Uniforms uniforms, ref Config config, BatchRequest request)
+        {
+            if (uniforms.MeshId != -1)
+            {
+                GL.ProgramUniform1((uint)shader.Program, uniforms.MeshId, (uint)request.Mesh.MeshIndex);
+                GL.ProgramUniform1((uint)shader.Program, uniforms.ShaderId, request.Call.Material.Shader.NameHash);
+                GL.ProgramUniform1((uint)shader.Program, uniforms.ShaderProgramId, (uint)request.Call.Material.Shader.Program);
+            }
+
+            if (config.IndirectDraw)
+            {
+                if (request.Node is SceneAggregate agg && agg.IndirectDrawCount > 0)
+                {
+                    PerfStats.Active.CountIndirectDraw(agg.IndirectDrawCount);
+
+                    var scene = agg.Scene;
+                    if (scene.CompactMeshletDraws && agg.CompactionIndex >= 0)
+                    {
+                        GL.MultiDrawElementsIndirectCount(
+                            request.Call.PrimitiveType,
+                            request.Call.IndexType,
+                            agg.IndirectDrawByteOffset,
+                            agg.CompactionIndex * sizeof(uint), // drawcount buffer offset
+                            agg.IndirectDrawCount, // maxdrawcount
+                            0); // stride
+                        return;
+                    }
+
+                    GL.MultiDrawElementsIndirect(request.Call.PrimitiveType, request.Call.IndexType, agg.IndirectDrawByteOffset, agg.IndirectDrawCount, 0);
+                    return;
+                }
+            }
+
+            if (request.Node is SceneClutter clutter)
+            {
+                PerfStats.Active.CountDrawCall(request.Node);
+                clutter.Scene.ClutterCuller?.Draw(clutter, request.Call);
+                return;
+            }
+
+            var instanceCount = 1;
+
+            if (request.Node is SceneAggregate { InstanceTransforms.Count: > 0 } aggregate)
+            {
+                instanceCount = aggregate.InstanceTransforms.Count;
+            }
+
+            PerfStats.Active.CountDrawCall(request.Node);
+
+            GL.DrawElementsInstancedBaseVertexBaseInstance(
+                request.Call.PrimitiveType,
+                request.Call.IndexCount,
+                request.Call.IndexType,
+                request.Call.StartIndex,
+                instanceCount,
+                request.Call.BaseVertex,
+                request.Node is MeshCollectionNode ? request.Call.InstanceBufferIndex : request.Node.Id
+            );
+        }
+    }
+}

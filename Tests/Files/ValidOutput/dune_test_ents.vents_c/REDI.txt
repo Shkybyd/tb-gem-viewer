@@ -1,0 +1,52 @@
+"ResourceEditInfo"
+{
+	"InputDependencies"
+	{
+	}
+	"AdditionalInputDependencies"
+	{
+		"0"
+		{
+			"ContentRelativeFilename"	"maps/dune_test/entities/default_ents.vents"
+			"ContentSearchPath"	"dota_addons/dungeon"
+			"FileCRC"	"1749338821"
+			"Optional"	"0"
+			"FileExists"	"1"
+			"IsGameFile"	"0"
+		}
+	}
+	"ArgumentDependencies"
+	{
+		"0"
+		{
+			"ParameterName"	"___OverrideInputData___"
+			"ParameterType"	"BinaryBlobArg"
+			"Fingerprint"	"0"
+			"FingerprintDefault"	"0"
+		}
+	}
+	"SpecialDependencies"
+	{
+		"0"
+		{
+			"String"	"Entity Lump Compiler Version"
+			"CompilerIdentifier"	"CompileEntityLump"
+			"Fingerprint"	"3"
+			"UserData"	"0"
+		}
+	}
+	"AdditionalRelatedFiles"
+	{
+	}
+	"ChildResourceList"
+	{
+	}
+	"SearchableUserData"
+	{
+		"0"
+		{
+			"Key"	"IsChildResource"
+			"Value"	"1"
+		}
+	}
+}

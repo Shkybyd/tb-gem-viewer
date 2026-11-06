@@ -1,0 +1,457 @@
+using System.Buffers.Binary;
+using System.Linq;
+using System.Numerics.Tensors;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using SkiaSharp;
+
+namespace ValveResourceFormat.TextureDecoders
+{
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct Color
+    {
+        public byte b;
+        public byte g;
+        public byte r;
+        public byte a;
+
+        /*public static implicit operator Color(Span<byte> data)
+        {
+            return new Color { b = data[0], g = data[1], r = data[2], a = data[3] };
+        }*/
+    }
+
+    /// <summary>
+    /// Texture codec flags for decoding and color space conversions.
+    /// </summary>
+    [Flags]
+    public enum TextureCodec
+    {
+        /// <summary>
+        /// No codec flags.
+        /// </summary>
+        None = 0,
+
+        /// <summary>
+        /// Co, Cg, Scale, and Y stored in RGBA respectively.
+        /// </summary>
+        YCoCg = 1 << 0,
+
+        /// <summary>
+        /// HDR content stored in 8 bit by multiplying colors with alpha
+        /// and another constant (typically 16)
+        /// </summary>
+        RGBM = 1 << 1, // todo
+
+        /// <summary>
+        /// Hemi Octahedron surface normal data in RG. Widens to RGB.
+        /// </summary>
+        HemiOctNormal = 1 << 2,
+
+        /// <summary>
+        /// Reconstruct normal Z from X and Y.
+        /// </summary>
+        NormalizeNormals = 1 << 3,
+
+        /// <summary>
+        ///  Swizzle red with alpha (exploiting higher bitcount alpha in dxt5)
+        /// </summary>
+        Dxt5nm = 1 << 4,
+
+        /// <summary>
+        /// Indicates the texture data is stored in linear color space.
+        /// </summary>
+        ColorSpaceLinear = 1 << 5,
+
+        /// <summary>
+        /// Indicates the texture data is stored in sRGB gamma space.
+        /// </summary>
+        ColorSpaceSrgb = 1 << 6,
+
+        /// <summary>
+        /// Force decode HDR content to LDR.
+        /// </summary>
+        ForceLDR = 1 << 7,
+
+        /// <summary>
+        /// Move blue to alpha, before other conversions overwrite blue.
+        /// </summary>
+        BlueToAlpha = 1 << 8,
+
+        /// <summary>
+        /// Hemi Octahedron surface normal data in RG and roughness in B, moved to alpha.
+        /// </summary>
+        HemiOctRB = HemiOctNormal | BlueToAlpha,
+
+        /// <summary>
+        /// Determine codec flags from the texture's edit info. Other flags set alongside it are added on top.
+        /// </summary>
+        Auto = 1 << 30,
+    }
+
+    internal class Common
+    {
+        public static void ApplyTextureConversions(SKBitmap bitmap, TextureCodec decodeFlags)
+        {
+            var swapRA = decodeFlags.HasFlag(TextureCodec.Dxt5nm);
+            var decodeYCoCg = decodeFlags.HasFlag(TextureCodec.YCoCg);
+            var linearizeYCoCg = decodeYCoCg && decodeFlags.HasFlag(TextureCodec.ColorSpaceSrgb);
+            var blueToAlpha = decodeFlags.HasFlag(TextureCodec.BlueToAlpha);
+            var decodeHemiOct = decodeFlags.HasFlag(TextureCodec.HemiOctNormal);
+            var reconstructZ = decodeFlags.HasFlag(TextureCodec.NormalizeNormals);
+
+            if (!swapRA && !decodeYCoCg && !blueToAlpha && !decodeHemiOct && !reconstructZ)
+            {
+                return;
+            }
+
+            var data = bitmap.GetPixelSpan();
+
+            if (swapRA)
+            {
+                SwapRA(data);
+            }
+
+            var pixels = MemoryMarshal.Cast<byte, Color>(data);
+
+            // Conversions are independent per pixel, so they run as separate passes
+            if (decodeYCoCg)
+            {
+                Decode_YCoCg(pixels, linearizeYCoCg);
+            }
+
+            if (blueToAlpha)
+            {
+                CopyBlueToAlpha(MemoryMarshal.Cast<byte, uint>(data));
+            }
+
+            if (decodeHemiOct)
+            {
+                Decode_HemiOct(pixels);
+            }
+
+            if (reconstructZ)
+            {
+                ReconstructNormals(pixels);
+            }
+        }
+
+        /// <summary>
+        /// Reconstructs normalized RGB from the YCoCg encoding (Co, Cg, scale, Y in X, Y, Z, W). Pure
+        /// matrix with no color space handling; the caller linearizes the inputs. Mirrors DecodeYCoCg in utils.slang.
+        /// </summary>
+        public static Vector3 Decode_YCoCg(Vector4 color)
+        {
+            var scale = (color.Z * (255f / 8f)) + 1f;
+            var co = (color.X - (128f / 255f)) / scale;
+            var cg = (color.Y - (128f / 255f)) / scale;
+
+            var y = color.W;
+
+            return new Vector3(y + co - cg, y + cg, y - co - cg);
+        }
+
+        private static void Decode_YCoCg(Span<Color> pixels, bool linearize)
+        {
+            for (var i = 0; i < pixels.Length; i++)
+            {
+                ref var pixel = ref pixels[i];
+
+                var input = new Vector3(pixel.r, pixel.g, pixel.b) / 255f;
+
+                if (linearize)
+                {
+                    input = ColorSpace.SrgbGammaToLinear(input);
+                }
+
+                var rgb = Decode_YCoCg(new Vector4(input, pixel.a / 255f));
+
+                pixel.r = ToClampedLdrColor(rgb.X);
+                pixel.g = ToClampedLdrColor(rgb.Y);
+                pixel.b = ToClampedLdrColor(rgb.Z);
+                pixel.a = 255;
+            }
+        }
+
+        private const int ConversionChunkSize = 512;
+
+        public static void ReconstructNormals(ref Color color)
+        {
+            ReconstructNormals(new Span<Color>(ref color));
+        }
+
+        private static void ReconstructNormals(Span<Color> pixels)
+        {
+            Span<float> xBuffer = stackalloc float[ConversionChunkSize];
+            Span<float> yBuffer = stackalloc float[ConversionChunkSize];
+            Span<byte> unormBuffer = stackalloc byte[ConversionChunkSize];
+
+            for (var offset = 0; offset < pixels.Length; offset += ConversionChunkSize)
+            {
+                var chunk = pixels.Slice(offset, Math.Min(ConversionChunkSize, pixels.Length - offset));
+                var x = xBuffer[..chunk.Length];
+                var y = yBuffer[..chunk.Length];
+                var unorm = unormBuffer[..chunk.Length];
+
+                for (var i = 0; i < chunk.Length; i++)
+                {
+                    x[i] = chunk[i].r;
+                    y[i] = chunk[i].g;
+                }
+
+                UnormToSigned(x);
+                UnormToSigned(y);
+
+                // Byte rounding can push X and Y just outside the unit circle
+                TensorPrimitives.Multiply(x, x, x);
+                TensorPrimitives.Multiply(y, y, y);
+                TensorPrimitives.Subtract(1f, x, x);
+                TensorPrimitives.Subtract(x, y, x);
+                TensorPrimitives.Max(x, 0f, x);
+                TensorPrimitives.Sqrt(x, x);
+
+                SignedToUnorm(x, unorm);
+
+                for (var i = 0; i < chunk.Length; i++)
+                {
+                    chunk[i].b = unorm[i];
+                }
+            }
+        }
+
+        private static void Decode_HemiOct(Span<Color> pixels)
+        {
+            Span<float> xBuffer = stackalloc float[ConversionChunkSize];
+            Span<float> yBuffer = stackalloc float[ConversionChunkSize];
+            Span<float> zBuffer = stackalloc float[ConversionChunkSize];
+            Span<float> lengthBuffer = stackalloc float[ConversionChunkSize];
+            Span<float> scratchBuffer = stackalloc float[ConversionChunkSize];
+            Span<byte> unormBuffer = stackalloc byte[ConversionChunkSize];
+
+            for (var offset = 0; offset < pixels.Length; offset += ConversionChunkSize)
+            {
+                var chunk = pixels.Slice(offset, Math.Min(ConversionChunkSize, pixels.Length - offset));
+                var x = xBuffer[..chunk.Length];
+                var y = yBuffer[..chunk.Length];
+                var z = zBuffer[..chunk.Length];
+                var length = lengthBuffer[..chunk.Length];
+                var scratch = scratchBuffer[..chunk.Length];
+                var unorm = unormBuffer[..chunk.Length];
+
+                for (var i = 0; i < chunk.Length; i++)
+                {
+                    x[i] = chunk[i].r + chunk[i].g;
+                    y[i] = chunk[i].r - chunk[i].g;
+                }
+
+                TensorPrimitives.Divide(x, 255f, x);
+                TensorPrimitives.Subtract(x, 1.003922f, x);
+                TensorPrimitives.Divide(y, 255f, y);
+
+                TensorPrimitives.Abs(x, scratch);
+                TensorPrimitives.Subtract(1f, scratch, z);
+                TensorPrimitives.Abs(y, scratch);
+                TensorPrimitives.Subtract(z, scratch, z);
+
+                TensorPrimitives.Multiply(x, x, length);
+                TensorPrimitives.Multiply(y, y, scratch);
+                TensorPrimitives.Add(length, scratch, length);
+                TensorPrimitives.Multiply(z, z, scratch);
+                TensorPrimitives.Add(length, scratch, length);
+                TensorPrimitives.Sqrt(length, length);
+
+                TensorPrimitives.Divide(x, length, x);
+                SignedToUnorm(x, unorm);
+
+                for (var i = 0; i < chunk.Length; i++)
+                {
+                    chunk[i].r = unorm[i];
+                }
+
+                TensorPrimitives.Divide(y, length, y);
+                SignedToUnorm(y, unorm);
+
+                for (var i = 0; i < chunk.Length; i++)
+                {
+                    chunk[i].g = unorm[i];
+                }
+
+                TensorPrimitives.Divide(z, length, z);
+                SignedToUnorm(z, unorm);
+
+                for (var i = 0; i < chunk.Length; i++)
+                {
+                    chunk[i].b = unorm[i];
+                }
+            }
+        }
+
+        /// <summary>
+        /// Maps [0, 255] to [-1, 1] in place.
+        /// </summary>
+        private static void UnormToSigned(Span<float> values)
+        {
+            TensorPrimitives.Divide(values, 255f, values);
+            TensorPrimitives.Multiply(values, 2f, values);
+            TensorPrimitives.Subtract(values, 1f, values);
+        }
+
+        /// <summary>
+        /// Maps [-1, 1] to a byte, overwriting <paramref name="values"/>.
+        /// </summary>
+        private static void SignedToUnorm(Span<float> values, Span<byte> destination)
+        {
+            TensorPrimitives.Multiply(values, 0.5f, values);
+            TensorPrimitives.Add(values, 0.5f, values);
+            TensorPrimitives.ConvertToClampedUnorm8(values, destination);
+        }
+
+        /// <remarks>
+        /// Components are expected in BGRA order.
+        /// </remarks>
+        private static void CopyBlueToAlpha(Span<uint> pixels)
+        {
+            Span<uint> alphaBuffer = stackalloc uint[ConversionChunkSize];
+
+            for (var offset = 0; offset < pixels.Length; offset += ConversionChunkSize)
+            {
+                var chunk = pixels.Slice(offset, Math.Min(ConversionChunkSize, pixels.Length - offset));
+                var alpha = alphaBuffer[..chunk.Length];
+
+                TensorPrimitives.ShiftLeft(chunk, 24, alpha);
+                TensorPrimitives.BitwiseAnd(chunk, 0x00FFFFFFu, chunk);
+                TensorPrimitives.BitwiseOr(chunk, alpha, chunk);
+            }
+        }
+
+        public static byte ClampColor(int a)
+        {
+            return (byte)Math.Clamp(a, 0, 255);
+        }
+
+        public static float ClampHighRangeColor(float a)
+        {
+            return MathUtils.Saturate(a);
+        }
+
+        public static byte ToClampedLdrColor(float a)
+        {
+            return (byte)(ClampHighRangeColor(a) * 255 + 0.5f);
+        }
+
+        /// <summary>
+        /// Same as <see cref="ToClampedLdrColor(float)"/> for every element.
+        /// </summary>
+        public static void ToClampedLdrColor(ReadOnlySpan<Half> source, Span<byte> destination)
+        {
+            const int ChunkSize = 1024;
+            Span<float> values = stackalloc float[ChunkSize];
+
+            for (var offset = 0; offset < destination.Length; offset += ChunkSize)
+            {
+                var count = Math.Min(ChunkSize, destination.Length - offset);
+                var sourceChunk = source.Slice(offset, count);
+                var valuesChunk = values[..count];
+                var destinationChunk = destination.Slice(offset, count);
+
+                TensorPrimitives.ConvertToSingle(sourceChunk, valuesChunk);
+                TensorPrimitives.ConvertToClampedUnorm8(valuesChunk, destinationChunk);
+            }
+        }
+
+        private static byte[] CreateSimdSwizzleMask(int[] swizzle) =>
+        [
+            ..Enumerable.Range(0, 64).Select(component =>
+             {
+                 var pixel = component / 4;
+                 var pixelComponent = component % 4;
+                 return (byte)(pixel * 4 + swizzle[pixelComponent]);
+             })
+        ];
+
+        private static readonly byte[] SwapRBSwizzleMask_RGBA = CreateSimdSwizzleMask([2, 1, 0, 3]);
+        private static readonly byte[] SwapRASwizzleMask_BGRA = CreateSimdSwizzleMask([0, 1, 3, 2]);
+
+        /// <remarks>
+        /// Components are expected in RGBA order. This changes it to BGRA.
+        /// </remarks>
+        public static void SwapRB(Span<byte> pixels)
+        {
+            var offset = SwizzleSimd(pixels, SwapRBSwizzleMask_RGBA);
+
+            // Process remaining pixels with scalar code
+            var pixelsInt = MemoryMarshal.Cast<byte, uint>(pixels[offset..]);
+            for (var j = 0; j < pixelsInt.Length; j++)
+            {
+                pixelsInt[j] = BitOperations.RotateRight(BinaryPrimitives.ReverseEndianness(pixelsInt[j]), 8);
+            }
+        }
+
+        /// <remarks>
+        /// Components are expected in BGRA order.
+        /// </remarks>
+        public static void SwapRA(Span<byte> pixels)
+        {
+            var offset = SwizzleSimd(pixels, SwapRASwizzleMask_BGRA);
+
+            // Process remaining pixels with scalar code
+            var pixelsInt = MemoryMarshal.Cast<byte, uint>(pixels[offset..]);
+            for (var j = 0; j < pixelsInt.Length; j++)
+            {
+                var p = pixelsInt[j];
+
+                var bg = p & 0x0000FFFF;
+                var r = (p & 0x00FF0000) << 8;
+                var a = (p & 0xFF000000) >> 8;
+
+                pixelsInt[j] = bg | r | a;
+            }
+        }
+
+        private static int SwizzleSimd(Span<byte> pixels, byte[] swizzleMask)
+        {
+            var offset = 0;
+
+            // Process 64-byte chunks
+            if (Vector512.IsHardwareAccelerated && pixels.Length >= Vector512<byte>.Count)
+            {
+                var shuffleMask = Vector512.Create(swizzleMask);
+
+                for (; offset <= pixels.Length - Vector512<byte>.Count; offset += Vector512<byte>.Count)
+                {
+                    var rgba = Vector512.Create<byte>(pixels.Slice(offset, Vector512<byte>.Count));
+                    var bgra = Vector512.Shuffle(rgba, shuffleMask);
+                    bgra.CopyTo(pixels.Slice(offset, Vector512<byte>.Count));
+                }
+            }
+
+            // Process 32-byte chunks
+            if (Vector256.IsHardwareAccelerated && pixels.Length - offset >= Vector256<byte>.Count)
+            {
+                var shuffleMask = Vector256.Create(swizzleMask);
+
+                for (; offset <= pixels.Length - Vector256<byte>.Count; offset += Vector256<byte>.Count)
+                {
+                    var rgba = Vector256.Create<byte>(pixels.Slice(offset, Vector256<byte>.Count));
+                    var bgra = Vector256.Shuffle(rgba, shuffleMask);
+                    bgra.CopyTo(pixels.Slice(offset, Vector256<byte>.Count));
+                }
+            }
+
+            // Process 16-byte chunks
+            if (Vector128.IsHardwareAccelerated && pixels.Length - offset >= Vector128<byte>.Count)
+            {
+                var shuffleMask = Vector128.Create(swizzleMask);
+
+                for (; offset <= pixels.Length - Vector128<byte>.Count; offset += Vector128<byte>.Count)
+                {
+                    var rgba = Vector128.Create<byte>(pixels.Slice(offset, Vector128<byte>.Count));
+                    var bgra = Vector128.Shuffle(rgba, shuffleMask);
+                    bgra.CopyTo(pixels.Slice(offset, Vector128<byte>.Count));
+                }
+            }
+
+            return offset;
+        }
+    }
+}

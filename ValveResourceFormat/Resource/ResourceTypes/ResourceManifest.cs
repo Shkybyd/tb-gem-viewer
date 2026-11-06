@@ -1,0 +1,128 @@
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using ValveKeyValue;
+using ValveResourceFormat.Serialization.KeyValues;
+
+namespace ValveResourceFormat.ResourceTypes
+{
+    /// <summary>
+    /// Represents a resource manifest.
+    /// </summary>
+    public class ResourceManifest : Block
+    {
+        /// <inheritdoc/>
+        public override BlockType Type => BlockType.DATA;
+
+        /// <summary>
+        /// Gets the list of resources in the manifest.
+        /// </summary>
+        public List<List<string>> Resources { get; private set; } = [];
+
+        /// <inheritdoc/>
+        public override void Read(BinaryReader reader)
+        {
+            reader.BaseStream.Position = Offset;
+
+            Debug.Assert(Resource != null);
+
+            if (Resource.ContainsBlockType(BlockType.NTRO))
+            {
+                var ntro = new NTRO
+                {
+                    StructName = "ResourceManifest_t",
+                    Offset = Offset,
+                    Size = Size,
+                    Resource = Resource,
+                };
+                ntro.Read(reader);
+
+                Resources =
+                [
+                    new(ntro.Output.GetArray<string>("m_ResourceFileNameList")!),
+                ];
+
+                return;
+            }
+
+            if (Size < 8)
+            {
+                throw new UnexpectedMagicException("Unknown size", Size, nameof(Size));
+            }
+
+            var blocksOffset = reader.ReadInt32();
+            var blockCount = reader.ReadInt32();
+
+            reader.BaseStream.Position = Offset + blocksOffset;
+
+            for (var block = 0; block < blockCount; block++)
+            {
+                var originalOffset = reader.BaseStream.Position;
+                var offset = reader.ReadInt32();
+                var count = reader.ReadInt32();
+                var strings = new List<string>(count);
+
+                reader.BaseStream.Position = originalOffset + offset;
+
+                for (var i = 0; i < count; i++)
+                {
+                    strings.Add(reader.ReadOffsetString(Encoding.UTF8));
+                }
+
+                reader.BaseStream.Position = originalOffset + 8;
+
+                Resources.Add(strings);
+            }
+        }
+
+        /// <inheritdoc/>
+        public override void Serialize(Stream stream)
+        {
+            throw new NotImplementedException("Serializing this block is not yet supported. If you need this, send us a pull request!");
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Outputs the resource manifest as a KV3 object.
+        /// </remarks>
+        public override void WriteText(IndentedTextWriter writer)
+        {
+            GetPrintabaleObject().WriteKV3Text(writer);
+        }
+
+        private KVDocument GetPrintabaleObject()
+        {
+            var root = new KVObject();
+
+            if (Resources.Count == 0)
+            {
+                root.Add("resourceManifest", KVObject.Array());
+                return root.ToKV3Document();
+            }
+            if (Resources.Count == 1)
+            {
+                var arr = KVObject.Array();
+                foreach (var file in Resources[0])
+                {
+                    arr.Add(file);
+                }
+                root.Add("resourceManifest", arr);
+            }
+            else
+            {
+                var outerArray = KVObject.Array();
+                foreach (var resourceList in Resources)
+                {
+                    var innerArray = KVObject.Array();
+                    foreach (var file in resourceList)
+                    {
+                        innerArray.Add(file);
+                    }
+                    outerArray.Add(innerArray);
+                }
+                root.Add("resourceManifest", outerArray);
+            }
+            return root.ToKV3Document();
+        }
+    }
+}

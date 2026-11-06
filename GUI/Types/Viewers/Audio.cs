@@ -1,0 +1,63 @@
+using System.Diagnostics;
+using System.IO;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using GUI.Controls;
+using GUI.Types.Audio;
+using GUI.Utils;
+using NAudio.Wave;
+using NLayer.NAudioSupport;
+
+namespace GUI.Types.Viewers
+{
+    class Audio(VrfGuiContext vrfGuiContext, bool isPreview) : IViewer, IDisposable
+    {
+        private WaveStream? waveStream;
+
+        public static bool IsAccepted(uint magic, string fileName)
+        {
+            return (magic == 0x46464952 /* RIFF */ && fileName.EndsWith(".wav", StringComparison.InvariantCultureIgnoreCase)) ||
+                    fileName.EndsWith(".mp3", StringComparison.InvariantCultureIgnoreCase);
+        }
+
+        public async Task LoadAsync(Stream? stream)
+        {
+            if (stream == null)
+            {
+                // The readers do not take ownership of a stream, so the file is read into memory instead of being held open while it plays
+                using var fileStream = File.Open(vrfGuiContext.FileName!, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var data = new byte[fileStream.Length];
+                await fileStream.ReadExactlyAsync(data).ConfigureAwait(false);
+                stream = new MemoryStream(data, writable: false);
+            }
+
+            if (vrfGuiContext.FileName!.EndsWith(".mp3", StringComparison.InvariantCultureIgnoreCase))
+            {
+                waveStream = new Mp3FileReaderBase(stream, wf => new Mp3FrameDecompressor(wf));
+            }
+            else
+            {
+                waveStream = AudioPlayer.CreateWavStream(new WaveFileReader(stream));
+            }
+        }
+
+        public void Create(TabPage tab)
+        {
+            Debug.Assert(waveStream is not null);
+
+            var autoPlay = ((Settings.QuickPreviewFlags)Settings.Config.QuickFilePreview & Settings.QuickPreviewFlags.AutoPlaySounds) != 0;
+            var audio = new AudioPlaybackPanel(waveStream, vrfGuiContext.DisplayPath, isPreview && autoPlay, (0, 0));
+            tab.Controls.Add(audio);
+
+            waveStream = null;
+
+            return;
+        }
+
+        public void Dispose()
+        {
+            waveStream?.Dispose();
+            waveStream = null;
+        }
+    }
+}

@@ -1,0 +1,89 @@
+using ValveResourceFormat.ResourceTypes.ModelData;
+
+namespace ValveResourceFormat.Renderer.SceneNodes
+{
+    /// <summary>
+    /// Decides which LoD level of a model is drawn: the level forced by the viewer, or the one the
+    /// model's own switch values pick for a screen-size metric.
+    /// </summary>
+    internal sealed class ModelLodSelector
+    {
+        private readonly ModelLodInfo lodInfo;
+        private readonly bool hasSwitchableLevels;
+        private int? overrideLevel;
+
+        /// <summary>The LoD level currently being rendered, auto-selected or forced.</summary>
+        public int ActiveLevel { get; private set; }
+
+        /// <summary>Whether the level is chosen automatically by distance rather than forced.</summary>
+        public bool IsAuto => overrideLevel == null;
+
+        /// <summary>Whether switching level changes what is drawn at all.</summary>
+        public bool HasDistinctLevels => lodInfo.HasDistinctLevels;
+
+        /// <summary>Whether <see cref="Update"/> picks the level, so the metric is worth computing.</summary>
+        public bool SelectsByMetric => overrideLevel == null && hasSwitchableLevels;
+
+        /// <summary>The levels the model populates.</summary>
+        public IReadOnlyList<int> AvailableLevels => lodInfo.AvailableLevels;
+
+        /// <summary>
+        /// Starts at the model's lowest populated level.
+        /// </summary>
+        public ModelLodSelector(ModelLodInfo lodInfo)
+        {
+            this.lodInfo = lodInfo;
+            hasSwitchableLevels = lodInfo.AvailableLevels.Count > 1 && lodInfo.SwitchDistances.Count > 1;
+            ActiveLevel = lodInfo.LowestLevel;
+        }
+
+        /// <summary>
+        /// Forces a level, clamped to the model's populated range, or returns to automatic selection
+        /// when <paramref name="level"/> is <see langword="null"/>.
+        /// </summary>
+        /// <returns>Whether the active level changed.</returns>
+        public bool SetOverride(int? level)
+        {
+            if (level.HasValue)
+            {
+                var highestLevel = lodInfo.AvailableLevels.Count > 0 ? lodInfo.AvailableLevels[^1] : lodInfo.LowestLevel;
+                level = Math.Clamp(level.Value, lodInfo.LowestLevel, highestLevel);
+            }
+
+            overrideLevel = level;
+
+            var target = level ?? lodInfo.LowestLevel;
+
+            return Select(target);
+        }
+
+        /// <summary>
+        /// In automatic mode, picks the level for a screen-size metric: the model drops to level
+        /// <c>n</c> once the metric passes that level's switch value.
+        /// </summary>
+        /// <returns>Whether the active level changed.</returns>
+        public bool Update(float metric)
+        {
+            if (!SelectsByMetric)
+            {
+                return false;
+            }
+
+            return Select(lodInfo.SelectLevel(metric));
+        }
+
+        /// <summary>Whether the mesh at <paramref name="meshIndex"/> is drawn at the active level.</summary>
+        public bool Contains(int meshIndex) => lodInfo.IsMeshInLevel(meshIndex, ActiveLevel);
+
+        private bool Select(int level)
+        {
+            if (level == ActiveLevel)
+            {
+                return false;
+            }
+
+            ActiveLevel = level;
+            return true;
+        }
+    }
+}

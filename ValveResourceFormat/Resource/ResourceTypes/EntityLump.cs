@@ -1,0 +1,784 @@
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using ValveKeyValue;
+using ValveResourceFormat.Serialization.KeyValues;
+
+namespace ValveResourceFormat.ResourceTypes
+{
+    /// <summary>
+    /// Represents an entity lump resource containing entity definitions and their properties.
+    /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/worldrenderer/PermEntityLumpData_t">PermEntityLumpData_t</seealso>
+    public class EntityLump : KeyValuesOrNTRO
+    {
+        /// <summary>
+        /// Represents a single entity with its properties and connections.
+        /// </summary>
+        public class Entity : KVObject
+        {
+            /// <summary>
+            /// Gets the entity connections (outputs that fire inputs on other entities, part of the entity I/O system).
+            /// </summary>
+            public List<Connection>? Connections { get; internal set; }
+            /// <summary>
+            /// Gets the parent entity lump that contains this entity.
+            /// </summary>
+            public required EntityLump ParentLump { get; init; }
+
+            /// <summary>
+            /// Gets the target name of the entity.
+            /// </summary>
+            public string? TargetName => this.GetStringProperty("targetname");
+            /// <summary>
+            /// Gets the target name of the entity with its name fixup markers removed, as the map spawns it.
+            /// </summary>
+            public string? FriendlyTargetName => TargetName is { } targetName ? ApplyNameFixup(targetName, string.Empty, string.Empty) : null;
+
+            /// <summary>
+            /// Gets a Vector2 property value by name.
+            /// </summary>
+            /// <param name="name">The property name.</param>
+            /// <param name="defaultValue">The default value to return if the property is not found.</param>
+            /// <returns>The Vector2 property value or the default value.</returns>
+            public Vector2 GetVector2Property(string name, Vector2 defaultValue = default)
+            {
+                if (!TryGetValue(name, out var value))
+                {
+                    return defaultValue;
+                }
+
+                if (value != null && value.ValueType != KVValueType.Null)
+                {
+                    if (value.ValueType is KVValueType.Collection or KVValueType.Array)
+                    {
+                        return value.ToVector2();
+                    }
+
+                    if (value.ValueType == KVValueType.String)
+                    {
+                        return EntityTransformHelper.TryParseVector2((string)value, out var parsed) ? parsed : defaultValue;
+                    }
+                }
+
+                return defaultValue;
+            }
+
+            /// <summary>
+            /// Gets a Vector3 property value by name.
+            /// </summary>
+            /// <param name="name">The property name.</param>
+            /// <param name="defaultValue">The default value to return if the property is not found.</param>
+            /// <returns>The Vector3 property value or the default value.</returns>
+            public Vector3 GetVector3Property(string name, Vector3 defaultValue = default)
+            {
+                if (!TryGetValue(name, out var value))
+                {
+                    return defaultValue;
+                }
+
+                if (value != null && value.ValueType != KVValueType.Null)
+                {
+                    if (value.ValueType is KVValueType.Collection or KVValueType.Array)
+                    {
+                        return value.ToVector3();
+                    }
+
+                    if (value.ValueType == KVValueType.String)
+                    {
+                        return EntityTransformHelper.TryParseVector3((string)value, out var parsed) ? parsed : defaultValue;
+                    }
+                }
+
+                return defaultValue;
+            }
+
+            /// <summary>
+            /// Gets a Color32 property value as a normalized Vector3 (0-1 range).
+            /// </summary>
+            /// <param name="key">The property name.</param>
+            /// <returns>The normalized color vector (0-1 range).</returns>
+            public Vector3 GetColor32Property(string key)
+            {
+                var defaultColor = new Vector3(255f);
+                return GetVector3Property(key, defaultColor) / 255f;
+            }
+
+            /// <summary>
+            /// Gets the alpha of a Color32 property, normalized to 0-1.
+            /// </summary>
+            /// <param name="key">The property name.</param>
+            /// <returns>The alpha, or 1 if the property has no alpha component.</returns>
+            public float GetColor32Alpha(string key)
+            {
+                var components = this.GetArray<float>(key);
+
+                if (components == null || components.Length < 4)
+                {
+                    return 1f;
+                }
+
+                return components[3] / 255f;
+            }
+
+            /// <summary>
+            /// Gets the render tint as a colour plus alpha, from <c>rendercolor</c> and <c>renderamt</c>.
+            /// </summary>
+            /// <returns>The tint, with each channel normalized to 0-1.</returns>
+            public Vector4 GetRenderTint()
+            {
+                // todo: rendercolor might sometimes be vec4, which holds renderamt
+                var color = GetColor32Property("rendercolor");
+                var amount = this.GetFloatProperty("renderamt", 1.0f);
+
+                if (amount > 1f)
+                {
+                    amount /= 255f;
+                }
+
+                return new Vector4(color, amount);
+            }
+
+            /// <summary>
+            /// Finds all connections in the parent lump that target this entity by its targetname.
+            /// </summary>
+            /// <param name="entities">List of world entities to look for connections for, defaults to the current lump.</param>
+            /// <returns>A list of input connections targeting this entity.</returns>
+            public List<Connection> GetInputConnections(List<Entity>? entities)
+            {
+                if (string.IsNullOrEmpty(TargetName))
+                {
+                    return [];
+                }
+
+                var inputConnections = new List<Connection>();
+
+                foreach (var sourceEntity in entities ?? ParentLump.GetEntities())
+                {
+                    if (sourceEntity.Connections == null)
+                    {
+                        continue;
+                    }
+
+                    inputConnections.AddRange(sourceEntity.Connections.Where(connection => EntityNameMatches(connection.TargetName, TargetName)));
+                }
+
+                return inputConnections;
+            }
+        }
+
+        /// <summary>
+        /// Represents a IO connection.
+        /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/worldrenderer/EntityIOConnectionData_t">EntityIOConnectionData_t</seealso>
+        public class Connection
+        {
+            /// <summary>
+            /// Gets the entity that fires this connection (the source of the output).
+            /// </summary>
+            public required Entity SourceEntity { get; init; }
+            /// <summary>
+            /// Gets the name of the output that fires this connection (m_outputName).
+            /// </summary>
+            public required string OutputName { get; init; }
+            /// <summary>
+            /// Gets the name of the input that is fired on the target entity (m_inputName).
+            /// </summary>
+            public required string InputName { get; init; }
+            /// <summary>
+            /// Gets the name of the target entity (m_targetName).
+            /// </summary>
+            public required string TargetName { get; init; }
+            /// <summary>
+            /// Gets the parameter override passed with the input (m_overrideParam).
+            /// </summary>
+            public required string OverrideParam { get; init; }
+            /// <summary>
+            /// Gets the delay in seconds before the input is fired (m_flDelay).
+            /// </summary>
+            public required float Delay { get; init; }
+            /// <summary>
+            /// Gets the number of times this connection may fire, or -1 for infinite (m_nTimesToFire).
+            /// </summary>
+            public required int TimesToFire { get; init; }
+            /// <summary>
+            /// Gets the connection target type (m_targetType).
+            /// </summary>
+            public required EntityIOTargetType TargetType { get; init; }
+            /// <summary>
+            /// Gets the input parameter mapping (m_paramMap), or null when the connection has none. An empty table maps nothing.
+            /// </summary>
+            /// <remarks>
+            /// Keyed by the input's parameter name, each entry is either <c>{ value = literal }</c> or
+            /// <c>{ src = "output param name" }</c>. A <c>--forward-all-args--</c> boolean forwards output
+            /// params to input params of the same name.
+            /// </remarks>
+            public KVObject? ParamMap { get; init; }
+        }
+
+        /// <summary>
+        /// Gets the name of this entity lump.
+        /// </summary>
+        public string Name => Data.GetStringProperty("m_name");
+
+        /// <summary>
+        /// Gets the names of child entity lumps.
+        /// </summary>
+        /// <returns>An array of child entity lump names.</returns>
+        public string[] GetChildEntityNames()
+        {
+            return Data.GetArray<string>("m_childLumps")!;
+        }
+
+        /// <summary>
+        /// Gets all entities contained in this entity lump.
+        /// </summary>
+        /// <returns>A list of entities.</returns>
+        public List<Entity> GetEntities()
+            => Data.GetArray("m_entityKeyValues")
+                .Select(ParseEntityProperties)
+                .OfType<Entity>()
+                .ToList();
+
+        private Entity? ParseEntityProperties(KVObject entityKv)
+        {
+            var connections = entityKv.GetArray("m_connections");
+            Entity entity;
+
+            if (entityKv.ContainsKey("keyValues3Data"))
+            {
+                entity = ParseEntityPropertiesKV3(entityKv.GetSubCollection("keyValues3Data"));
+            }
+            else
+            {
+                entity = ParseEntityProperties(entityKv.GetArray<byte>("m_keyValuesData")!);
+            }
+
+            // are there any kinds of valid entities which don't contain a classname?
+            if (!entity.ContainsKey("classname"))
+            {
+                return null;
+            }
+
+            if (connections.Count > 0)
+            {
+                var entityConnections = new List<Connection>(connections.Count);
+
+                foreach (var connection in connections)
+                {
+                    entityConnections.Add(new Connection
+                    {
+                        SourceEntity = entity,
+                        TargetName = connection.GetStringProperty("m_targetName"),
+                        OutputName = connection.GetStringProperty("m_outputName"),
+                        InputName = connection.GetStringProperty("m_inputName"),
+                        OverrideParam = connection.GetStringProperty("m_overrideParam"),
+                        Delay = connection.GetFloatProperty("m_flDelay"),
+                        TimesToFire = connection.GetInt32Property("m_nTimesToFire"),
+                        TargetType = connection.GetEnumValue<EntityIOTargetType>("m_targetType"),
+                        ParamMap = connection.TryGetValue("m_paramMap", out var paramMap) && paramMap.ValueType == KVValueType.Collection
+                            ? paramMap
+                            : null,
+                    });
+                }
+
+                entity.Connections = entityConnections;
+            }
+
+            return entity;
+        }
+
+        private Entity ParseEntityPropertiesKV3(KVObject entityKv)
+        {
+            var entityVersion = entityKv.GetInt32Property("version");
+
+            if (entityVersion != 1)
+            {
+                throw new UnexpectedMagicException("Unsupported entity data version", entityVersion, nameof(entityVersion));
+            }
+
+            var entity = new Entity { ParentLump = this };
+
+            entityKv.TryGetValue("values", out var values);
+            // ignore CEntityKeyValues attributes
+            // entityKv.TryGetValue("attributes", out var attributes);
+
+            ReadValues(entity, values);
+            // ReadValues(entity, attributes);
+
+            return entity;
+        }
+
+        // TODO: Keep the original casing once entity property lookups are case-insensitive
+        private static string ToPropertyKey(string name) => name.ToLowerInvariant();
+
+        private static KVObject MakeColor32(byte[] bytes)
+            => KVObject.PackedArray(Array.ConvertAll(bytes, static b => (long)b));
+
+        private static void ReadValues(Entity entity, KVObject? values)
+        {
+            if (values == null || values.ValueType == KVValueType.Null)
+            {
+                return;
+            }
+
+            if (values.ValueType != KVValueType.Collection)
+            {
+                throw new UnexpectedMagicException("Unsupported entity data values type", (int)values.ValueType, nameof(values));
+            }
+
+            foreach (var child in values.Children)
+            {
+                StringToken.Store(child.Key);
+                entity.Add(ToPropertyKey(child.Key), child.Value);
+            }
+        }
+
+        private Entity ParseEntityProperties(byte[] bytes)
+        {
+            using var dataStream = new MemoryStream(bytes);
+            using var dataReader = new BinaryReader(dataStream);
+            var entityVersion = dataReader.ReadUInt32();
+
+            if (entityVersion != 1)
+            {
+                throw new UnexpectedMagicException("Unsupported entity data version", entityVersion, nameof(entityVersion));
+            }
+
+            var keyValuesFieldsCount = dataReader.ReadUInt32();
+            var attributesFieldsCount = dataReader.ReadUInt32();
+
+            var entity = new Entity { ParentLump = this };
+
+            void ReadTypedValue(uint keyHash, string? keyName)
+            {
+                var type = (EntityFieldType)dataReader.ReadUInt32();
+
+                KVObject entityProperty = type switch
+                {
+                    EntityFieldType.Boolean => dataReader.ReadBoolean(),
+                    EntityFieldType.Float => (double)dataReader.ReadSingle(),
+                    EntityFieldType.Float64 => dataReader.ReadDouble(),
+                    EntityFieldType.Color32 => MakeColor32(dataReader.ReadBytes(4)),
+                    EntityFieldType.Integer => (long)dataReader.ReadInt32(),
+                    EntityFieldType.UInt => (ulong)dataReader.ReadUInt32(),
+                    EntityFieldType.Integer64 => dataReader.ReadInt64(),
+                    EntityFieldType.UInt64 => dataReader.ReadUInt64(),
+                    EntityFieldType.Vector or EntityFieldType.QAngle => (KVObject)string.Create(CultureInfo.InvariantCulture, $"{dataReader.ReadSingle()} {dataReader.ReadSingle()} {dataReader.ReadSingle()}"),
+                    EntityFieldType.CString => dataReader.ReadNullTermString(Encoding.UTF8),
+                    _ => throw new UnexpectedMagicException("Unknown type", (int)type, nameof(type)),
+                };
+
+                // ignore CEntityKeyValues attributes
+                if (keyName == null)
+                {
+                    keyName = ToPropertyKey(StringToken.GetKnownString(keyHash));
+                    entity.Add(keyName, entityProperty);
+                }
+                else
+                {
+                    var calculatedHash = StringToken.Store(keyName);
+                    if (calculatedHash != keyHash)
+                    {
+                        throw new InvalidDataException(
+                            $"Key hash for {keyName} ({keyHash}) found in resource is not the same as the calculated {calculatedHash}."
+                        );
+                    }
+                }
+            }
+
+            for (var i = 0; i < keyValuesFieldsCount; i++)
+            {
+                // murmur2 hashed field name (see EntityLumpKeyLookup)
+                var keyHash = dataReader.ReadUInt32();
+
+                ReadTypedValue(keyHash, null);
+            }
+
+            // TODO: Is this attributes like in KV3 version, should we put them into separate property?
+            for (var i = 0; i < attributesFieldsCount; i++)
+            {
+                var keyHash = dataReader.ReadUInt32();
+                var keyName = dataReader.ReadNullTermString(Encoding.UTF8);
+
+                ReadTypedValue(keyHash, keyName);
+            }
+
+            return entity;
+        }
+
+        /// <summary>
+        /// Converts the entity lump to a human-readable string representation.
+        /// </summary>
+        /// <returns>A formatted string containing all entities and their properties.</returns>
+        public string ToEntityDumpString()
+        {
+            var builder = new StringBuilder();
+
+            using var valueStream = new MemoryStream();
+
+            var index = 0;
+            foreach (var entity in GetEntities())
+            {
+                builder.AppendLine(CultureInfo.InvariantCulture, $"===={index++}====");
+
+                foreach (var property in entity.Children)
+                {
+                    var value = StringifyValue(property.Value, valueStream);
+
+                    builder.AppendLine(CultureInfo.InvariantCulture, $"{property.Key,-30} {value}");
+                }
+
+                if (entity.Connections != null)
+                {
+                    foreach (var connection in entity.Connections)
+                    {
+                        builder.Append('@');
+                        builder.Append(connection.OutputName);
+                        builder.Append(' ');
+
+                        var delay = connection.Delay;
+
+                        if (delay > 0)
+                        {
+                            builder.Append(CultureInfo.InvariantCulture, $"Delay={delay} ");
+                        }
+
+                        var timesToFire = connection.TimesToFire;
+
+                        switch (timesToFire)
+                        {
+                            case 1:
+                                builder.Append("OnlyOnce ");
+                                break;
+                            case >= 2:
+                                builder.Append(CultureInfo.InvariantCulture, $"Only{timesToFire}Times ");
+                                break;
+                        }
+
+                        builder.Append(connection.InputName);
+                        builder.Append(' ');
+                        builder.Append(connection.TargetName);
+
+                        var param = connection.OverrideParam;
+
+                        if (!string.IsNullOrEmpty(param) && param != "(null)")
+                        {
+                            builder.Append(' ');
+                            builder.Append(param);
+                        }
+
+                        if (connection.ParamMap is { Count: > 0 })
+                        {
+                            builder.Append(' ');
+                            builder.Append(FormatParamMap(connection.ParamMap));
+                        }
+
+                        builder.AppendLine();
+                    }
+                }
+
+                builder.AppendLine();
+            }
+
+            return builder.ToString();
+        }
+
+        /// <summary>
+        /// Converts the entity lump to a Forge Game Data (FGD) format string.
+        /// </summary>
+        /// <returns>An FGD-formatted string containing entity class definitions.</returns>
+        public string ToForgeGameData()
+        {
+            var knownKeys = StringToken.InvertedTable;
+            var uniqueEntityProperties = new Dictionary<string, HashSet<(string Name, KVValueType Type)>>();
+            var uniqueEntityConnections = new Dictionary<string, HashSet<string>>();
+            var brushEntities = new HashSet<string>();
+
+            foreach (var entity in GetEntities())
+            {
+                var classname = entity.GetStringProperty("classname")?.ToLowerInvariant();
+                if (classname == null)
+                {
+                    continue;
+                }
+
+                if (!uniqueEntityProperties.TryGetValue(classname, out var entityProperties))
+                {
+                    entityProperties = [];
+                    uniqueEntityProperties.Add(classname, entityProperties);
+                }
+
+                foreach (var property in entity.Children)
+                {
+                    var key = property.Key;
+
+                    if (key is "hammeruniqueid" or "classname" or "angles" or "scales" or "origin")
+                    {
+                        continue;
+                    }
+
+                    if (property.Value.ValueType == KVValueType.String && key == "model")
+                    {
+                        var model = (string)property.Value;
+                        if (model.Contains("/entities/", StringComparison.Ordinal) || model.Contains("\\entities\\", StringComparison.Ordinal))
+                        {
+                            brushEntities.Add(classname);
+                        }
+                    }
+
+                    entityProperties.Add((key, property.Value.ValueType));
+                }
+
+                if (entity.Connections != null)
+                {
+                    if (!uniqueEntityConnections.TryGetValue(classname, out var entityConnections))
+                    {
+                        entityConnections = [];
+                        uniqueEntityConnections.Add(classname, entityConnections);
+                    }
+
+                    foreach (var connection in entity.Connections)
+                    {
+                        var outputName = connection.OutputName;
+
+                        entityConnections.Add(outputName);
+                    }
+                }
+            }
+
+            var builder = new StringBuilder();
+            builder.AppendLine(CultureInfo.InvariantCulture, $"// Generated with {StringToken.VRF_GENERATOR}");
+            builder.AppendLine();
+
+            foreach (var (classname, properties) in uniqueEntityProperties.OrderBy(x => x.Key))
+            {
+                if (brushEntities.Contains(classname))
+                {
+                    builder.Append("@SolidClass ");
+                }
+                else
+                {
+                    builder.Append("@PointClass ");
+                }
+
+                if (properties.RemoveWhere(x => x.Name == "targetname") > 0)
+                {
+                    builder.Append("base(Targetname) ");
+                }
+
+                builder.AppendLine(CultureInfo.InvariantCulture, $"{classname} : \"\"");
+                builder.AppendLine("[");
+
+                foreach (var property in properties.OrderBy(x => x.Name))
+                {
+                    var type = property.Type switch
+                    {
+                        KVValueType.FloatingPoint64 => "float",
+                        KVValueType.Int64 or KVValueType.UInt64 => "integer",
+                        KVValueType.Array => "vector", // sometimes also "color255", but with kv3 entities this information is lost
+                        KVValueType.String => "string",
+                        _ => property.Type.ToString().ToLowerInvariant()
+                    };
+
+                    builder.AppendLine(CultureInfo.InvariantCulture, $"\t{property.Name}({type}) : \"\"");
+                }
+
+                if (uniqueEntityConnections.TryGetValue(classname, out var entityConnections) && entityConnections.Count > 0)
+                {
+                    builder.AppendLine();
+
+                    foreach (var connection in entityConnections.OrderBy(x => x))
+                    {
+                        // TODO: Inputs?
+                        builder.AppendLine(CultureInfo.InvariantCulture, $"\toutput {connection}(void) : \"\"");
+                    }
+                }
+
+                builder.AppendLine("]");
+                builder.AppendLine();
+            }
+
+            return builder.ToString();
+        }
+
+        private static string FormatParamMap(KVObject paramMap)
+        {
+            var parts = new List<string>();
+
+            foreach (var (name, entry) in paramMap.Children)
+            {
+                if (name == "--forward-all-args--")
+                {
+                    if (entry.ValueType == KVValueType.Boolean && (bool)entry)
+                    {
+                        parts.Add("forward-all-args");
+                    }
+
+                    continue;
+                }
+
+                if (entry.IsCollection && entry.TryGetValue("src", out var source))
+                {
+                    parts.Add($"{name}<-{source}");
+                    continue;
+                }
+
+                var literal = entry.IsCollection && entry.TryGetValue("value", out var value) ? value : entry;
+                parts.Add($"{name}={CollapseWhitespace(StringifyValue(literal))}");
+            }
+
+            return $"{{{string.Join(", ", parts)}}}";
+
+            static string CollapseWhitespace(string value)
+                => string.Join(' ', value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        }
+
+        /// <summary>
+        /// Return a string representation of an entity property.
+        /// </summary>
+        /// <param name="value">Entity property.</param>
+        /// <returns>Stringified value.</returns>
+        public static string StringifyValue(object? value)
+        {
+            using var ms = new MemoryStream();
+            return StringifyValue(value, ms);
+        }
+
+        private static readonly KVSerializer ValueSerializer = KVSerializer.Create(KVSerializationFormat.KeyValues3Text);
+        private static readonly KVSerializerOptions ValueSerializerOptions = new() { SkipHeader = true };
+
+        private static string StringifyValue(object? value, MemoryStream ms)
+        {
+            var valueStr = string.Empty;
+
+            if (value is KVObject kvObject)
+            {
+                ms.SetLength(0);
+                ValueSerializer.Serialize(ms, new KVDocument(null, null, kvObject), ValueSerializerOptions);
+                valueStr = Encoding.UTF8.GetString(ms.GetBuffer(), 0, (int)ms.Length);
+            }
+            else if (value is not null)
+            {
+                valueStr = Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
+            }
+
+            return valueStr.Trim();
+        }
+
+        /// <summary>
+        /// The marker a compiled name carries where its spawn group's parent fixup goes, such as the prefix
+        /// that tells apart the instances of a prefab.
+        /// </summary>
+        public const string ParentNameFixupMarker = "[PR#]";
+
+        /// <summary>
+        /// The marker a compiled name carries where its spawn group's local fixup goes, such as the suffix that
+        /// tells apart the entities each spawn of a template makes.
+        /// </summary>
+        public const string LocalNameFixupMarker = "&0000";
+
+        /// <summary>
+        /// Replaces the first <see cref="ParentNameFixupMarker"/> and the first <see cref="LocalNameFixupMarker"/>
+        /// in a compiled name, applied to every name an entity is spawned with.
+        /// </summary>
+        /// <param name="name">A name as compiled, such as a targetname or a connection's target.</param>
+        /// <param name="parentFixup">What replaces <see cref="ParentNameFixupMarker"/>.</param>
+        /// <param name="localFixup">What replaces <see cref="LocalNameFixupMarker"/>.</param>
+        /// <returns>The name with its markers replaced, or <paramref name="name"/> when it has none.</returns>
+        public static string ApplyNameFixup(string name, string parentFixup, string localFixup)
+        {
+            ArgumentNullException.ThrowIfNull(name);
+            ArgumentNullException.ThrowIfNull(parentFixup);
+            ArgumentNullException.ThrowIfNull(localFixup);
+
+            var parentAt = name.IndexOf(ParentNameFixupMarker, StringComparison.OrdinalIgnoreCase);
+            var localAt = name.IndexOf(LocalNameFixupMarker, StringComparison.OrdinalIgnoreCase);
+
+            // Both markers are found in the name as compiled, never in a fixup. Whichever comes later is
+            // replaced first, so the other is still where it was found.
+            if (parentAt > localAt)
+            {
+                name = ReplaceAt(name, parentAt, ParentNameFixupMarker.Length, parentFixup);
+                parentAt = -1;
+            }
+
+            if (localAt >= 0)
+            {
+                name = ReplaceAt(name, localAt, LocalNameFixupMarker.Length, localFixup);
+            }
+
+            if (parentAt >= 0)
+            {
+                name = ReplaceAt(name, parentAt, ParentNameFixupMarker.Length, parentFixup);
+            }
+
+            return name;
+
+            static string ReplaceAt(string name, int at, int length, string replacement)
+                => string.Concat(name.AsSpan(0, at), replacement, name.AsSpan(at + length));
+        }
+
+        /// <summary>
+        /// Compares an entity targetname against a target string that may contain wildcards.
+        /// Letters compare ignoring ASCII case only, and there is no escape character.
+        /// </summary>
+        /// <param name="pattern">Targetname to match against, may contain wildcards: `*` and `?` (e.g. <c>door_*</c>).</param>
+        /// <param name="targetName">Entity targetname.</param>
+        /// <returns>Whether the targetname matches.</returns>
+        public static bool EntityNameMatches(string pattern, string targetName)
+        {
+            var patternIndex = 0;
+            var nameIndex = 0;
+            var starIndex = -1;
+            var starNameIndex = 0;
+
+            while (nameIndex < targetName.Length)
+            {
+                if (patternIndex < pattern.Length && pattern[patternIndex] == '*')
+                {
+                    while (patternIndex < pattern.Length && pattern[patternIndex] == '*')
+                    {
+                        patternIndex++;
+                    }
+
+                    if (patternIndex == pattern.Length)
+                    {
+                        return true;
+                    }
+
+                    starIndex = patternIndex;
+                    starNameIndex = nameIndex;
+                }
+                else if (patternIndex < pattern.Length
+                    && (pattern[patternIndex] == '?' || ToUpperAscii(pattern[patternIndex]) == ToUpperAscii(targetName[nameIndex])))
+                {
+                    patternIndex++;
+                    nameIndex++;
+                }
+                else if (starIndex >= 0)
+                {
+                    patternIndex = starIndex;
+                    nameIndex = ++starNameIndex;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+
+            while (patternIndex < pattern.Length && pattern[patternIndex] == '*')
+            {
+                patternIndex++;
+            }
+
+            return patternIndex == pattern.Length;
+        }
+
+        /// <summary>
+        /// Uppercases ASCII letters and leaves every other character unchanged.
+        /// </summary>
+        internal static char ToUpperAscii(char c) => char.IsAsciiLetterLower(c) ? (char)(c - ('a' - 'A')) : c;
+    }
+}

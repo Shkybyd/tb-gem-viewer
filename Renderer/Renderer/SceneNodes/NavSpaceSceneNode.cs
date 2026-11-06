@@ -1,0 +1,146 @@
+using System.Linq;
+using ValveResourceFormat.NavMesh;
+
+namespace ValveResourceFormat.Renderer.SceneNodes
+{
+    /// <summary>
+    /// Debug scene node that draws navigation space volumes as colored wireframe convex hulls.
+    /// </summary>
+    public class NavSpaceSceneNode : WireframeSceneNode
+    {
+        private static readonly Color32 TransitionColor = new(255, 255, 0);
+        private static readonly Color32 CellColor = new(240, 230, 140);
+
+        private static readonly WorldLayer BlocksLayer = new("Navigation/Space (blocks)");
+        private static readonly WorldLayer TransitionsLayer = new("Navigation/Space (transitions)");
+        private static readonly WorldLayer GridCellsLayer = new("Navigation/Space (grid cells)");
+
+        private readonly Func<List<SimpleVertex>> buildLines;
+
+        private NavSpaceSceneNode(Scene scene, AABB bounds, Func<List<SimpleVertex>> buildLines)
+            : base(scene, nameof(NavSpaceSceneNode))
+        {
+            this.buildLines = buildLines;
+            LocalBoundingBox = bounds;
+        }
+
+        /// <inheritdoc/>
+        protected override List<SimpleVertex> BuildLines() => buildLines();
+
+        /// <summary>
+        /// Adds nodes for the blocks, the transitions and the grid cells holding blocks of a <see cref="NavSpaceFile"/>
+        /// to the scene, each as its own layer. Each block is colored by its id.
+        /// </summary>
+        public static void AddToScene(NavSpaceFile? navSpaceFile, Scene scene)
+        {
+            if (navSpaceFile == null || scene == null || !navSpaceFile.Blocks.Any())
+            {
+                return;
+            }
+
+            var (sizeX, sizeY, sizeZ) = navSpaceFile.GridSize;
+            var bounds = new AABB(navSpaceFile.Bounds.Min, navSpaceFile.Bounds.Min + new Vector3(sizeX, sizeY, sizeZ) * navSpaceFile.CellSize);
+
+            AddLayer(scene, BlocksLayer, bounds, () => BuildBlockLines(navSpaceFile));
+
+            if (navSpaceFile.Transitions.Length > 0)
+            {
+                AddLayer(scene, TransitionsLayer, bounds, () => BuildTransitionLines(navSpaceFile));
+            }
+
+            AddLayer(scene, GridCellsLayer, bounds, () => BuildCellLines(navSpaceFile));
+        }
+
+        private static List<SimpleVertex> BuildBlockLines(NavSpaceFile navSpaceFile)
+        {
+            var maxEdgeCount = 0;
+
+            foreach (var block in navSpaceFile.Blocks)
+            {
+                maxEdgeCount += ConvexHull.GetMaxEdgeCount(block.Vertices.Length);
+            }
+
+            var vertices = new List<SimpleVertex>(maxEdgeCount * 2);
+            var hull = new ConvexHull();
+            var edges = new List<int>();
+
+            foreach (var block in navSpaceFile.Blocks)
+            {
+                AddConvexHull(vertices, hull, block.Vertices, GetIdColor(block.Id), edges);
+            }
+
+            return vertices;
+        }
+
+        private static List<SimpleVertex> BuildTransitionLines(NavSpaceFile navSpaceFile)
+        {
+            var maxEdgeCount = 0;
+
+            foreach (var transition in navSpaceFile.Transitions)
+            {
+                maxEdgeCount += ConvexHull.GetMaxEdgeCount(transition.Vertices.Length);
+            }
+
+            var vertices = new List<SimpleVertex>(maxEdgeCount * 2);
+            var hull = new ConvexHull();
+            var edges = new List<int>();
+
+            foreach (var transition in navSpaceFile.Transitions)
+            {
+                AddConvexHull(vertices, hull, transition.Vertices, TransitionColor, edges);
+            }
+
+            return vertices;
+        }
+
+        private static List<SimpleVertex> BuildCellLines(NavSpaceFile navSpaceFile)
+        {
+            var occupiedCellCount = 0;
+
+            foreach (var cell in navSpaceFile.Cells)
+            {
+                if (cell.Length > 0)
+                {
+                    occupiedCellCount++;
+                }
+            }
+
+            var vertices = new List<SimpleVertex>(occupiedCellCount * ShapeSceneNode.BoxLineVertexCount);
+            var (sizeX, sizeY, _) = navSpaceFile.GridSize;
+
+            for (var cell = 0; cell < navSpaceFile.Cells.Length; cell++)
+            {
+                if (navSpaceFile.Cells[cell].Length == 0)
+                {
+                    continue;
+                }
+
+                var coordinate = new Vector3(cell % sizeX, cell / sizeX % sizeY, cell / (sizeX * sizeY));
+                var min = navSpaceFile.Bounds.Min + coordinate * navSpaceFile.CellSize;
+
+                ShapeSceneNode.AddBox(vertices, new AABB(min + Vector3.One, min + new Vector3(navSpaceFile.CellSize - 1f)), CellColor);
+            }
+
+            return vertices;
+        }
+
+        private static void AddConvexHull(List<SimpleVertex> vertices, ConvexHull hull, Vector3[] points, Color32 color, List<int> edges)
+        {
+            edges.Clear();
+            hull.GetEdges(points, edges);
+
+            for (var i = 0; i < edges.Count; i += 2)
+            {
+                ShapeSceneNode.AddLine(vertices, points[edges[i]], points[edges[i + 1]], color);
+            }
+        }
+
+        private static void AddLayer(Scene scene, WorldLayer layer, AABB bounds, Func<List<SimpleVertex>> buildLines)
+        {
+            scene.Add(new NavSpaceSceneNode(scene, bounds, buildLines)
+            {
+                Layers = [layer],
+            }, false);
+        }
+    }
+}

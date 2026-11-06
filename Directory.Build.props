@@ -1,0 +1,67 @@
+<Project>
+  <PropertyGroup>
+    <!-- The SDK version is pinned in global.json -->
+    <TargetFramework>net10.0</TargetFramework>
+
+    <ProjectBaseVersion>20.1</ProjectBaseVersion>
+    <ProjectVersion Condition="'$(GITHUB_RUN_NUMBER)' != ''">$(ProjectBaseVersion).$(GITHUB_RUN_NUMBER)</ProjectVersion>
+    <ProjectVersion Condition="'$(GITHUB_RUN_NUMBER)' == ''">$(ProjectBaseVersion).0</ProjectVersion>
+    <DefineConstants Condition="'$(GITHUB_REF_TYPE)' == 'tag'">$(DefineConstants);CI_RELEASE_BUILD</DefineConstants>
+
+    <AssemblyVersion>$(ProjectBaseVersion)</AssemblyVersion>
+    <FileVersion>$(ProjectVersion)</FileVersion>
+    <Version>$(ProjectVersion)</Version>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>$(MSBuildThisFileDirectory)/Misc/ValveResourceFormat.snk</AssemblyOriginatorKeyFile>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>embedded</DebugType>
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <NeutralLanguage>en</NeutralLanguage>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <TreatWarningsAsErrors Condition="'$(Configuration)' == 'Release'">true</TreatWarningsAsErrors>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <PublishReferencesDocumentationFiles>false</PublishReferencesDocumentationFiles>
+    <AnalysisMode Condition="'$(Configuration)' == 'Release'">All</AnalysisMode>
+    <AnalysisMode Condition="'$(Configuration)' != 'Release'">Recommended</AnalysisMode>
+    <EnforceCodeStyleInBuild Condition="'$(Configuration)' == 'Release'">true</EnforceCodeStyleInBuild>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Authors>ValveResourceFormat Contributors</Authors>
+    <Copyright>Copyright © ValveResourceFormat Contributors</Copyright>
+    <RepositoryUrl>https://github.com/ValveResourceFormat/ValveResourceFormat</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://s2v.app/</PackageProjectUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' != 'Release'">
+    <!-- CA2000 is very slow: https://github.com/dotnet/roslyn-analyzers/issues/4915 -->
+    <NoWarn>$(NoWarn);CA2000</NoWarn>
+    <!-- Analyzers still run in the IDE, and Release builds enforce them -->
+    <RunAnalyzersDuringBuild>false</RunAnalyzersDuringBuild>
+    <!-- Skips the git queries for source link and the commit suffix of the version -->
+    <EnableSourceControlManagerQueries>false</EnableSourceControlManagerQueries>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(CI)' != 'true' And '$(CheckAot)' != 'true'">
+    <EnableTrimAnalyzer>false</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>false</EnableAotAnalyzer>
+    <EnableSingleFileAnalyzer>false</EnableSingleFileAnalyzer>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Using Include="System" />
+    <Using Include="System.Numerics" />
+    <Using Include="System.Collections.Generic" />
+  </ItemGroup>
+</Project>

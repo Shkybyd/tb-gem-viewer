@@ -1,0 +1,689 @@
+using System.Linq;
+using ValveKeyValue;
+using ValveResourceFormat.ResourceTypes.ModelFlex;
+using ValveResourceFormat.Serialization.KeyValues;
+
+namespace ValveResourceFormat.ResourceTypes.ModelAnimation
+{
+    /// <summary>
+    /// Represents a sequence-based model animation with frame data, events, and movement information.
+    /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/animationsystem/CAnimDesc">CAnimDesc</seealso>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/animationsystem/CSeqS1SeqDesc">CSeqS1SeqDesc</seealso>
+    public sealed class SequenceAnimation : AnimationBase
+    {
+        /// <summary>
+        /// Gets a value indicating whether the animation loops.
+        /// </summary>
+        public bool IsLooping { get; }
+
+        /// <summary>
+        /// Gets a value indicating whether the animation is hidden.
+        /// </summary>
+        public bool Hidden { get; init; }
+
+        /// <summary>
+        /// Gets a value indicating whether this is a delta animation.
+        /// </summary>
+        public bool Delta { get; init; }
+
+        /// <summary>
+        /// Gets a value indicating whether the animation graph plays this animation additively
+        /// (<c>m_bAnimGraphAdditive</c>, present in newer engine branches).
+        /// </summary>
+        public bool AnimGraphAdditive { get; }
+
+        /// <summary>
+        /// Gets a value indicating whether this animation is in world space.
+        /// </summary>
+        public bool Worldspace { get; init; }
+
+        /// <summary>
+        /// Gets LegacyRealtime value of animation sequence. False for animations constructed without animation sequence data.
+        /// </summary>
+        public bool Realtime { get; init; }
+
+        /// <summary>
+        /// Gets Autoplay value of animation sequence. False for animations constructed without animation sequence data.
+        /// </summary>
+        public bool Autoplay { get; init; }
+
+        private AnimationFrameBlock[] FrameBlocks { get; } = [];
+        private readonly AnimationSegmentTable segments;
+
+        private bool? hasFlexData;
+
+        /// <inheritdoc/>
+        public override bool HasFlexData => hasFlexData ??=
+            GetOwnSegments().Any(static segment => segment.ChannelAttribute == AnimationChannelAttribute.Data);
+
+        /// <summary>
+        /// Gets the movement data for this animation.
+        /// </summary>
+        public AnimationMovement[] Movements { get; }
+
+        /// <summary>
+        /// Gets the events defined in this animation.
+        /// </summary>
+        public AnimationEvent[] Events { get; }
+
+        /// <summary>
+        /// Gets the activities associated with this animation.
+        /// </summary>
+        public AnimationActivity[] Activities { get; }
+
+        /// <summary>
+        /// Gets the local-hierarchy overrides of this animation (bones interpolated in another bone's
+        /// or model space for a frame range, e.g. a weapon detaching in a death animation).
+        /// </summary>
+        public AnimationLocalHierarchy[] LocalHierarchy { get; } = [];
+
+        /// <summary>
+        /// Gets the sequence parameters for this animation.
+        /// </summary>
+        public AnimationSequenceParams SequenceParams { get; }
+
+        /// <summary>
+        /// Gets the auto layer data for this animation. Empty for animations that were constructed without sequence data.
+        /// </summary>
+        public AnimationAutoLayer[] AutoLayers { get; } = [];
+
+        /// <summary>
+        /// Gets fetch data for this animation. Null for animations that were constructed without sequence data.
+        /// </summary>
+        public AnimationFetch? Fetch { get; }
+
+        /// <summary>
+        /// Gets the name of the bone mask this sequence plays with. Empty for the default mask.
+        /// </summary>
+        public string BoneMaskName { get; } = string.Empty;
+
+        /// <summary>
+        /// Gets whether this sequence blends several animations along a pose parameter.
+        /// </summary>
+        public bool IsBlend => Fetch is { LocalReferenceArray.Length: > 1 } fetch && (fetch.Is1D || fetch.Is2D);
+
+        /// <summary>
+        /// Gets the name each entry of <see cref="AnimationFetch.LocalReferenceArray"/> resolves to
+        /// against the sequence group's shared name array, in blend order. Empty when not a blend.
+        /// </summary>
+        public string[] BlendReferenceNames { get; } = [];
+
+        /// <summary>
+        /// Gets the name each dimension of <see cref="AnimationFetch.LocalPose"/> resolves to against the
+        /// sequence group's pose parameter array, row then column. Empty where a dimension names none.
+        /// </summary>
+        public string[] PoseParameterNames { get; } = [];
+
+        /// <summary>
+        /// Gets the name the first entry of <see cref="AnimationFetch.LocalReferenceArray"/> resolves to
+        /// against the sequence group's shared name array: the animation this sequence plays.
+        /// </summary>
+        public string ReferencedAnimationName { get; } = string.Empty;
+
+        /// <summary>
+        /// Gets whether this animation was constructed from sequence data.
+        /// </summary>
+        public bool FromSequence { get; }
+
+        private static AnimationLocalHierarchy[] GetLocalHierarchy(KVObject? animDesc)
+            => animDesc?.GetArray("m_hierarchyArray")?.Select(static x => new AnimationLocalHierarchy(x)).ToArray() ?? [];
+
+        private static (int FrameCount, AnimationFrameBlock[] FrameBlocks) GetFrameData(KVObject animDesc)
+        {
+            // Older animations store the frame data directly on the description
+            var pData = animDesc.GetSubCollection("m_pData");
+            var frameCount = pData?.GetInt32Property("m_nFrames") ?? animDesc.GetInt32Property("numframes");
+            var frameBlocks = (pData ?? animDesc).GetArray("m_frameblockArray").Select(static x => new AnimationFrameBlock(x)).ToArray();
+
+            return (frameCount, frameBlocks);
+        }
+
+        private SequenceAnimation(KVObject animDesc, AnimationSegmentTable segments)
+        {
+            Name = animDesc.GetStringProperty("m_name");
+            Fps = animDesc.GetFloatProperty("fps");
+            this.segments = segments;
+
+            var flags = animDesc.GetSubCollection("m_flags");
+            IsLooping = flags.GetBooleanProperty("m_bLooping");
+            Hidden = flags.GetBooleanProperty("m_bHidden");
+            Delta = flags.GetBooleanProperty("m_bDelta");
+            AnimGraphAdditive = flags.GetBooleanProperty("m_bAnimGraphAdditive");
+            Worldspace = flags.GetBooleanProperty("m_bLegacyWorldspace");
+            IsAdditive = Delta || AnimGraphAdditive;
+
+            (FrameCount, FrameBlocks) = GetFrameData(animDesc);
+
+            var movementArray = animDesc.GetArray("m_movementArray");
+            Movements = new AnimationMovement[movementArray.Count];
+            for (var i = 0; i < movementArray.Count; i++)
+            {
+                Movements[i] = new AnimationMovement(movementArray[i]);
+            }
+
+            Events = animDesc.GetArray("m_eventArray")
+                                 .Select(x => new AnimationEvent(x))
+                                 .ToArray();
+
+            Activities = animDesc.GetArray("m_activityArray")
+                                    .Select(x => new AnimationActivity(x))
+                                    .ToArray();
+
+            LocalHierarchy = GetLocalHierarchy(animDesc);
+
+            if (animDesc.GetSubCollection("m_sequenceParams") is { } sequenceParams)
+            {
+                SequenceParams = new AnimationSequenceParams(sequenceParams);
+            }
+
+            FromSequence = false;
+        }
+
+        /// <summary>
+        /// Constructor for creating animation from sequence descriptor (ASEQ) and animation data (ANIM).
+        /// </summary>
+        private SequenceAnimation(KVObject seqDesc, KVObject? animDesc, AnimationSegmentTable segments,
+            string[] sequenceNameArray, string[] boneMaskNames, string[] poseParamNames)
+        {
+            // Name and metadata from sequence descriptor
+            Name = seqDesc.GetStringProperty("m_sName");
+
+            var seqFlags = seqDesc.GetSubCollection("m_flags");
+            var animFlags = animDesc?.GetSubCollection("m_flags");
+
+            IsLooping = seqFlags.GetBooleanProperty("m_bLooping");
+            Hidden = seqFlags.GetBooleanProperty("m_bHidden");
+            Delta = seqFlags.GetBooleanProperty("m_bLegacyDelta") || (animFlags?.GetBooleanProperty("m_bDelta") ?? false);
+
+            Worldspace = seqFlags.GetBooleanProperty("m_bLegacyWorldspace");
+            Realtime = seqFlags.GetBooleanProperty("m_bLegacyRealtime");
+            Autoplay = seqFlags.GetBooleanProperty("m_bAutoplay");
+            AnimGraphAdditive = animFlags?.GetBooleanProperty("m_bAnimGraphAdditive") ?? false;
+
+            IsAdditive = Delta || AnimGraphAdditive;
+
+            // Activities from sequence descriptor
+            Activities = seqDesc.GetArray("m_activityArray")
+                .Select(x => new AnimationActivity(x))
+                .ToArray();
+
+            LocalHierarchy = GetLocalHierarchy(animDesc);
+
+            // Transition params from sequence descriptor
+            var transition = seqDesc.GetSubCollection("m_transition");
+            SequenceParams = new AnimationSequenceParams(transition);
+
+            this.segments = segments;
+            Movements = [];
+            Events = [];
+
+            if (animDesc != null)
+            {
+                Fps = animDesc.GetFloatProperty("fps");
+
+                (FrameCount, FrameBlocks) = GetFrameData(animDesc);
+
+                var movementArray = animDesc.GetArray("m_movementArray");
+                Movements = new AnimationMovement[movementArray.Count];
+                for (var i = 0; i < movementArray.Count; i++)
+                {
+                    Movements[i] = new AnimationMovement(movementArray[i]);
+                }
+
+                Events = animDesc.GetArray("m_eventArray")
+                    .Select(x => new AnimationEvent(x))
+                    .ToArray();
+            }
+
+            var autoLayerArray = seqDesc.GetArray("m_autoLayerArray");
+            AutoLayers = new AnimationAutoLayer[autoLayerArray.Count];
+            for (var i = 0; i < autoLayerArray.Count; i++)
+            {
+                var layer = new AnimationAutoLayer(autoLayerArray[i]);
+
+                if (layer.LocalReference >= 0 && layer.LocalReference < sequenceNameArray.Length)
+                {
+                    layer.ReferencedAnimationName = sequenceNameArray[layer.LocalReference];
+                }
+
+                AutoLayers[i] = layer;
+            }
+
+            var fetch = seqDesc.GetSubCollection("m_fetch");
+            Fetch = new AnimationFetch(fetch);
+
+            if (Fetch.Value.LocalReferenceArray is [var firstReference, ..]
+                && firstReference >= 0 && firstReference < sequenceNameArray.Length)
+            {
+                ReferencedAnimationName = sequenceNameArray[firstReference];
+            }
+
+            if (IsBlend)
+            {
+                var localReferenceArray = Fetch.Value.LocalReferenceArray;
+                var blendReferenceNames = new string[localReferenceArray.Length];
+                for (var i = 0; i < blendReferenceNames.Length; i++)
+                {
+                    var refIndex = localReferenceArray[i];
+                    blendReferenceNames[i] = refIndex >= 0 && refIndex < sequenceNameArray.Length
+                        ? sequenceNameArray[refIndex]
+                        : string.Empty;
+                }
+                BlendReferenceNames = blendReferenceNames;
+
+                var localPose = Fetch.Value.LocalPose;
+                var poseParameterNames = new string[localPose.Length];
+                for (var i = 0; i < poseParameterNames.Length; i++)
+                {
+                    var poseIndex = localPose[i];
+                    poseParameterNames[i] = poseIndex >= 0 && poseIndex < poseParamNames.Length
+                        ? poseParamNames[poseIndex]
+                        : string.Empty;
+                }
+                PoseParameterNames = poseParameterNames;
+            }
+
+            var weightListIndex = seqDesc.GetInt32Property("m_nLocalWeightlist");
+            BoneMaskName = weightListIndex > 0 && weightListIndex < boneMaskNames.Length
+                ? boneMaskNames[weightListIndex]
+                : string.Empty;
+
+            FromSequence = true;
+        }
+
+        /// <summary>
+        /// Creates animation instances from the provided animation data and decode key.
+        /// </summary>
+        public static IEnumerable<SequenceAnimation> FromData(KVObject animationData, KVObject decodeKey,
+            Skeleton skeleton, FlexController[] flexControllers)
+        {
+            var animArray = animationData.GetArray("m_animArray");
+
+            if (animArray.Count == 0)
+            {
+                return [];
+            }
+
+            var segments = new AnimationSegmentTable(animationData, decodeKey, skeleton, flexControllers);
+
+            return animArray
+                .Select(anim => new SequenceAnimation(anim, segments) { TargetSkeletonName = skeleton.Name })
+                .ToArray();
+        }
+
+        /// <summary>
+        /// Creates animation instances from sequence data (ASEQ) and animation data (ANIM).
+        /// This method uses sequence descriptors from ASEQ for names and metadata, while getting
+        /// frame data from animations in ANIM that the sequences reference.
+        /// </summary>
+        public static IEnumerable<SequenceAnimation> FromSequenceData(
+            KVObject sequenceData,
+            KVObject animationData,
+            KVObject decodeKey,
+            Skeleton skeleton,
+            FlexController[] flexControllers)
+        {
+            var animArray = animationData.GetArray("m_animArray");
+
+            if (animArray.Count == 0)
+            {
+                return [];
+            }
+
+            var segments = new AnimationSegmentTable(animationData, decodeKey, skeleton, flexControllers);
+            var sequenceNameArray = sequenceData.GetArray<string>("m_localSequenceNameArray");
+
+            var boneMaskArray = sequenceData.GetArray("m_localBoneMaskArray");
+            var boneMaskNames = new string[boneMaskArray?.Count ?? 0];
+            for (var i = 0; i < boneMaskNames.Length; i++)
+            {
+                boneMaskNames[i] = boneMaskArray![i].GetStringProperty("m_sName");
+            }
+
+            var poseParamArray = sequenceData.GetArray("m_localPoseParamArray");
+            var poseParamNames = new string[poseParamArray?.Count ?? 0];
+            for (var i = 0; i < poseParamNames.Length; i++)
+            {
+                poseParamNames[i] = poseParamArray![i].GetStringProperty("m_sName");
+            }
+
+            // The sequence group's name table spells the same animation in either case.
+            var animLookup = new Dictionary<string, KVObject>(StringComparer.OrdinalIgnoreCase);
+            foreach (var anim in animArray)
+            {
+                var name = anim.GetStringProperty("m_name");
+                animLookup[name] = anim;
+            }
+
+            var processedAnimNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seqDescArray = sequenceData.GetArray("m_localS1SeqDescArray");
+            var animations = new List<SequenceAnimation>();
+
+            static KVObject? FirstReference(KVObject seqDesc, string[] sequenceNameArray, Dictionary<string, KVObject> animLookup)
+            {
+                var localRefArray = seqDesc.GetSubCollection("m_fetch").GetSubCollection("m_localReferenceArray");
+
+                if (localRefArray is not { Count: > 0 })
+                {
+                    return null;
+                }
+
+                var refIndex = localRefArray.GetElement<int>(0);
+
+                if (refIndex < 0 || refIndex >= sequenceNameArray.Length)
+                {
+                    return null;
+                }
+
+                return animLookup.GetValueOrDefault(sequenceNameArray[refIndex]);
+            }
+
+            // A reference names an entry of the shared name array: an animation, or another sequence.
+            var sequenceLookup = new Dictionary<string, KVObject>(StringComparer.OrdinalIgnoreCase);
+            foreach (var seqDesc in seqDescArray)
+            {
+                if (FirstReference(seqDesc, sequenceNameArray, animLookup) is { } referenced)
+                {
+                    sequenceLookup[seqDesc.GetStringProperty("m_sName")] = referenced;
+                }
+            }
+
+            foreach (var seqDesc in seqDescArray)
+            {
+                var fetch = seqDesc.GetSubCollection("m_fetch");
+
+                var localRefArray = fetch.GetSubCollection("m_localReferenceArray");
+                if (localRefArray is not { Count: > 0 })
+                {
+                    continue;
+                }
+
+                // A blend plays all of its references at once; the first stands in for the sequence.
+                var refIndex = localRefArray.GetElement<int>(0);
+
+                if (refIndex < 0 || refIndex >= sequenceNameArray.Length)
+                {
+                    continue;
+                }
+
+                var refAnimName = sequenceNameArray[refIndex];
+
+                if (!animLookup.TryGetValue(refAnimName, out var animDesc)
+                    && !sequenceLookup.TryGetValue(refAnimName, out animDesc)
+                    && localRefArray.Count == 1)
+                {
+                    continue;
+                }
+
+                var seqName = seqDesc.GetStringProperty("m_sName");
+                processedAnimNames.Add(seqName);
+
+                animations.Add(new SequenceAnimation(seqDesc, animDesc, segments, sequenceNameArray, boneMaskNames, poseParamNames) { TargetSkeletonName = skeleton.Name });
+            }
+
+            // Add remaining animations not already output as sequences
+            foreach (var anim in animArray)
+            {
+                var animName = anim.GetStringProperty("m_name");
+
+                if (processedAnimNames.Contains(animName))
+                {
+                    continue;
+                }
+
+                animations.Add(new SequenceAnimation(anim, segments) { TargetSkeletonName = skeleton.Name });
+            }
+
+            return animations;
+        }
+
+        /// <summary>
+        /// Creates animation instances from a resource file.
+        /// </summary>
+        public static IEnumerable<SequenceAnimation> FromResource(Resource resource, KVObject decodeKey, Skeleton skeleton, FlexController[] flexControllers)
+        {
+            var animations = FromData(GetAnimationData(resource), decodeKey, skeleton, flexControllers);
+
+            if (resource.DataBlock is KeyValuesOrNTRO dataBlock)
+            {
+                dataBlock.Data = null;
+            }
+
+            return animations;
+        }
+
+        private static KVObject GetAnimationData(Resource resource)
+            => (resource.DataBlock ?? throw new InvalidOperationException("Resource has no data block.")).AsKeyValueCollection();
+
+        private int GetMovementIndexForTime(float time)
+        {
+            var frame = (int)MathF.Floor(time * Fps);
+            return GetMovementIndexForFrame(frame);
+        }
+
+        private int GetMovementIndexForFrame(int frame)
+        {
+            for (var i = 0; i < Movements.Length; i++)
+            {
+                var movement = Movements[i];
+                if (movement.EndFrame > frame)
+                {
+                    return i;
+                }
+            }
+            return Movements.Length - 1;
+        }
+
+        /// <inheritdoc/>
+        public override bool HasMovementData()
+        {
+            return Movements.Length > 0;
+        }
+
+        /// <summary>
+        /// Determines whether any movement segment actually moves. Compiled animations often carry
+        /// segments that are all zero, which behave the same as having no movement at all.
+        /// </summary>
+        public bool HasNonZeroMovementData()
+        {
+            return Array.Exists(Movements, static movement => !movement.IsZero);
+        }
+
+        /// <inheritdoc/>
+        public override AnimationMovement.MovementData GetMovementOffsetData(float time)
+        {
+            if (!HasMovementData())
+            {
+                return new();
+            }
+
+            GetMovementForTime(time, out var movement, out var nextMovement, out var t);
+            return AnimationMovement.Lerp(movement, nextMovement, t);
+        }
+
+        /// <inheritdoc/>
+        public override AnimationMovement.MovementData GetMovementOffsetData(int frame)
+        {
+            if (!HasMovementData())
+            {
+                return new();
+            }
+
+            var movementIndex = GetMovementIndexForFrame(frame);
+            var lastMovement = movementIndex == 0 ? null : Movements[movementIndex - 1];
+            var movement = Movements[movementIndex];
+
+            var movementTime = frame / (float)movement.EndFrame;
+            return AnimationMovement.Lerp(lastMovement, movement, movementTime);
+        }
+
+        /// <summary>
+        /// Returns root motion data at the specified animation time for interpolation.
+        /// </summary>
+        private void GetMovementForTime(float time, out AnimationMovement? lastMovement, out AnimationMovement nextMovement, out float t)
+        {
+            time %= FrameCount / Fps;
+
+            var nextMovementIndex = GetMovementIndexForTime(time);
+            var lastMovementIndex = nextMovementIndex - 1;
+
+            nextMovement = Movements[nextMovementIndex];
+            if (nextMovementIndex == 0)
+            {
+                lastMovement = null;
+
+                var movementTime = nextMovement.EndFrame / Fps;
+                t = time / movementTime;
+                return;
+            }
+
+            lastMovement = Movements[lastMovementIndex];
+
+            var startTime = lastMovement.EndFrame / Fps;
+            var endTime = nextMovement.EndFrame / Fps;
+
+            var movementDuration = endTime - startTime;
+            var elapsedTime = time - startTime;
+
+            t = Math.Min(1f, elapsedTime / movementDuration);
+        }
+
+        private enum AnimatedChannels : byte
+        {
+            None = 0,
+            Position = 1,
+            Angle = 2,
+        }
+
+        /// <summary>
+        /// Sequences decode into a bind-pose frame and only write the channels they animate (see
+        /// <see cref="BuildAnimatedChannels"/>), so a channel the animation leaves alone holds the bind
+        /// pose rather than a delta, and has to be neutralized before it is composed onto a pose.
+        /// </summary>
+        public override FrameBone GetAdditiveDelta(int boneIndex, FrameBone bone)
+        {
+            var animated = animatedChannelsCache ??= BuildAnimatedChannels();
+            var channels = boneIndex < animated.Length ? animated[boneIndex] : AnimatedChannels.None;
+
+            var position = (channels & AnimatedChannels.Position) != 0 ? bone.Position : Vector3.Zero;
+            var angle = (channels & AnimatedChannels.Angle) != 0 ? bone.Angle : Quaternion.Identity;
+
+            // Sequence scale is authored around one rather than around zero, so the delta is what it is
+            // over one. That is also zero for a bone this animation does not scale, masking it for free.
+            return new FrameBone(position, bone.Scale - 1f, angle);
+        }
+
+        /// <summary>
+        /// Returns the bones this animation writes a scale for, empty when it leaves every bone at its
+        /// rest scale.
+        /// </summary>
+        public int[] GetScaledBones()
+        {
+            var scaled = new SortedSet<int>();
+
+            foreach (var segment in GetOwnSegments())
+            {
+                if (segment.ChannelAttribute != AnimationChannelAttribute.Scale)
+                {
+                    continue;
+                }
+
+                foreach (var boneIndex in segment.RemapTable)
+                {
+                    if (boneIndex >= 0)
+                    {
+                        scaled.Add(boneIndex);
+                    }
+                }
+            }
+
+            return [.. scaled];
+        }
+
+        private AnimatedChannels[]? animatedChannelsCache;
+
+        /// <summary>
+        /// Returns, per bone, which transform channels this animation actually writes, derived from
+        /// the segment decoders' bone targets and channel attributes. Bones past the end of it are
+        /// animated by nothing.
+        /// </summary>
+        private AnimatedChannels[] BuildAnimatedChannels()
+        {
+            var ownSegments = GetOwnSegments().ToList();
+            var boneCount = 0;
+
+            foreach (var segment in ownSegments)
+            {
+                foreach (var boneIndex in segment.RemapTable)
+                {
+                    boneCount = Math.Max(boneCount, boneIndex + 1);
+                }
+            }
+
+            var animated = new AnimatedChannels[boneCount];
+
+            foreach (var segment in ownSegments)
+            {
+                var channel = segment.ChannelAttribute switch
+                {
+                    AnimationChannelAttribute.Position => AnimatedChannels.Position,
+                    AnimationChannelAttribute.Angle => AnimatedChannels.Angle,
+                    _ => AnimatedChannels.None,
+                };
+
+                if (channel == AnimatedChannels.None)
+                {
+                    continue;
+                }
+
+                foreach (var boneIndex in segment.RemapTable)
+                {
+                    if (boneIndex >= 0)
+                    {
+                        animated[boneIndex] |= channel;
+                    }
+                }
+            }
+
+            return animated;
+        }
+
+        /// <summary>
+        /// Gets the decoders of the segments this animation's frame blocks reference, skipping unsupported ones.
+        /// </summary>
+        private IEnumerable<AnimationSegmentDecoder> GetOwnSegments()
+        {
+            var seen = new HashSet<long>();
+
+            foreach (var frameBlock in FrameBlocks)
+            {
+                foreach (var segmentIndex in frameBlock.SegmentIndexArray)
+                {
+                    if (seen.Add(segmentIndex) && segments.Get(segmentIndex) is { } segment)
+                    {
+                        yield return segment;
+                    }
+                }
+            }
+        }
+
+        /// <inheritdoc/>
+        public override void DecodeFrame(Frame outFrame)
+        {
+            foreach (var frameBlock in FrameBlocks)
+            {
+                // Only consider blocks that actually contain info for this frame
+                if (outFrame.FrameIndex >= frameBlock.StartFrame && outFrame.FrameIndex <= frameBlock.EndFrame)
+                {
+                    foreach (var segmentIndex in frameBlock.SegmentIndexArray)
+                    {
+                        var segment = segments.Get(segmentIndex);
+                        // Segment could be null for unknown decoders
+                        segment?.Read(outFrame.FrameIndex - frameBlock.StartFrame, outFrame);
+                    }
+                }
+            }
+        }
+    }
+}

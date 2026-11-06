@@ -1,0 +1,1662 @@
+using System.Buffers;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using K4os.Compression.LZ4;
+using SkiaSharp;
+using TinyBCSharp;
+using ValveResourceFormat.CompiledShader;
+using ValveResourceFormat.TextureDecoders;
+
+namespace ValveResourceFormat.ResourceTypes
+{
+    /// <summary>
+    /// Represents a texture resource containing image data with various formats and metadata.
+    /// </summary>
+    /// <remarks>
+    /// Get one from <see cref="ValveResourceFormat.Resource.DataBlock"/> of a resource whose type is <see cref="ResourceType.Texture"/>.
+    /// Use <see cref="GenerateBitmap"/> to decode the pixels.
+    /// </remarks>
+    public class Texture : Block
+    {
+        /// <summary>
+        /// Defines the six faces of a cubemap texture.
+        /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/hlvr/rendersystemdx11/CubeMapFace_t">CubeMapFace_t</seealso>
+        public enum CubemapFace
+        {
+            /// <summary>Right face.</summary>
+            PositiveX,
+            /// <summary>Left face.</summary>
+            NegativeX,
+            /// <summary>Back face.</summary>
+            PositiveY,
+            /// <summary>Front face.</summary>
+            NegativeY,
+            /// <summary>Up face.</summary>
+            PositiveZ,
+            /// <summary>Down face.</summary>
+            NegativeZ,
+        }
+
+        /// <summary>
+        /// Contains data for sprite sheet animations and sequences.
+        /// </summary>
+        public class SpritesheetData
+        {
+            /// <summary>
+            /// Represents an animation sequence within a sprite sheet.
+            /// </summary>
+            public class Sequence
+            {
+                /// <summary>
+                /// Represents a single frame within an animation sequence.
+                /// </summary>
+                public class Frame
+                {
+                    /// <summary>
+                    /// Represents an image within a frame, defining cropped and uncropped UV coordinates.
+                    /// </summary>
+                    public class Image
+                    {
+                        /// <summary>
+                        /// Gets or sets the minimum UV coordinates for the cropped image area.
+                        /// </summary>
+                        public Vector2 CroppedMin { get; set; }
+
+                        /// <summary>
+                        /// Gets or sets the maximum UV coordinates for the cropped image area.
+                        /// </summary>
+                        public Vector2 CroppedMax { get; set; }
+
+                        /// <summary>
+                        /// Gets or sets the minimum UV coordinates for the uncropped image area.
+                        /// </summary>
+                        public Vector2 UncroppedMin { get; set; }
+
+                        /// <summary>
+                        /// Gets or sets the maximum UV coordinates for the uncropped image area.
+                        /// </summary>
+                        public Vector2 UncroppedMax { get; set; }
+
+                        /// <summary>
+                        /// Gets the cropped rectangle in pixel coordinates for the specified dimensions.
+                        /// </summary>
+                        /// <param name="width">The width of the texture in pixels.</param>
+                        /// <param name="height">The height of the texture in pixels.</param>
+                        /// <returns>A rectangle representing the cropped area in pixel coordinates.</returns>
+                        public SKRectI GetCroppedRect(int width, int height)
+                        {
+                            return ToPixelRect(CroppedMin, CroppedMax, width, height);
+                        }
+
+                        /// <summary>
+                        /// Gets the uncropped rectangle in pixel coordinates for the specified dimensions.
+                        /// </summary>
+                        /// <param name="width">The width of the texture in pixels.</param>
+                        /// <param name="height">The height of the texture in pixels.</param>
+                        /// <returns>A rectangle representing the uncropped area in pixel coordinates.</returns>
+                        public SKRectI GetUncroppedRect(int width, int height)
+                        {
+                            return ToPixelRect(UncroppedMin, UncroppedMax, width, height);
+                        }
+
+                        // The sheet compiler stores texel centers: the min corner is (x + 0.5) / dim and the max
+                        // corner is (xLast + 0.5) / dim, with xLast inclusive. Flooring maps each corner back
+                        // onto its texel, so the exclusive edge is one texel past the max corner.
+                        private static SKRectI ToPixelRect(Vector2 min, Vector2 max, int width, int height)
+                        {
+                            // Empty frames are stored as a degenerate rectangle
+                            if (max.X <= min.X || max.Y <= min.Y)
+                            {
+                                return SKRectI.Empty;
+                            }
+
+                            var startX = (int)(min.X * width);
+                            var startY = (int)(min.Y * height);
+                            var endX = Math.Min((int)(max.X * width) + 1, width);
+                            var endY = Math.Min((int)(max.Y * height) + 1, height);
+
+                            return new SKRectI(startX, startY, endX, endY);
+                        }
+                    }
+
+                    /// <summary>
+                    /// Gets or sets the array of images contained in this frame.
+                    /// </summary>
+                    public Image[] Images { get; set; } = [];
+
+                    /// <summary>
+                    /// Gets or sets the display time for this frame in seconds.
+                    /// </summary>
+                    public float DisplayTime { get; set; }
+                }
+
+                /// <summary>
+                /// Gets or sets the sequence number this sequence was authored with.
+                /// </summary>
+                public uint Id { get; set; }
+
+                /// <summary>
+                /// Gets or sets the array of frames in this sequence.
+                /// </summary>
+                public Frame[] Frames { get; set; } = [];
+
+                /// <summary>
+                /// Gets or sets the total time this sequence spans. Frames divide it by their display times.
+                /// </summary>
+                public float TotalTime { get; set; }
+
+                /// <summary>
+                /// Gets or sets the name of this sequence.
+                /// </summary>
+                public string Name { get; set; } = string.Empty;
+
+                /// <summary>
+                /// Gets or sets a value indicating whether this sequence should clamp at the end.
+                /// </summary>
+                public bool Clamp { get; set; }
+
+                /// <summary>
+                /// Gets or sets a value indicating whether alpha cropping is enabled for this sequence.
+                /// </summary>
+                public bool AlphaCrop { get; set; }
+
+                /// <summary>
+                /// Gets or sets a value indicating whether color information should be ignored.
+                /// </summary>
+                public bool NoColor { get; set; }
+
+                /// <summary>
+                /// Gets or sets a value indicating whether alpha information should be ignored.
+                /// </summary>
+                public bool NoAlpha { get; set; }
+
+                /// <summary>
+                /// Gets the dictionary of floating-point parameters associated with this sequence.
+                /// </summary>
+                public Dictionary<string, float> FloatParams { get; } = [];
+
+                /// <summary>
+                /// Gets the playback time span of this sequence, or one second when it has no total of its own.
+                /// </summary>
+                public float EffectiveTotalTime => TotalTime > 0f ? TotalTime : 1f;
+
+                /// <summary>
+                /// Gets a value indicating whether <see cref="Name"/> was authored with the sheet.
+                /// Unnamed sequences carry the name of the element class they were built from.
+                /// </summary>
+                public bool IsNamed => Name.Length > 0
+                    && !Name.StartsWith("CDme", StringComparison.Ordinal)
+                    && !Name.Any(char.IsWhiteSpace);
+
+                /// <summary>
+                /// Gets the time at which a frame starts, measured from the start of the sequence.
+                /// </summary>
+                /// <param name="frameIndex">Index of the frame to locate.</param>
+                /// <returns>The frame's start time in seconds.</returns>
+                public float GetFrameStartTime(int frameIndex)
+                {
+                    var start = 0f;
+
+                    for (var frame = 0; frame < frameIndex && frame < Frames.Length; frame++)
+                    {
+                        start += Frames[frame].DisplayTime;
+                    }
+
+                    return start;
+                }
+
+                /// <summary>
+                /// The two frames a playback position sits between and how far it has crossed from the
+                /// first to the second. Every frame is held for its own display time as a share of the
+                /// sequence's total, so a sequence whose frames have uneven display times does not play
+                /// at a uniform rate. A clamping sequence holds its last frame; otherwise it wraps back
+                /// to the first.
+                /// </summary>
+                /// <param name="position">Playback position in seconds, within <see cref="EffectiveTotalTime"/>.</param>
+                /// <returns>The frame to show, the frame after it, and the fraction crossed between them.</returns>
+                public (int Frame, int NextFrame, float Blend) GetFrameAtPosition(float position)
+                {
+                    var lastFrame = Frames.Length - 1;
+
+                    if (lastFrame < 1)
+                    {
+                        return (0, 0, 0f);
+                    }
+
+                    var frameStart = 0f;
+
+                    for (var frame = 0; frame < lastFrame; frame++)
+                    {
+                        var displayTime = Frames[frame].DisplayTime;
+
+                        if (frameStart + displayTime > position)
+                        {
+                            return (frame, frame + 1, CrossedFraction(position - frameStart, displayTime));
+                        }
+
+                        frameStart += displayTime;
+                    }
+
+                    return Clamp
+                        ? (lastFrame, lastFrame, 0f)
+                        : (lastFrame, 0, CrossedFraction(position - frameStart, EffectiveTotalTime - frameStart));
+                }
+
+                private static float CrossedFraction(float into, float span) => span > 0f ? into / span : 0f;
+            }
+
+            private const string UnnamedSequenceName = "CDmeSheetSequence";
+
+            private Sequence[] sequences = [];
+            private int[] sequenceIndicesById = [];
+
+            /// <summary>
+            /// Gets or sets the array of animation sequences in this sprite sheet.
+            /// </summary>
+            public Sequence[] Sequences
+            {
+                get => sequences;
+                set
+                {
+                    sequences = value;
+                    sequenceIndicesById = BuildSequenceIndicesById(value);
+                }
+            }
+
+            /// <summary>
+            /// Gets the position in <see cref="Sequences"/> of the sequence a particle reaches with
+            /// sequence number <paramref name="id"/>, or -1 when no sequence answers to it.
+            /// </summary>
+            /// <remarks>
+            /// An unnamed sequence answers to its authored <see cref="Sequence.Id"/>, a sequence named with
+            /// digits only answers to that number, and any other named sequence cannot be reached.
+            /// </remarks>
+            /// <param name="id">The sequence number.</param>
+            /// <returns>The sequence's position, or -1.</returns>
+            public int GetSequenceIndex(int id)
+                => (uint)id < (uint)sequenceIndicesById.Length ? sequenceIndicesById[id] : -1;
+
+            /// <summary>
+            /// Gets the number one past the largest sequence number any sequence answers to.
+            /// </summary>
+            public int SequenceIdCount => sequenceIndicesById.Length;
+
+            private static int[] BuildSequenceIndicesById(Sequence[] sequences)
+            {
+                var ids = new int[sequences.Length];
+                var count = 0;
+
+                for (var i = 0; i < sequences.Length; i++)
+                {
+                    ids[i] = GetLookupId(sequences[i]);
+                    count = Math.Max(count, ids[i] + 1);
+                }
+
+                var indices = new int[count];
+                Array.Fill(indices, -1);
+
+                for (var i = 0; i < sequences.Length; i++)
+                {
+                    if (ids[i] >= 0)
+                    {
+                        indices[ids[i]] = i;
+                    }
+                }
+
+                return indices;
+            }
+
+            // TODO: Whether an empty name counts as all digits is not known; it is treated as a name
+            private static int GetLookupId(Sequence sequence)
+            {
+                var name = sequence.Name;
+
+                if (name == UnnamedSequenceName)
+                {
+                    return (int)sequence.Id;
+                }
+
+                if (name.Length == 0 || !name.All(char.IsAsciiDigit))
+                {
+                    return -1;
+                }
+
+                return int.TryParse(name, NumberStyles.None, CultureInfo.InvariantCulture, out var id) ? id : -1;
+            }
+        }
+
+        /// <summary>
+        /// Gets the block size in bytes for the current texture format.
+        /// </summary>
+        public int BlockSize => Format switch
+        {
+            VTexFormat.DXT1 => 8,
+            VTexFormat.DXT5 => 16,
+            VTexFormat.RGBA8888 => 4,
+            VTexFormat.R16 => 2,
+            VTexFormat.RG1616 => 4,
+            VTexFormat.RGBA16161616 => 8,
+            VTexFormat.R16F => 2,
+            VTexFormat.RG1616F => 4,
+            VTexFormat.RGBA16161616F => 8,
+            VTexFormat.R32F => 4,
+            VTexFormat.RG3232F => 8,
+            VTexFormat.RGB323232F => 12,
+            VTexFormat.RGBA32323232F => 16,
+            VTexFormat.BC6H => 16,
+            VTexFormat.BC7 => 16,
+            VTexFormat.IA88 => 2,
+            VTexFormat.ETC2 => 8,
+            VTexFormat.ETC2_EAC => 16,
+            VTexFormat.R11_EAC => 8,
+            VTexFormat.RG11_EAC => 16,
+            VTexFormat.BGRA8888 => 4,
+            VTexFormat.ATI1N => 8,
+            VTexFormat.ATI2N => 16,
+            VTexFormat.R32_UINT => 4,
+            _ => 1,
+        };
+
+        /// <summary>
+        /// Gets a value indicating whether this texture stores 4x4 blocks rather than individual pixels.
+        /// </summary>
+        public bool IsBlockCompressed => Format
+            is VTexFormat.DXT1
+            or VTexFormat.DXT5
+            or VTexFormat.BC6H
+            or VTexFormat.BC7
+            or VTexFormat.ETC2
+            or VTexFormat.ETC2_EAC
+            or VTexFormat.R11_EAC
+            or VTexFormat.RG11_EAC
+            or VTexFormat.ATI1N
+            or VTexFormat.ATI2N;
+
+        /// <inheritdoc/>
+        public override BlockType Type => BlockType.DATA;
+
+        private BinaryReader? Reader => Resource.Reader;
+        private long DataOffset => Offset + Size;
+
+        /// <summary>
+        /// Gets the texture version number.
+        /// </summary>
+        public ushort Version { get; private set; }
+
+        /// <summary>
+        /// Gets the width of the texture in pixels.
+        /// </summary>
+        public ushort Width { get; private set; }
+
+        /// <summary>
+        /// Gets the height of the texture in pixels.
+        /// </summary>
+        public ushort Height { get; private set; }
+
+        /// <summary>
+        /// Gets the depth of the texture for volume textures, or the number of array slices.
+        /// </summary>
+        public ushort Depth { get; private set; }
+
+        /// <summary>
+        /// Gets the reflectivity values as a 4-component vector (RGBA).
+        /// </summary>
+        public Vector4 Reflectivity { get; private set; }
+
+        /// <summary>
+        /// Gets the texture flags that define various properties and behaviors.
+        /// </summary>
+        public VTexFlags Flags { get; private set; }
+
+        /// <summary>
+        /// Gets the pixel format of the texture data.
+        /// </summary>
+        public VTexFormat Format { get; private set; }
+
+        /// <summary>
+        /// Gets the number of mip levels in the texture.
+        /// </summary>
+        public byte NumMipLevels { get; private set; }
+
+        /// <summary>
+        /// Gets the picmip 0 resolution value. Unused, always 0 in modern files.
+        /// </summary>
+        public uint Picmip0Res { get; private set; }
+
+        /// <summary>
+        /// Gets the dictionary containing extra data blocks associated with the texture.
+        /// </summary>
+        public Dictionary<VTexExtraData, byte[]> ExtraData { get; private set; }
+
+        /// <summary>
+        /// Gets the width of the sub-rect of the texture that should actually be displayed.
+        /// Zero when it does not fit within <see cref="Width"/>.
+        /// </summary>
+        public ushort DisplayRectWidth { get; private set; }
+
+        /// <summary>
+        /// Gets the height of the sub-rect of the texture that should actually be displayed.
+        /// Zero when it does not fit within <see cref="Height"/>.
+        /// </summary>
+        public ushort DisplayRectHeight { get; private set; }
+
+        /// <summary>
+        /// Gets the maximum distance in pixels that a motion vector texture may displace per frame.
+        /// Zero for regular textures.
+        /// </summary>
+        public short MotionVectorsMaxDistance { get; private set; }
+
+        /// <summary>
+        /// Gets the lower bound of the value range each channel was remapped from, only used by
+        /// textures that store range compressed data such as spherical harmonics.
+        /// </summary>
+        public Vector4 RangeMin { get; private set; }
+
+        /// <summary>
+        /// Gets the upper bound of the value range each channel was remapped from, only used by
+        /// textures that store range compressed data such as spherical harmonics.
+        /// </summary>
+        public Vector4 RangeMax { get; private set; }
+
+        private enum MipCompressionMethod
+        {
+            None,
+            LZ4,
+            Zstd,
+        }
+
+        private int[]? CompressedMips;
+        private MipCompressionMethod MipCompression;
+
+        /// <summary>
+        /// Gets the baked radiance of each cube map in the array as an L2 spherical harmonic,
+        /// 9 coefficients per channel stored planar, 27 per cube map. Null unless the texture
+        /// carries <see cref="VTexExtraData.CUBEMAP_RADIANCE_SH"/>.
+        /// </summary>
+        public float[]? RadianceCoefficients { get; private set; }
+
+        /// <summary>
+        /// Gets the actual width of the texture, using <see cref="DisplayRectWidth"/> if available and valid, otherwise <see cref="Width"/>.
+        /// Some textures have displayrect set to 1x1, but that's not the expected size.
+        /// If it's set to 1x1, but the real size does not expand to 4x4 (the usual block compression size), it's ignored.
+        /// </summary>
+        public ushort ActualWidth => DisplayRectWidth > 0 && (DisplayRectWidth != 1 || Width == 4) ? DisplayRectWidth : Width;
+
+        /// <summary>
+        /// Gets the actual height of the texture, using <see cref="DisplayRectHeight"/> if available and valid, otherwise <see cref="Height"/>.
+        /// Some textures have displayrect set to 1x1, but that's not the expected size.
+        /// If it's set to 1x1, but the real size does not expand to 4x4 (the usual block compression size), it's ignored.
+        /// </summary>
+        public ushort ActualHeight => DisplayRectHeight > 0 && (DisplayRectHeight != 1 || Height == 4) ? DisplayRectHeight : Height;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="Texture"/> class.
+        /// </summary>
+        public Texture()
+        {
+            ExtraData = [];
+        }
+
+        /// <inheritdoc/>
+        public override void Read(BinaryReader reader)
+        {
+            reader.BaseStream.Position = Offset;
+
+            if (Resource.Version == 0)
+            {
+                ReadLegacyHeader(reader);
+                return;
+            }
+
+            Version = reader.ReadUInt16();
+
+            if (Version != 1)
+            {
+                throw new UnexpectedMagicException("Unknown vtex version", Version, nameof(Version));
+            }
+
+            Flags = (VTexFlags)reader.ReadUInt16();
+
+            Reflectivity = new(
+                reader.ReadSingle(),
+                reader.ReadSingle(),
+                reader.ReadSingle(),
+                reader.ReadSingle()
+            );
+            Width = reader.ReadUInt16();
+            Height = reader.ReadUInt16();
+            Depth = reader.ReadUInt16();
+            Format = (VTexFormat)reader.ReadByte();
+            NumMipLevels = reader.ReadByte();
+            Picmip0Res = reader.ReadUInt32();
+
+            var extraDataOffset = reader.ReadUInt32();
+            var extraDataCount = reader.ReadUInt32();
+
+            if (extraDataCount > 0)
+            {
+                reader.BaseStream.Position += extraDataOffset - 8; // 8 is 2 uint32s we just read
+
+                ExtraData.EnsureCapacity((int)extraDataCount);
+
+                for (var i = 0; i < extraDataCount; i++)
+                {
+                    var type = (VTexExtraData)reader.ReadUInt32();
+                    var offset = reader.ReadUInt32() - 8;
+                    var size = reader.ReadUInt32();
+
+                    var prevOffset = reader.BaseStream.Position;
+
+                    reader.BaseStream.Position += offset;
+                    ExtraData.Add(type, reader.ReadBytes((int)size));
+                    reader.BaseStream.Position -= size;
+
+                    if (type == VTexExtraData.METADATA)
+                    {
+                        // This block is the on-disk tail of the engine's texture description, always padded to 128 bytes.
+                        reader.ReadUInt16(); // Always zero in every file we have seen
+
+                        var displayRectWidth = reader.ReadUInt16();
+                        var displayRectHeight = reader.ReadUInt16();
+                        MotionVectorsMaxDistance = reader.ReadInt16();
+
+                        // The display rect is authored against the source image, so it can exceed the compiled size
+                        if (displayRectWidth > 0 && displayRectHeight > 0 && Width >= displayRectWidth && Height >= displayRectHeight)
+                        {
+                            DisplayRectWidth = displayRectWidth;
+                            DisplayRectHeight = displayRectHeight;
+                        }
+
+                        RangeMin = new(
+                            reader.ReadSingle(),
+                            reader.ReadSingle(),
+                            reader.ReadSingle(),
+                            reader.ReadSingle()
+                        );
+                        RangeMax = new(
+                            reader.ReadSingle(),
+                            reader.ReadSingle(),
+                            reader.ReadSingle(),
+                            reader.ReadSingle()
+                        );
+
+                        // The remaining 88 bytes are padding.
+                    }
+                    else if (type == VTexExtraData.COMPRESSED_MIP_SIZE)
+                    {
+                        var compressionMethod = reader.ReadUInt32();
+                        var mipsOffset = reader.ReadUInt32();
+                        var mips = reader.ReadUInt32();
+
+                        MipCompression = compressionMethod switch
+                        {
+                            0 => MipCompressionMethod.None,
+                            1 => MipCompressionMethod.LZ4,
+                            2 => MipCompressionMethod.Zstd,
+                            _ => throw new UnexpectedMagicException("Unknown mip compression method", compressionMethod, nameof(compressionMethod)),
+                        };
+
+                        CompressedMips = new int[mips];
+
+                        reader.BaseStream.Position += mipsOffset - 8;
+
+                        for (var mip = 0; mip < mips; mip++)
+                        {
+                            CompressedMips[mip] = reader.ReadInt32();
+                        }
+                    }
+                    else if (type == VTexExtraData.CUBEMAP_RADIANCE_SH)
+                    {
+                        var coeffsOffset = reader.ReadUInt32();
+                        var coeffs = reader.ReadUInt32();
+
+                        //Spherical Harmonics
+                        RadianceCoefficients = new float[coeffs];
+
+                        reader.BaseStream.Position += coeffsOffset - 8;
+
+                        for (var c = 0; c < coeffs; c++)
+                        {
+                            RadianceCoefficients[c] = reader.ReadSingle();
+                        }
+                    }
+
+                    reader.BaseStream.Position = prevOffset;
+                }
+            }
+        }
+
+        private void ReadLegacyHeader(BinaryReader reader)
+        {
+            Width = reader.ReadUInt16();
+            Height = reader.ReadUInt16();
+            Depth = reader.ReadUInt16();
+
+            var imageFormat = (LegacyImageFormat)reader.ReadSByte();
+            Format = imageFormat switch
+            {
+                LegacyImageFormat.RGBA8888 => VTexFormat.RGBA8888,
+                LegacyImageFormat.I8 => VTexFormat.I8,
+                LegacyImageFormat.DXT1 => VTexFormat.DXT1,
+                LegacyImageFormat.DXT5 => VTexFormat.DXT5,
+                LegacyImageFormat.RG1616 => VTexFormat.RG1616,
+                _ => throw new UnexpectedMagicException("Unsupported image format", (int)imageFormat, nameof(imageFormat)),
+            };
+
+            NumMipLevels = reader.ReadByte();
+            Picmip0Res = reader.ReadUInt32();
+            reader.ReadUInt16(); // Multisample type
+
+            // These flags start four bits higher than in later versions
+            Flags = (VTexFlags)(reader.ReadUInt16() >> 4);
+
+            Reflectivity = new(
+                reader.ReadSingle(),
+                reader.ReadSingle(),
+                reader.ReadSingle(),
+                reader.ReadSingle()
+            );
+        }
+
+        /// <summary>
+        /// Retrieves sprite sheet data if available in the texture's extra data.
+        /// </summary>
+        /// <returns>The sprite sheet data, or null if not available.</returns>
+        public SpritesheetData? GetSpriteSheetData()
+        {
+            if (ExtraData.TryGetValue(VTexExtraData.SHEET, out var bytes))
+            {
+                using var memoryStream = new MemoryStream(bytes);
+                using var reader = new BinaryReader(memoryStream);
+                var sequencesOffset = reader.ReadInt32();
+                var numSequences = reader.ReadUInt32();
+
+                reader.BaseStream.Position = sequencesOffset;
+
+                var sequences = new SpritesheetData.Sequence[numSequences];
+
+                for (var s = 0; s < numSequences; s++)
+                {
+                    var sequence = new SpritesheetData.Sequence
+                    {
+                        Id = reader.ReadUInt32(),
+                        Clamp = reader.ReadBoolean(),
+                        AlphaCrop = reader.ReadBoolean(),
+                        NoColor = reader.ReadBoolean(),
+                        NoAlpha = reader.ReadBoolean(),
+                    };
+                    var framesOffset = reader.BaseStream.Position + reader.ReadInt32();
+                    var numFrames = reader.ReadUInt32();
+                    sequence.TotalTime = reader.ReadSingle();
+                    sequence.Name = reader.ReadOffsetString(Encoding.UTF8);
+                    var floatParamsOffset = reader.BaseStream.Position + reader.ReadInt32();
+                    var floatParamsCount = reader.ReadUInt32();
+
+                    var endOfHeaderOffset = reader.BaseStream.Position;
+
+                    if (floatParamsCount > 0)
+                    {
+                        reader.BaseStream.Position = floatParamsOffset;
+
+                        for (var p = 0; p < floatParamsCount; p++)
+                        {
+                            var floatName = reader.ReadOffsetString(Encoding.UTF8);
+                            var floatValue = reader.ReadSingle();
+
+                            sequence.FloatParams.Add(floatName, floatValue);
+                        }
+                    }
+
+                    reader.BaseStream.Position = framesOffset;
+
+                    sequence.Frames = new SpritesheetData.Sequence.Frame[numFrames];
+
+                    for (var f = 0; f < numFrames; f++)
+                    {
+                        var displayTime = reader.ReadSingle();
+                        var imageOffset = reader.BaseStream.Position + reader.ReadInt32();
+                        var imageCount = reader.ReadUInt32();
+                        var originalOffset = reader.BaseStream.Position;
+
+                        var images = new SpritesheetData.Sequence.Frame.Image[imageCount];
+                        sequence.Frames[f] = new SpritesheetData.Sequence.Frame
+                        {
+                            DisplayTime = displayTime,
+                            Images = images,
+                        };
+
+                        reader.BaseStream.Position = imageOffset;
+
+                        for (var i = 0; i < images.Length; i++)
+                        {
+                            images[i] = new SpritesheetData.Sequence.Frame.Image
+                            {
+                                // uvCropped
+                                CroppedMin = new Vector2(reader.ReadSingle(), reader.ReadSingle()),
+                                CroppedMax = new Vector2(reader.ReadSingle(), reader.ReadSingle()),
+
+                                // uvUncropped
+                                UncroppedMin = new Vector2(reader.ReadSingle(), reader.ReadSingle()),
+                                UncroppedMax = new Vector2(reader.ReadSingle(), reader.ReadSingle()),
+                            };
+                        }
+
+                        reader.BaseStream.Position = originalOffset;
+                    }
+
+                    reader.BaseStream.Position = endOfHeaderOffset;
+
+                    sequences[s] = sequence;
+                }
+
+                return new SpritesheetData
+                {
+                    Sequences = sequences,
+                };
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Gets a value indicating whether this texture uses a high dynamic range format.
+        /// </summary>
+        public bool IsHighDynamicRange => Format
+            is VTexFormat.R16
+            or VTexFormat.RG1616
+            or VTexFormat.RGBA16161616
+            or VTexFormat.R16F
+            or VTexFormat.RG1616F
+            or VTexFormat.RGBA16161616F
+            or VTexFormat.R32F
+            or VTexFormat.RG3232F
+            or VTexFormat.RGB323232F
+            or VTexFormat.RGBA32323232F
+            or VTexFormat.BC6H;
+
+        /// <summary>
+        /// Gets a value indicating whether this texture contains raw image data, not block data.
+        /// </summary>
+        public bool IsRawAnyImage => IsRawJpeg || IsRawPng || IsRawWebp;
+
+        /// <summary>
+        /// Gets a value indicating whether this texture contains raw JPEG data.
+        /// </summary>
+        public bool IsRawJpeg => Format is VTexFormat.JPEG_DXT5 or VTexFormat.JPEG_RGBA8888;
+
+        /// <summary>
+        /// Gets a value indicating whether this texture contains raw PNG data.
+        /// </summary>
+        public bool IsRawPng => Format is VTexFormat.PNG_DXT5 or VTexFormat.PNG_RGBA8888;
+
+        /// <summary>
+        /// Gets a value indicating whether this texture contains raw WebP data.
+        /// </summary>
+        public bool IsRawWebp => Format is VTexFormat.WEBP_DXT5 or VTexFormat.WEBP_RGBA8888;
+
+        /// <summary>
+        /// Reads the raw image data for PNG, JPEG, or WebP textures.
+        /// </summary>
+        /// <returns>The raw image data as a byte array, or null if not a raw image format.</returns>
+        internal byte[]? ReadRawImageData()
+        {
+            if (IsRawAnyImage)
+            {
+                Debug.Assert(Reader is not null);
+
+                lock (Resource.ReaderLock)
+                {
+                    Reader.BaseStream.Position = DataOffset;
+                    SkipMipmaps(0);
+                    return Reader.ReadBytes(CalculateTextureDataSize());
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// The default color type used for standard dynamic range bitmaps.
+        /// </summary>
+        public const SKColorType DefaultBitmapColorType = SKColorType.Bgra8888;
+
+        /// <summary>
+        /// The color type used for high dynamic range bitmaps.
+        /// </summary>
+        public const SKColorType HdrBitmapColorType = SKColorType.RgbaF32;
+
+        /// <summary>
+        /// Generate a bitmap for given parameters.
+        /// </summary>
+        /// <param name="depth">The depth to extract.</param>
+        /// <param name="face">The face to extract for cube textures.</param>
+        /// <param name="mipLevel">The mip level to extract.</param>
+        /// <param name="decodeFlags">The preferred codec to use when decoding the texture. Flags set alongside <see cref="TextureCodec.Auto"/> are added to the detected ones.</param>
+        /// <returns>Skia bitmap.</returns>
+        public SKBitmap GenerateBitmap(uint depth = 0, CubemapFace face = 0, uint mipLevel = 0, TextureCodec decodeFlags = TextureCodec.Auto)
+        {
+            Debug.Assert(Reader is not null);
+            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(mipLevel, NumMipLevels, nameof(mipLevel));
+
+            var depthMip = (Flags & VTexFlags.VOLUME_TEXTURE) == 0 ? Depth : MathUtils.MipLevelSize(Depth, (int)mipLevel);
+            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(depth, (uint)depthMip, nameof(depth));
+
+            if (face > 0)
+            {
+                if ((Flags & VTexFlags.CUBE_TEXTURE) == 0)
+                {
+                    throw new ArgumentException($"This is not a cubemap texture.", nameof(face));
+                }
+
+                ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual((int)face, 6, nameof(face));
+            }
+
+            var width = MathUtils.MipLevelSize(ActualWidth, (int)mipLevel);
+            var height = MathUtils.MipLevelSize(ActualHeight, (int)mipLevel);
+
+            switch (Format)
+            {
+                case VTexFormat.JPEG_DXT5:
+                case VTexFormat.JPEG_RGBA8888:
+                    return DecodeRawImage(CalculateJpegSize());
+
+                case VTexFormat.PNG_DXT5:
+                case VTexFormat.PNG_RGBA8888:
+                    return DecodeRawImage(CalculatePngSize());
+
+                case VTexFormat.WEBP_DXT5:
+                case VTexFormat.WEBP_RGBA8888:
+                    return DecodeRawImage(CalculateWebpSize());
+            }
+
+            var isHdrBitmap = IsHighDynamicRange && !decodeFlags.HasFlag(TextureCodec.ForceLDR);
+            var removeDecodeFlags = IsHighDynamicRange
+                ? (TextureCodec.ColorSpaceLinear | TextureCodec.ColorSpaceSrgb)
+                : TextureCodec.None;
+
+            decodeFlags = decodeFlags.HasFlag(TextureCodec.Auto)
+                ? (RetrieveCodecFromResourceEditInfo() & ~removeDecodeFlags) | (decodeFlags & ~TextureCodec.Auto)
+                : decodeFlags;
+
+            var colorType = isHdrBitmap
+                ? HdrBitmapColorType
+                : DefaultBitmapColorType;
+
+            var skiaBitmap = new SKBitmap(width, height, colorType, SKAlphaType.Unpremul);
+
+            // GPU decoder calls into <see cref="GetEveryMipLevelTexture"/> which sets the reader offset on its own
+            if (HardwareAcceleratedTextureDecoder.Decoder?.Decode(skiaBitmap, Resource, depth, face, mipLevel, decodeFlags) == true)
+            {
+                return skiaBitmap;
+            }
+
+            var uncompressedSize = CalculateBufferSizeForMipLevel(mipLevel);
+            var buf = ArrayPool<byte>.Shared.Rent(uncompressedSize);
+
+            try
+            {
+                var span = buf.AsSpan(0, uncompressedSize);
+
+                lock (Resource.ReaderLock)
+                {
+                    Reader.BaseStream.Position = DataOffset;
+                    SkipMipmaps(mipLevel);
+                    ReadTexture(mipLevel, span);
+                }
+
+                if ((Flags & VTexFlags.CUBE_TEXTURE) != 0)
+                {
+                    var faceSize = uncompressedSize / (6 * Depth);
+                    var faceOffset = 0;
+
+                    if (depth > 0)
+                    {
+                        faceOffset = faceSize * (int)depth * 6;
+                    }
+
+                    faceOffset += faceSize * (int)face;
+
+                    span = span[faceOffset..(faceOffset + faceSize)];
+                }
+                else if (depth > 0)
+                {
+                    var faceSize = uncompressedSize / depthMip;
+                    var faceOffset = faceSize * (int)depth;
+                    faceOffset += faceSize * (int)face;
+
+                    span = span[faceOffset..(faceOffset + faceSize)];
+                }
+
+                var decoder = CreateDecoder(mipLevel);
+                decoder.Decode(skiaBitmap, span);
+
+                Common.ApplyTextureConversions(skiaBitmap, decodeFlags);
+
+                var bitmapToReturn = skiaBitmap;
+                skiaBitmap = null;
+                return bitmapToReturn;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+                skiaBitmap?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Decompress every slice of one block compressed mip level into RGBA8.
+        /// </summary>
+        /// <param name="compressedSource">Compressed mip level, as returned by <see cref="GetEveryMipLevelTexture"/>.</param>
+        /// <param name="dest">Buffer of at least <c>width * height * depth * 4</c> bytes.</param>
+        /// <param name="width">Width of the mip level.</param>
+        /// <param name="height">Height of the mip level.</param>
+        /// <param name="depth">Number of slices in the mip level to decode if this is 2DArray or 3D.</param>
+        public void DecodeTexture(ReadOnlySpan<byte> compressedSource, Span<byte> dest, int width, int height, int depth = 1)
+        {
+            var blockFormat = Format switch
+            {
+                VTexFormat.DXT1 => BlockFormat.BC1NoAlpha,
+                VTexFormat.DXT5 => BlockFormat.BC3,
+                VTexFormat.ATI1N => BlockFormat.BC4U,
+                VTexFormat.ATI2N => BlockFormat.BC5U,
+                VTexFormat.BC7 => BlockFormat.BC7,
+                _ => throw new NotSupportedException($"Texture format {Format} can not be decompressed to RGBA8."),
+            };
+
+            var decoder = BlockDecoder.Create(blockFormat);
+            var sourceSliceSize = BlockDecoder.SourceSize(width, height, blockFormat);
+            var destinationSliceSize = width * height * 4;
+
+            for (var slice = 0; slice < depth; slice++)
+            {
+                decoder.Decode(
+                    compressedSource.Slice(slice * sourceSliceSize, sourceSliceSize),
+                    width,
+                    height,
+                    dest.Slice(slice * destinationSliceSize, destinationSliceSize)
+                );
+            }
+        }
+
+        private ITextureDecoder CreateDecoder(uint mipLevel)
+        {
+            var blockWidth = MathUtils.MipLevelSize(Width, (int)mipLevel);
+            var blockHeight = MathUtils.MipLevelSize(Height, (int)mipLevel);
+
+            return Format switch
+            {
+                // BCn
+                VTexFormat.DXT1 => new DecodeBCn(blockWidth, blockHeight, TinyBCSharp.BlockFormat.BC1NoAlpha),
+                VTexFormat.DXT5 => new DecodeBCn(blockWidth, blockHeight, TinyBCSharp.BlockFormat.BC3),
+                VTexFormat.ATI1N => new DecodeBCn(blockWidth, blockHeight, TinyBCSharp.BlockFormat.BC4U),
+                VTexFormat.ATI2N => new DecodeBCn(blockWidth, blockHeight, TinyBCSharp.BlockFormat.BC5U),
+                VTexFormat.BC6H => new DecodeBCn(blockWidth, blockHeight, TinyBCSharp.BlockFormat.BC6HUf32),
+                VTexFormat.BC7 => new DecodeBCn(blockWidth, blockHeight, TinyBCSharp.BlockFormat.BC7),
+
+                // ETC
+                VTexFormat.ETC2 => new DecodeETC2(blockWidth, blockHeight),
+                VTexFormat.ETC2_EAC => new DecodeETC2EAC(blockWidth, blockHeight),
+                VTexFormat.R11_EAC => new DecodeR11EAC(blockWidth, blockHeight),
+                VTexFormat.RG11_EAC => new DecodeRG11EAC(blockWidth, blockHeight),
+
+                // Simple colors
+                VTexFormat.I8 => new DecodeI8(),
+                VTexFormat.RGBA8888 => new DecodeRGBA8888(),
+                VTexFormat.R16 => new DecodeR16(),
+                VTexFormat.RG1616 => new DecodeRG1616(),
+                VTexFormat.RGBA16161616 => new DecodeRGBA16161616(),
+                VTexFormat.R16F => new DecodeR16F(),
+                VTexFormat.RG1616F => new DecodeRG1616F(),
+                VTexFormat.RGBA16161616F => new DecodeRGBA16161616F(),
+                VTexFormat.R32F => new DecodeR32F(),
+                VTexFormat.RG3232F => new DecodeRG3232F(),
+                VTexFormat.RGB323232F => new DecodeRGB323232F(),
+                VTexFormat.RGBA32323232F => new DecodeRGBA32323232F(),
+                VTexFormat.IA88 => new DecodeIA88(),
+                VTexFormat.BGRA8888 => new DecodeBGRA8888(),
+                VTexFormat.R8_UNORM => new DecodeR8(),
+                VTexFormat.R32_UINT => new DecodeR32UInt(),
+                _ => throw new UnexpectedMagicException("Unhandled image type", (int)Format, nameof(Format))
+            };
+        }
+
+        /// <summary>
+        /// Calculates the total size of texture data across all mip levels.
+        /// </summary>
+        /// <returns>The total size in bytes.</returns>
+        public int CalculateTextureDataSize()
+        {
+            if (IsRawJpeg)
+            {
+                return CalculateJpegSize();
+            }
+
+            if (IsRawPng)
+            {
+                return CalculatePngSize();
+            }
+
+            if (IsRawWebp)
+            {
+                return CalculateWebpSize();
+            }
+
+            var bytes = 0;
+
+            if (CompressedMips != null)
+            {
+                bytes = CompressedMips.Sum();
+            }
+            else
+            {
+                for (var j = 0u; j < NumMipLevels; j++)
+                {
+                    bytes += CalculateBufferSizeForMipLevel(j);
+                }
+            }
+
+            return bytes;
+        }
+
+        /// <summary>
+        /// Calculate buffer size that is required to hold data of specified mip level.
+        /// </summary>
+        /// <param name="mipLevel">Mip level for which to calculate buffer size.</param>
+        /// <returns>Buffer size.</returns>
+        public int CalculateBufferSizeForMipLevel(uint mipLevel)
+        {
+            var (width, height, depth) = CalculateTextureSizesForMipLevel(mipLevel);
+
+            return CalculateBufferSizeForMipLevel(width, height, depth);
+        }
+
+        private (int Width, int Height, int Depth) CalculateTextureSizesForMipLevel(uint mipLevel)
+        {
+            var width = MathUtils.MipLevelSize(Width, (int)mipLevel);
+            var height = MathUtils.MipLevelSize(Height, (int)mipLevel);
+            var depth = (Flags & VTexFlags.VOLUME_TEXTURE) == 0 ? Depth : MathUtils.MipLevelSize(Depth, (int)mipLevel);
+
+            if ((Flags & VTexFlags.CUBE_TEXTURE) != 0)
+            {
+                depth *= 6;
+            }
+
+            return (width, height, depth);
+        }
+
+        private int CalculateBufferSizeForMipLevel(int width, int height, int depth)
+        {
+            var bytesPerPixel = BlockSize;
+
+            if (IsBlockCompressed)
+            {
+                var misalign = width % 4;
+
+                if (misalign > 0)
+                {
+                    width += 4 - misalign;
+                }
+
+                misalign = height % 4;
+
+                if (misalign > 0)
+                {
+                    height += 4 - misalign;
+                }
+
+                if (width < 4 && width > 0)
+                {
+                    width = 4;
+                }
+
+                if (height < 4 && height > 0)
+                {
+                    height = 4;
+                }
+
+                if (depth < 4 && depth > 1)
+                {
+                    depth = 4;
+                }
+
+                var numBlocks = (width * height) >> 4;
+
+                return numBlocks * depth * bytesPerPixel;
+            }
+
+            return width * height * depth * bytesPerPixel;
+        }
+
+        private void SkipMipmaps(uint desiredMipLevel)
+        {
+            Debug.Assert(Reader is not null);
+
+            if (NumMipLevels < 2)
+            {
+                return;
+            }
+
+            for (var j = NumMipLevels - 1u; j > desiredMipLevel; j--)
+            {
+                var size = CalculateBufferSizeForMipLevel(j);
+
+                if (CompressedMips != null)
+                {
+                    var compressedSize = CompressedMips[j];
+
+                    if (size > compressedSize)
+                    {
+                        size = compressedSize;
+                    }
+                }
+
+                Reader.BaseStream.Position += size;
+            }
+        }
+
+        private void ReadTexture(uint mipLevel, Span<byte> output)
+        {
+            Debug.Assert(Reader is not null);
+
+            if (MipCompression == MipCompressionMethod.None || CompressedMips == null)
+            {
+                Reader.ReadExactly(output);
+                return;
+            }
+
+            var compressedSize = CompressedMips[mipLevel];
+
+            if (compressedSize >= output.Length)
+            {
+                Reader.ReadExactly(output);
+                return;
+            }
+
+            if (MipCompression == MipCompressionMethod.Zstd)
+            {
+                throw new NotSupportedException("Zstd compressed texture mips are not supported.");
+            }
+
+            var buf = ArrayPool<byte>.Shared.Rent(compressedSize);
+
+            try
+            {
+                DecompressLz4Mip(buf.AsSpan(0, compressedSize), output);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+            }
+        }
+
+        private void DecompressLz4Mip(Span<byte> source, Span<byte> output)
+        {
+            Debug.Assert(Reader is not null);
+
+            Reader.ReadExactly(source);
+
+            var written = LZ4Codec.Decode(source, output);
+
+            if (written != output.Length)
+            {
+                throw new InvalidDataException($"Failed to decompress LZ4 (expected {output.Length} bytes, got {written}) (texture format is {Format}).");
+            }
+        }
+
+        /// <summary>
+        /// Biggest buffer size to be used with <see cref="GetEveryMipLevelTexture"/>.
+        /// </summary>
+        /// <returns>The size of the largest mip level (mip 0) in bytes.</returns>
+        public int GetBiggestBufferSize() => CalculateBufferSizeForMipLevel(0);
+
+        /// <summary>
+        /// Get every mip level size starting from the smallest one. Used when uploading textures to the GPU.
+        /// This writes into the buffer for every mip level, so the buffer must be used before next texture is yielded.
+        /// </summary>
+        /// <param name="buffer">Buffer to use when yielding textures, it should be size of <see cref="GetBiggestBufferSize"/> or bigger. This buffer is reused for every mip level.</param>
+        /// <param name="minMipLevelAllowed">The minimum mip level for which to read texture data.</param>
+        public IEnumerable<(uint Level, int Width, int Height, int Depth, int BufferSize)> GetEveryMipLevelTexture(byte[] buffer, int minMipLevelAllowed = 0)
+        {
+            Debug.Assert(Reader is not null);
+            long position = DataOffset;
+
+            foreach (var (mipLevel, width, height, depth, uncompressedSize) in GetEveryMipLevelMetrics())
+            {
+                if (mipLevel < minMipLevelAllowed)
+                {
+                    break;
+                }
+
+                lock (Resource.ReaderLock)
+                {
+                    Reader.BaseStream.Position = position;
+                    ReadTexture(mipLevel, buffer.AsSpan(0, uncompressedSize));
+                    position = Reader.BaseStream.Position;
+                }
+
+                yield return (mipLevel, width, height, depth, uncompressedSize);
+            }
+        }
+
+        /// <summary>
+        /// Get metrics like dimensions and buffer size for every mip level.
+        /// </summary>
+        /// <returns>An enumerable of tuples containing mip level, width, height, depth, and buffer size for each mip level, from smallest to largest.</returns>
+        public IEnumerable<(uint Level, int Width, int Height, int Depth, int BufferSize)> GetEveryMipLevelMetrics()
+        {
+            for (var i = NumMipLevels - 1; i >= 0; i--)
+            {
+                var mipLevel = (uint)i;
+                var (width, height, depth) = CalculateTextureSizesForMipLevel(mipLevel);
+                var uncompressedSize = CalculateBufferSizeForMipLevel(width, height, depth);
+
+                yield return (mipLevel, width, height, depth, uncompressedSize);
+            }
+        }
+
+        /// <summary>
+        /// Read single mip level of texture. Buffer size must be at least <see cref="CalculateBufferSizeForMipLevel(uint)"/>.
+        /// </summary>
+        /// <param name="output">Buffer that will receive texture data.</param>
+        /// <param name="mipLevel">Mip level for which to read texture data.</param>
+        public void ReadTextureMipLevel(Span<byte> output, uint mipLevel)
+        {
+            Debug.Assert(Reader is not null);
+
+            var bufferSize = CalculateBufferSizeForMipLevel(mipLevel);
+
+            if (bufferSize > output.Length)
+            {
+                throw new ArgumentException($"Buffer size ({output.Length}) must be at least {bufferSize}, mip level {mipLevel}");
+            }
+
+            lock (Resource.ReaderLock)
+            {
+                Reader.BaseStream.Position = DataOffset;
+                SkipMipmaps(mipLevel);
+                ReadTexture(mipLevel, output);
+            }
+        }
+
+        /// <summary>Calculate decompression buffer size for <see cref="ReadTextureMipLevelInPlace"/>.</summary>
+        public int CalculateInPlaceDecompressionBufferSize(uint mipLevel)
+        {
+            var uncompressedSize = CalculateBufferSizeForMipLevel(mipLevel);
+
+            if (MipCompression == MipCompressionMethod.LZ4 && CompressedMips != null && CompressedMips[mipLevel] < uncompressedSize)
+            {
+                // LZ4_DECOMPRESS_INPLACE_MARGIN from lz4.h
+                return uncompressedSize + (CompressedMips[mipLevel] >> 8) + 32;
+            }
+
+            return uncompressedSize;
+        }
+
+        /// <summary>
+        /// Read single mip level of texture into the front of <paramref name="buffer"/>. LZ4 compressed
+        /// mips are read into the buffer's tail and decompressed in place, so no scratch buffer is needed.
+        /// </summary>
+        /// <param name="buffer">Buffer that will receive texture data. Must be at least <see cref="CalculateInPlaceDecompressionBufferSize"/> bytes.</param>
+        /// <param name="mipLevel">Mip level for which to read texture data.</param>
+        public void ReadTextureMipLevelInPlace(Span<byte> buffer, uint mipLevel)
+        {
+            Debug.Assert(Reader is not null);
+
+            var requiredSize = CalculateInPlaceDecompressionBufferSize(mipLevel);
+
+            if (requiredSize > buffer.Length)
+            {
+                throw new ArgumentException($"Buffer size ({buffer.Length}) must be at least {requiredSize}, mip level {mipLevel}");
+            }
+
+            var uncompressedSize = CalculateBufferSizeForMipLevel(mipLevel);
+
+            // No margin means no in-place LZ4 decode is involved; the plain read path already does the job
+            if (requiredSize == uncompressedSize)
+            {
+                ReadTextureMipLevel(buffer[..uncompressedSize], mipLevel);
+                return;
+            }
+
+            var compressedSize = CompressedMips![mipLevel];
+
+            lock (Resource.ReaderLock)
+            {
+                Reader.BaseStream.Position = DataOffset;
+                SkipMipmaps(mipLevel);
+                DecompressLz4Mip(buffer.Slice(requiredSize - compressedSize, compressedSize), buffer[..uncompressedSize]);
+            }
+        }
+
+        private SKBitmap DecodeRawImage(int size)
+        {
+            Debug.Assert(Reader is not null);
+
+            var buffer = ArrayPool<byte>.Shared.Rent(size);
+
+            try
+            {
+                int read;
+
+                lock (Resource.ReaderLock)
+                {
+                    Reader.BaseStream.Position = DataOffset;
+                    read = Reader.BaseStream.ReadAtLeast(buffer.AsSpan(0, size), size, throwOnEndOfStream: false);
+                }
+
+                return SKBitmap.Decode(buffer.AsSpan(0, read));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        private int CalculateJpegSize()
+        {
+            Debug.Assert(Reader is not null);
+            return (int)(Reader.BaseStream.Length - DataOffset);
+        }
+
+        private int CalculatePngSize()
+        {
+            Debug.Assert(Reader is not null);
+
+            var size = 8; // PNG header
+
+            using var scope = Resource.ReaderLock.EnterScope();
+            var originalPosition = Reader.BaseStream.Position;
+
+            Reader.BaseStream.Position = DataOffset;
+
+            try
+            {
+                var pngHeaderA = Reader.ReadInt32();
+                var pngHeaderB = Reader.ReadInt32();
+
+                if (pngHeaderA != 0x474E5089)
+                {
+                    throw new UnexpectedMagicException("This is not PNG", pngHeaderA, nameof(pngHeaderA));
+                }
+
+                if (pngHeaderB != 0x0A1A0A0D)
+                {
+                    throw new UnexpectedMagicException("This is not PNG", pngHeaderB, nameof(pngHeaderB));
+                }
+
+                var chunk = 0;
+
+                // Scan all the chunks until IEND
+                do
+                {
+                    // Integers in png are big endian
+                    var number = Reader.ReadBytes(sizeof(uint));
+                    Array.Reverse(number);
+                    size += BitConverter.ToInt32(number);
+                    size += 12; // length + chunk type + crc
+
+                    chunk = Reader.ReadInt32();
+
+                    Reader.BaseStream.Position = DataOffset + size;
+                }
+                while (chunk != 0x444E4549);
+            }
+            finally
+            {
+                Reader.BaseStream.Position = originalPosition;
+            }
+
+            return size;
+        }
+
+        private int CalculateWebpSize()
+        {
+            Debug.Assert(Reader is not null);
+
+            using var scope = Resource.ReaderLock.EnterScope();
+            var originalPosition = Reader.BaseStream.Position;
+
+            Reader.BaseStream.Position = DataOffset;
+
+            try
+            {
+                var riffHeader = Reader.ReadInt32();
+                if (riffHeader != 0x46464952) // "RIFF"
+                {
+                    throw new UnexpectedMagicException("This is not WebP RIFF", riffHeader, nameof(riffHeader));
+                }
+
+                var fileSize = Reader.ReadUInt32();
+                var webpHeader = Reader.ReadInt32();
+
+                if (webpHeader != 0x50424557) // "WEBP"
+                {
+                    throw new UnexpectedMagicException("This is not WebP", webpHeader, nameof(webpHeader));
+                }
+
+                return (int)(8 + fileSize);
+            }
+            finally
+            {
+                Reader.BaseStream.Position = originalPosition;
+            }
+        }
+
+        /// <summary>
+        /// Retrieves the texture codec information from the resource's edit info.
+        /// </summary>
+        /// <returns>The texture codec flags derived from the edit info.</returns>
+        public TextureCodec RetrieveCodecFromResourceEditInfo()
+        {
+            var codec = TextureCodec.None;
+
+            if (IsRawAnyImage)
+            {
+                return codec;
+            }
+
+            if (Resource.EditInfo == null)
+            {
+                return codec;
+            }
+
+            var textureCompilerDependencies = Resource.EditInfo.SpecialDependencies
+                .Where(static dependency => dependency.CompilerIdentifier == "CompileTexture");
+            var isNormalMap = false;
+            var isAnisoRoughness_RG = false;
+
+            foreach (var processorAlgorithm in textureCompilerDependencies)
+            {
+                isNormalMap |= processorAlgorithm.String == "Texture Compiler Version Image NormalizeNormals";
+                isAnisoRoughness_RG |= processorAlgorithm.String == "Texture Compiler Version Mip AnisoRoughness_RG";
+
+                codec |= processorAlgorithm.String switch
+                {
+                    // Image processor algorithms
+                    "Texture Compiler Version Image YCoCg Conversion" => TextureCodec.YCoCg,
+
+                    // Mipmap processor algorithms
+                    "Texture Compiler Version Mip HemiOctNormal" => TextureCodec.HemiOctNormal,
+                    "Texture Compiler Version Mip HemiOctIsoRoughness_RG_B" => TextureCodec.HemiOctRB,
+                    "Texture Compiler Version Mip HemiOctAnisoRoughness" => TextureCodec.HemiOctRB, // do we lose one of the roughness components? (anisotropic is xy)
+                    _ => TextureCodec.None,
+                };
+            }
+
+            // Roughness generated from a normal map lists the normal map's processors, but only holds roughness in red and green
+            if (isAnisoRoughness_RG)
+            {
+                isNormalMap = false;
+                codec &= ~TextureCodec.HemiOctRB;
+            }
+
+            // BC5 blue channel is always 0, it is not roughness
+            if (Format == VTexFormat.ATI2N)
+            {
+                codec &= ~TextureCodec.BlueToAlpha;
+            }
+
+            // The normalize processor runs on the source image, but normal maps in these formats only store X and Y
+            if (isNormalMap && !codec.HasFlag(TextureCodec.HemiOctNormal))
+            {
+                codec |= Format switch
+                {
+                    VTexFormat.DXT5 => TextureCodec.Dxt5nm | TextureCodec.NormalizeNormals,
+                    VTexFormat.ATI2N => TextureCodec.NormalizeNormals,
+                    _ => TextureCodec.None,
+                };
+            }
+
+            if (codec.HasFlag(TextureCodec.YCoCg) && (Flags & VTexFlags.CUBE_TEXTURE) != 0)
+            {
+                // Skybox cubemaps store YCoCg in sRGB gamma space; flat panorama textures are raw (issue #1127).
+                codec |= TextureCodec.ColorSpaceSrgb;
+            }
+
+            if (IsHighDynamicRange)
+            {
+                codec |= TextureCodec.ColorSpaceLinear;
+            }
+
+            return codec;
+        }
+
+        /// <inheritdoc/>
+        public override void Serialize(Stream stream)
+        {
+            throw new NotImplementedException("Serializing this block is not yet supported. If you need this, send us a pull request!");
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// Outputs detailed texture metadata including dimensions, format, and flags.
+        /// </remarks>
+        public override void WriteText(IndentedTextWriter writer)
+        {
+            writer.WriteLine("{0,-12} = {1}", "VTEX Version", Version);
+            writer.WriteLine("{0,-12} = {1}", "Width", Width);
+            writer.WriteLine("{0,-12} = {1}", "Height", Height);
+            writer.WriteLine("{0,-12} = {1}", "Depth", Depth);
+            writer.WriteLine("{0,-12} = {1}", "DisplayRectW", DisplayRectWidth);
+            writer.WriteLine("{0,-12} = {1}", "DisplayRectH", DisplayRectHeight);
+            writer.WriteLine("{0,-12} = {1}", "MotionVecMax", MotionVectorsMaxDistance);
+            writer.WriteLine("{0,-12} = ( {1:F6}, {2:F6}, {3:F6}, {4:F6} )", "RangeMin", RangeMin.X, RangeMin.Y, RangeMin.Z, RangeMin.W);
+            writer.WriteLine("{0,-12} = ( {1:F6}, {2:F6}, {3:F6}, {4:F6} )", "RangeMax", RangeMax.X, RangeMax.Y, RangeMax.Z, RangeMax.W);
+            writer.WriteLine("{0,-12} = ( {1:F6}, {2:F6}, {3:F6}, {4:F6} )", "Reflectivity", Reflectivity[0], Reflectivity[1], Reflectivity[2], Reflectivity[3]);
+            writer.WriteLine("{0,-12} = {1}", "NumMipLevels", NumMipLevels);
+            writer.WriteLine("{0,-12} = {1}", "Picmip0Res", Picmip0Res);
+            writer.WriteLine("{0,-12} = {1} (VTEX_FORMAT_{2})", "Format", (int)Format, Format);
+
+            {
+                var flagIndex = 0;
+                var currentFlag = -1;
+                var flags = (int)Flags;
+
+                writer.WriteLine("{0,-12} = 0x{1:X8}", "Flags", flags);
+
+                while (flagIndex < flags)
+                {
+                    var flag = 1 << ++currentFlag;
+
+                    flagIndex += flag;
+
+                    if ((flag & flags) == 0)
+                    {
+                        continue;
+                    }
+
+                    if (Enum.IsDefined((VTexFlags)flag))
+                    {
+                        writer.WriteLine("{0,-12} | 0x{1:X8} = VTEX_FLAG_{2}", string.Empty, flag, (VTexFlags)flag);
+                    }
+                    else
+                    {
+                        writer.WriteLine("{0,-12} | 0x{1:X8} = <UNKNOWN>", string.Empty, flag);
+                    }
+                }
+            }
+
+            writer.WriteLine("{0,-12} = {1} entries:", "Extra Data", ExtraData.Count);
+
+            var entry = 0;
+
+            foreach (var b in ExtraData)
+            {
+                writer.WriteLine("{0,-12}   [ Entry {1}: VTEX_EXTRA_DATA_{2} - {3} bytes ]", string.Empty, entry++, b.Key, b.Value.Length);
+
+                if (b.Key == VTexExtraData.COMPRESSED_MIP_SIZE)
+                {
+                    if (CompressedMips != null)
+                    {
+                        writer.WriteLine("{0,-16}   [ {1} mips, sized: {2} ]", string.Empty, CompressedMips.Length, string.Join(", ", CompressedMips));
+                    }
+                }
+                else if (b.Key == VTexExtraData.CUBEMAP_RADIANCE_SH)
+                {
+                    if (RadianceCoefficients != null)
+                    {
+                        writer.WriteLine("{0,-16}   [ {1} coefficients: {2} ]", string.Empty, RadianceCoefficients.Length, string.Join(", ", RadianceCoefficients.Select(static value => value.ToString(CultureInfo.InvariantCulture))));
+                    }
+                }
+                else if (b.Key == VTexExtraData.SHEET)
+                {
+                    var data = GetSpriteSheetData();
+                    Debug.Assert(data != null);
+
+                    writer.WriteLine("{0,-16} {1} Sheet Sequences:", string.Empty, data.Sequences.Length);
+
+                    for (var s = 0; s < data.Sequences.Length; s++)
+                    {
+                        var sequence = data.Sequences[s];
+
+                        writer.WriteLine("{0,-16} [Sequence {1}]:", string.Empty, s);
+                        writer.WriteLine("{0,-16}   m_nId             = {1}", string.Empty, sequence.Id);
+                        writer.WriteLine("{0,-16}   m_name            = '{1}'", string.Empty, sequence.Name);
+                        writer.WriteLine("{0,-16}   m_bClamp          = {1}", string.Empty, sequence.Clamp);
+                        writer.WriteLine("{0,-16}   m_bAlphaCrop      = {1}", string.Empty, sequence.AlphaCrop);
+                        writer.WriteLine("{0,-16}   m_bNoColor        = {1}", string.Empty, sequence.NoColor);
+                        writer.WriteLine("{0,-16}   m_bNoAlpha        = {1}", string.Empty, sequence.NoAlpha);
+                        writer.WriteLine("{0,-16}   m_flTotalTime     = {1:F6}", string.Empty, sequence.TotalTime);
+                        writer.WriteLine("{0,-16}   {1} Float Params:", string.Empty, sequence.FloatParams.Count);
+
+                        foreach (var (floatName, floatValue) in sequence.FloatParams)
+                        {
+                            writer.WriteLine("{0,-16}     '{1}' = {2:F6}", string.Empty, floatName, floatValue);
+                        }
+
+                        writer.WriteLine("{0,-16}   {1} Frames:", string.Empty, sequence.Frames.Length);
+
+                        for (var f = 0; f < sequence.Frames.Length; f++)
+                        {
+                            var frame = sequence.Frames[f];
+
+                            writer.WriteLine("{0,-16}     [Sequence {1} Frame {2}]:", string.Empty, s, f);
+                            writer.WriteLine("{0,-16}       m_flDisplayTime  = {1:F6}", string.Empty, frame.DisplayTime);
+                            writer.WriteLine("{0,-16}       {1} Images:", string.Empty, frame.Images.Length);
+
+                            for (var i = 0; i < frame.Images.Length; i++)
+                            {
+                                var image = frame.Images[i];
+
+                                writer.WriteLine("{0,-16}         [{1}.{2}.{3}] uvCropped    = {{ ( {4:F6}, {5:F6} ), ( {6:F6}, {7:F6} ) }}", string.Empty, s, f, i, image.CroppedMin.X, image.CroppedMin.Y, image.CroppedMax.X, image.CroppedMax.Y);
+                                writer.WriteLine("{0,-16}         [{1}.{2}.{3}] uvUncropped  = {{ ( {4:F6}, {5:F6} ), ( {6:F6}, {7:F6} ) }}", string.Empty, s, f, i, image.UncroppedMin.X, image.UncroppedMin.Y, image.UncroppedMax.X, image.UncroppedMax.Y);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!IsRawAnyImage)
+            {
+                for (var j = 0u; j < NumMipLevels; j++)
+                {
+                    writer.WriteLine($"Mip level {j} - buffer size: {CalculateBufferSizeForMipLevel(j)}");
+                }
+            }
+        }
+    }
+}

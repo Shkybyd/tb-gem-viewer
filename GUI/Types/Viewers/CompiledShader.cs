@@ -1,0 +1,446 @@
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using GUI.Controls;
+using GUI.Utils;
+using ValveResourceFormat.IO;
+using static ValveResourceFormat.CompiledShader.ShaderUtilHelpers;
+
+namespace GUI.Types.Viewers
+{
+    class CompiledShader : IDisposable, IViewer
+    {
+        private readonly TextControl control;
+        private readonly TreeView fileListView;
+        private readonly Container components;
+        private readonly ThemedContextMenuStrip shaderFileContextMenu;
+        private readonly VrfGuiContext vrfGuiContext;
+        private VfxProgramData? featuresProgram;
+
+        public static bool IsAccepted(uint magic)
+        {
+            return magic == VfxProgramData.MAGIC;
+        }
+
+        public CompiledShader(VrfGuiContext vrfGuiContext)
+        {
+            this.vrfGuiContext = vrfGuiContext;
+            fileListView = new TreeViewDoubleBuffered
+            {
+                FullRowSelect = true,
+                HideSelection = false,
+                ShowRootLines = false,
+                ShowNodeToolTips = true,
+                Dock = DockStyle.Fill,
+                ImageList = AppIcons.ImageList,
+            };
+            fileListView.NodeMouseClick += OnNodeMouseClick;
+            Themer.ThemeControl(fileListView);
+
+            components = new Container();
+            shaderFileContextMenu = new ThemedContextMenuStrip(components)
+            {
+                ImageScalingSize = new System.Drawing.Size(24, 24),
+            };
+            var exportBytecodeMenuItem = new ThemedToolStripMenuItem
+            {
+                Text = "Export bytecode",
+                SVGImageResourceName = "GUI.Icons.Export.svg",
+            };
+            exportBytecodeMenuItem.Click += OnExportBytecodeClick;
+            shaderFileContextMenu.Items.Add(exportBytecodeMenuItem);
+
+            control = new TextControl(HighlightLanguage.Shaders);
+            control.AddControl(fileListView);
+        }
+
+        public async Task LoadAsync(Stream? stream)
+        {
+            // Creating shader collection doesn't actually use the provided stream which is kind of a waste
+            if (stream is not null)
+            {
+                await stream.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        public void Create(TabPage tab)
+        {
+            var filename = Path.GetFileName(vrfGuiContext.FileName);
+            var leadProgramType = ComputeVCSFileName(filename).ProgramType;
+            var vcsCollectionName = filename.AsSpan(0, filename.LastIndexOf('_')); // in the form water_dota_pcgl_40
+
+            var shaderCollection = ShaderCollection.GetShaderCollection(vrfGuiContext.FileName, vrfGuiContext.CurrentPackage);
+
+            Create(tab, shaderCollection, vcsCollectionName, leadProgramType);
+        }
+
+        public void Create(TabPage tab, ShaderCollection shaderCollection, ReadOnlySpan<char> vcsCollectionName, VcsProgramType leadProgramType, IDictionary<string, byte>? leadFeatureParams = null)
+        {
+            tab.Controls.Add(control);
+
+            var vfxImage = AppIcons.Icons["FolderShaders"];
+            var programImage = AppIcons.GetImageIndexForExtension("vcs");
+            var comboImage = AppIcons.GetImageIndexForExtension("pdi");
+
+            var materialCollectionIndex = 0;
+            var collectionNode = new TreeNode($"{vcsCollectionName}.vfx")
+            {
+                ImageIndex = vfxImage,
+                SelectedImageIndex = vfxImage,
+            };
+            fileListView.Nodes.Add(collectionNode);
+
+            List<string> comboNamesAbbrev = [];
+            List<string> comboNames = [];
+
+            Debug.Assert(shaderCollection.Features != null);
+            featuresProgram = shaderCollection.Features;
+
+            foreach (var program in shaderCollection.OrderBy(static x => x.VcsProgramType))
+            {
+                var truncatedProgramName = program.FilenamePath.AsSpan();
+
+                if (truncatedProgramName.StartsWith(vcsCollectionName))
+                {
+                    truncatedProgramName = truncatedProgramName[(vcsCollectionName.Length + 1)..];
+                }
+
+                var programNode = new TreeNode(truncatedProgramName.ToString())
+                {
+                    Tag = program,
+                    ImageIndex = programImage,
+                    SelectedImageIndex = programImage,
+                };
+                collectionNode.Nodes.Add(programNode);
+
+                if (program.StaticComboEntries.Count > 0)
+                {
+                    var configMapping = new ComboConfigMapping(program);
+                    var leadStaticComboId = -1L; // Shader file to be displayed for a particular material
+
+                    if (leadFeatureParams != null)
+                    {
+                        leadStaticComboId = ShaderDataProvider.ResolveStaticConfiguration(shaderCollection.Features, program, leadFeatureParams).StaticComboId;
+                    }
+
+                    foreach (var staticComboEntry in program.StaticComboEntries)
+                    {
+                        var config = configMapping.GetConfigState(staticComboEntry.Key);
+
+                        comboNames.Clear();
+                        comboNamesAbbrev.Clear();
+
+                        for (var i = 0; i < program.StaticComboArray.Length; i++)
+                        {
+                            if (config[i] == 0)
+                            {
+                                continue;
+                            }
+
+                            var staticCombo = program.StaticComboArray[i];
+                            var shortName = ShortenShaderParam(staticCombo.Name).ToLowerInvariant();
+
+                            if (config[i] > 1)
+                            {
+                                comboNames.Add($"{staticCombo.Name}={config[i]}");
+                                comboNamesAbbrev.Add($"{shortName}={config[i]}");
+                            }
+                            else
+                            {
+                                comboNames.Add(staticCombo.Name);
+                                comboNamesAbbrev.Add(shortName);
+                            }
+                        }
+
+                        var variantsAbbrev = comboNamesAbbrev.Count > 0 ? $" ({string.Join(", ", comboNamesAbbrev)})" : string.Empty;
+                        var variantsTooltip = string.Join(Environment.NewLine, comboNames);
+
+                        var comboNode = new TreeNode($"{staticComboEntry.Key:x08}{variantsAbbrev}")
+                        {
+                            ToolTipText = variantsTooltip,
+                            Tag = staticComboEntry.Value,
+                            ImageIndex = comboImage,
+                            SelectedImageIndex = comboImage,
+                        };
+                        programNode.Nodes.Add(comboNode);
+
+                        if (staticComboEntry.Key == leadStaticComboId)
+                        {
+                            // When viewing from a material, unserialize the correct static combo straight away
+                            var combo = staticComboEntry.Value.Unserialize();
+                            comboNode.Tag = combo;
+                            CreateStaticComboNodes(combo, comboNode);
+
+                            // Program files that do not store any ShaderFiles
+                            if (program.VcsProgramType == VcsProgramType.PixelShaderRenderState)
+                            {
+                                continue;
+                            }
+
+                            var shaderFile = combo.ShaderFiles[0];
+
+                            if (shaderFile.Bytecode.Length > 0)
+                            {
+                                var matImage = AppIcons.GetImageIndexForExtension("vmat");
+                                var matNode = new TreeNode($"Material {program.VcsProgramType}{variantsAbbrev}")
+                                {
+                                    ToolTipText = variantsTooltip,
+                                    Tag = combo.ShaderFiles[0],
+                                    ImageIndex = matImage,
+                                    SelectedImageIndex = matImage,
+                                };
+                                collectionNode.Nodes.Insert(materialCollectionIndex++, matNode);
+                            }
+                        }
+                    }
+
+                    if (program.VcsProgramType == leadProgramType)
+                    {
+                        programNode.Expand();
+                    }
+                }
+            }
+
+            collectionNode.Expand();
+
+            // ShaderExtract cannot continue without the features file present
+            if (shaderCollection.Features is not null)
+            {
+                var shaderExtract = new ShaderExtract(shaderCollection);
+
+                collectionNode.Tag = shaderExtract;
+                TryDisplayNode(collectionNode);
+            }
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                fileListView?.Dispose();
+                control?.Dispose();
+                components?.Dispose();
+                shaderFileContextMenu?.Dispose();
+            }
+        }
+
+        private void OnNodeMouseClick(object? sender, TreeNodeMouseClickEventArgs e)
+        {
+            if (e.Node == null)
+            {
+                return;
+            }
+
+            if (e.Button == MouseButtons.Right && e.Node.Tag is VfxShaderFile clickedShader)
+            {
+                if (clickedShader.Bytecode.Length > 0)
+                {
+                    shaderFileContextMenu.Tag = clickedShader;
+                    shaderFileContextMenu.Show(fileListView, e.Location);
+                }
+
+                return;
+            }
+
+            TryDisplayNode(e.Node);
+        }
+
+        private void TryDisplayNode(TreeNode node)
+        {
+            try
+            {
+                control.TextBox.ClearException();
+                DisplayNode(node);
+            }
+            catch (Exception ex)
+            {
+                var context = $"{node.Text} in {vrfGuiContext.DisplayPath}";
+                Log.Error(nameof(CompiledShader), $"Failed to display \"{context}\": {ex}");
+
+                control.TextBox.ShowException(ex, context);
+            }
+        }
+
+        private void DisplayNode(TreeNode node)
+        {
+            if (node.Tag is ShaderExtract shaderExtract)
+            {
+                control.TextBox.Text = shaderExtract.ToVFX();
+            }
+            else if (node.Tag is VfxProgramData program)
+            {
+                using var output = new IndentedTextWriter();
+                program.PrintSummary(output, featuresProgram);
+                control.TextBox.Text = output.ToString();
+            }
+            else if (node.Tag is VfxStaticComboVcsEntry comboEntry)
+            {
+                var combo = comboEntry.Unserialize();
+                node.Tag = combo; // Replace the entry with unserialized combo data
+
+                DisplayStaticCombo(combo);
+
+                fileListView.BeginUpdate();
+
+                try
+                {
+                    CreateStaticComboNodes(combo, node);
+                }
+                finally
+                {
+                    fileListView.EndUpdate();
+                }
+            }
+            else if (node.Tag is VfxStaticComboData combo)
+            {
+                DisplayStaticCombo(combo);
+            }
+            else if (node.Tag is VfxShaderFile shaderFile)
+            {
+                // TODO: Perhaps these tabs can also be removed, but currently required for the byte viewer
+                control.TextBox.Text = shaderFile.GetDecompiledFile();
+
+                /*
+                TODO: We need to display the bytecode somehow
+
+                tabs = new TabControl
+                {
+                    Dock = DockStyle.Fill,
+                };
+
+                // source
+                var sourceBvTab = new TabPage("Source");
+                var sourceBv = new System.ComponentModel.Design.ByteViewer
+                {
+                    Dock = DockStyle.Fill,
+                };
+                sourceBvTab.Controls.Add(sourceBv);
+                resTabs.TabPages.Add(sourceBvTab);
+
+                // text
+                var reflectedSource = AttemptSpirvReflection(vulkanSource, Backend.GLSL);
+
+                var textTab = new TabPage("SPIR-V");
+                var textBox = new CodeTextBox(reflectedSource, HighlightLanguage.Shaders);
+                textTab.Controls.Add(textBox);
+                resTabs.TabPages.Add(textTab);
+                resTabs.SelectedTab = textTab;
+
+                if (!vulkanSource.IsEmpty())
+                {
+                    Program.MainForm.Invoke((MethodInvoker)(() =>
+                    {
+                        sourceBv.SetBytes(vulkanSource.Bytecode);
+                    }));
+                }
+                */
+            }
+        }
+
+        private static void CreateStaticComboNodes(VfxStaticComboData combo, TreeNode treeNode)
+        {
+            var sourceFileImage = AppIcons.GetImageIndexForExtension("ini");
+
+            List<string> comboNamesAbbrev = [];
+            List<string> comboNames = [];
+            var shaderFileIdToRenderStateInfo = new Dictionary<int, VfxRenderStateInfo>(combo.ShaderFiles.Length);
+
+            // We are only taking the first render state info currently
+            foreach (var renderStateInfo in combo.DynamicComboRenderStates)
+            {
+                shaderFileIdToRenderStateInfo.TryAdd(renderStateInfo.ShaderFileId, renderStateInfo);
+            }
+
+            Debug.Assert(combo.ParentProgramData != null);
+
+            foreach (var shaderFile in combo.ShaderFiles)
+            {
+                // KV3 resources may leave unreferenced shader file slots null
+                if (shaderFile is null || shaderFile.Size == 0)
+                {
+                    continue;
+                }
+
+                var config = combo.ParentProgramData.GetDynamicComboConfig(shaderFileIdToRenderStateInfo[shaderFile.ShaderFileId].DynamicComboId);
+
+                comboNames.Clear();
+                comboNamesAbbrev.Clear();
+
+                for (var i = 0; i < combo.ParentProgramData.DynamicComboArray.Length; i++)
+                {
+                    if (config[i] == 0)
+                    {
+                        continue;
+                    }
+
+                    var dynamicCombo = combo.ParentProgramData.DynamicComboArray[i];
+                    var shortName = ShortenShaderParam(dynamicCombo.Name).ToLowerInvariant();
+
+                    if (config[i] > 1)
+                    {
+                        comboNames.Add($"{dynamicCombo.Name}={config[i]}");
+                        comboNamesAbbrev.Add($"{shortName}={config[i]}");
+                    }
+                    else
+                    {
+                        comboNames.Add(dynamicCombo.Name);
+                        comboNamesAbbrev.Add(shortName);
+                    }
+                }
+
+                var node = new TreeNode($"{shaderFile.ShaderFileId:X2}{(comboNamesAbbrev.Count > 0 ? $" ({string.Join(", ", comboNamesAbbrev)})" : string.Empty)}")
+                {
+                    ToolTipText = string.Join(Environment.NewLine, comboNames),
+                    Tag = shaderFile,
+                    ImageIndex = sourceFileImage,
+                    SelectedImageIndex = sourceFileImage,
+                };
+                treeNode.Nodes.Add(node);
+            }
+
+            treeNode.Expand();
+        }
+
+        private void DisplayStaticCombo(VfxStaticComboData combo)
+        {
+            using var output = new IndentedTextWriter();
+            _ = new PrintStaticComboSummary(combo, output);
+            control.TextBox.Text = output.ToString();
+        }
+
+        private void OnExportBytecodeClick(object? sender, EventArgs e)
+        {
+            if (shaderFileContextMenu.Tag is not VfxShaderFile shaderFile)
+            {
+                return;
+            }
+
+            var combo = shaderFile.ParentCombo;
+            Debug.Assert(combo.ParentProgramData != null);
+
+            var extension = shaderFile.SourceType == "VULKAN" ? "spv" : shaderFile.SourceType.ToLowerInvariant();
+
+            var fileName = AppFileDialogs.SaveFile(
+                "Export bytecode",
+                $"{combo.ParentProgramData.ShaderName}_{combo.StaticComboId:x08}_{shaderFile.ShaderFileId:x02}",
+                extension,
+                $"{shaderFile.SourceType} bytecode (*.{extension})|*.{extension}|All files (*.*)|*.*");
+
+            if (fileName == null)
+            {
+                return;
+            }
+
+            File.WriteAllBytes(fileName, shaderFile.Bytecode);
+        }
+    }
+}

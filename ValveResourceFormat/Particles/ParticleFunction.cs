@@ -1,0 +1,211 @@
+using Microsoft.Extensions.Logging;
+using ValveResourceFormat.Particles.Utils;
+
+namespace ValveResourceFormat.Particles
+{
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particles/CParticleFunction">CParticleFunction</seealso>
+    abstract class ParticleFunction
+    {
+        private readonly INumberProvider opStrengthInput = new LiteralNumberProvider(1f);
+        private readonly ParticleEndCapMode opEndCapState = ParticleEndCapMode.PARTICLE_ENDCAP_ALWAYS_ON;
+        public readonly float OpStartFadeInTime; // operator start fadein
+        public readonly float OpEndFadeInTime; // operator end fadein
+        public readonly float OpStartFadeOutTime; // operator start fadeout
+        public readonly float OpEndFadeOutTime; // operator end fadeout
+        public readonly float OpFadeOscillatePeriod; // operator fade oscillate
+        private readonly bool normalizeToStopTime;
+        private readonly float opTimeOffsetMin;
+        private readonly float opTimeOffsetMax;
+        // Seeds drawing a per-instance offset and scale of the time the fade curve reads; 0 disables each
+        private readonly int opTimeOffsetSeed;
+        private readonly int opTimeScaleSeed;
+        private readonly float opTimeScaleMin = 1f;
+        private readonly float opTimeScaleMax = 1f;
+
+        /// <summary>Every field feeding the fade curve is at its default, so the curve is always 1.</summary>
+        readonly bool FadeCurveIsUnity;
+
+        /// <summary>The curve is unity and the strength is a literal 1, so the whole evaluation folds away.</summary>
+        readonly bool StrengthFastPath;
+        protected readonly ILogger Logger;
+
+        public ParticleFunction(ParticleDefinitionParser parse)
+        {
+            Logger = parse.Logger;
+            opStrengthInput = parse.NumberProvider("m_flOpStrength", opStrengthInput);
+            opEndCapState = parse.Enum("m_nOpEndCapState", opEndCapState);
+            OpStartFadeInTime = parse.Float("m_flOpStartFadeInTime");
+            OpEndFadeInTime = parse.Float("m_flOpEndFadeInTime");
+            OpStartFadeOutTime = parse.Float("m_flOpStartFadeOutTime");
+            OpEndFadeOutTime = parse.Float("m_flOpEndFadeOutTime");
+            OpFadeOscillatePeriod = parse.Float("m_flOpFadeOscillatePeriod");
+            opTimeOffsetMin = parse.Float("m_flOpTimeOffsetMin", opTimeOffsetMin);
+            opTimeOffsetMax = parse.Float("m_flOpTimeOffsetMax", opTimeOffsetMax);
+            opTimeScaleMin = parse.Float("m_flOpTimeScaleMin", opTimeScaleMin);
+            opTimeScaleMax = parse.Float("m_flOpTimeScaleMax", opTimeScaleMax);
+            normalizeToStopTime = parse.Boolean("m_bNormalizeToStopTime");
+            opTimeOffsetSeed = parse.Int32("m_nOpTimeOffsetSeed", opTimeOffsetSeed);
+            opTimeScaleSeed = parse.Int32("m_nOpTimeScaleSeed", opTimeScaleSeed);
+
+            FadeCurveIsUnity =
+                OpStartFadeInTime == 0f &&
+                OpEndFadeInTime == 0f &&
+                OpStartFadeOutTime == 0f &&
+                OpEndFadeOutTime == 0f &&
+                (opTimeOffsetSeed == 0 || (opTimeOffsetMin == 0f && opTimeOffsetMax == 0f)) &&
+                (opTimeScaleSeed == 0 || (opTimeScaleMin == 1f && opTimeScaleMax == 1f));
+
+            StrengthFastPath = FadeCurveIsUnity
+                && opEndCapState == ParticleEndCapMode.PARTICLE_ENDCAP_ALWAYS_ON
+                && opStrengthInput is LiteralNumberProvider { Value: 1f };
+        }
+
+        /// <summary>
+        /// Whether the authored <c>m_nOpEndCapState</c> lets the function run in the phase the system is
+        /// in. Walks with no operator strength to evaluate, such as the initializers, test this alone.
+        /// </summary>
+        public bool RunsInCurrentPhase(ParticleSystemState systemState)
+            => opEndCapState == ParticleEndCapMode.PARTICLE_ENDCAP_ALWAYS_ON
+                || systemState.InEndCap == (opEndCapState == ParticleEndCapMode.PARTICLE_ENDCAP_ENDCAP_ON);
+
+        /// <summary>
+        /// Whether removing particles must keep the survivors in order while this function is part of
+        /// the system.
+        /// </summary>
+        public virtual bool IsOrderImportant => false;
+
+        /// <summary>
+        /// Bit mask over <see cref="ParticleField"/> of the attributes this function writes, which the
+        /// system must therefore store. An attribute no function writes is not stored and every particle
+        /// reads its constant. None unless overridden.
+        /// </summary>
+        public virtual ulong StoredFields => 0;
+
+        /// <summary>
+        /// Bit mask over <see cref="ParticleField"/> of the attributes whose initial value this function
+        /// overwrites, which makes them initialized attributes with their own initial copy.
+        /// </summary>
+        public virtual ulong InitialWrittenFields => 0;
+
+        /// <summary>
+        /// Bit mask over <see cref="ParticleField"/> of the attributes an emitter or initializer also
+        /// rewrites on particles created earlier, which keeps their initial values in a copy of their own.
+        /// </summary>
+        public virtual ulong LiveWrittenFields => 0;
+
+        /// <summary>Builds the per-instance running state the function starts with.</summary>
+        public virtual void Reset()
+        {
+        }
+
+        /// <summary>Builds the running state when the system is created or replayed; <see cref="Reset"/> unless overridden.</summary>
+        public virtual void Initialize(ParticleSystemState particleSystemState) => Reset();
+
+        /// <summary>Called when the system restarts without being destroyed; keeps the running state unless overridden.</summary>
+        public virtual void Restart(ParticleSystemState particleSystemState)
+        {
+        }
+
+        /// <summary>
+        /// Adds the control points this function reads whose use implies a nonzero preview value.
+        /// </summary>
+        public virtual void AddControlPointDefaults(ControlPointDefaults defaults)
+        {
+        }
+
+        /// <summary>Whether the fade window has closed for good, past <c>m_flOpEndFadeOutTime</c>.</summary>
+        protected bool IsPastFadeOut(ParticleSystemState systemState)
+            => OpFadeOscillatePeriod == 0f && OpEndFadeOutTime > 0f && GetFunctionTime(systemState) > OpEndFadeOutTime;
+
+        public float GetOperatorRunStrength(ParticleSystemState systemState) // CheckIfOperatorShouldRun
+        {
+            if (StrengthFastPath)
+            {
+                return 1f;
+            }
+
+            if (!RunsInCurrentPhase(systemState))
+            {
+                return 0f;
+            }
+
+            var opStrength = opStrengthInput.NextNumber(systemState);
+
+            if (FadeCurveIsUnity || opStrength <= 0f)
+            {
+                return opStrength;
+            }
+
+            var strength = FadeInOut(OpStartFadeInTime, OpEndFadeInTime, OpStartFadeOutTime, OpEndFadeOutTime, GetFunctionTime(systemState));
+
+            return MathF.Max(0f, opStrength) * strength;
+        }
+
+        /// <summary>
+        /// The time the fade window is measured against: seconds since the system last restarted, or
+        /// since the endcap began for an endcap function with <c>m_bNormalizeToStopTime</c>, then offset
+        /// and stretched per system instance when the time offset and scale seeds are set. An
+        /// oscillating fade instead takes the phase of the system age within the period, in [0, 1).
+        /// </summary>
+        protected float GetFunctionTime(ParticleSystemState systemState)
+        {
+            if (OpFadeOscillatePeriod > 0f)
+            {
+                return 1f / OpFadeOscillatePeriod * systemState.Age % 1f;
+            }
+
+            var time = MathF.Max(0f, systemState.Age - systemState.OperatorTimeBase);
+
+            if (normalizeToStopTime && opEndCapState == ParticleEndCapMode.PARTICLE_ENDCAP_ENDCAP_ON)
+            {
+                time = MathF.Max(0f, time - systemState.EndCapStartAge);
+            }
+
+            if (opTimeOffsetSeed != 0)
+            {
+                time += ParticleRandom.ForSampleBetween(systemState.Random.Seed + opTimeOffsetSeed, opTimeOffsetMin, opTimeOffsetMax);
+                time = MathF.Max(0f, time);
+            }
+
+            if (opTimeScaleSeed != 0 && time > OpStartFadeInTime)
+            {
+                var timeScale = 1f / MathF.Max(0.0001f, ParticleRandom.ForSampleBetween(systemState.Random.Seed + opTimeScaleSeed, opTimeScaleMin, opTimeScaleMax));
+                time = OpStartFadeInTime + (timeScale * (time - OpStartFadeInTime));
+            }
+
+            return time;
+        }
+
+        private static float FadeInOut(float fadeInStart, float fadeInEnd, float fadeOutStart, float fadeOutEnd, float time)
+        {
+            if (fadeInStart > time) // started yet?
+            {
+                return 0f;
+            }
+
+            if (fadeOutEnd > 0f && fadeOutEnd < time) // timed out?
+            {
+                return 0f;
+            }
+
+            // handle out of order cases
+            fadeInEnd = MathF.Max(fadeInEnd, fadeInStart);
+            fadeOutStart = MathF.Max(fadeOutStart, fadeInEnd);
+            fadeOutEnd = MathF.Max(fadeOutEnd, fadeOutStart);
+
+            var strength = 1f;
+
+            if (fadeInEnd > time && fadeInEnd > fadeInStart)
+            {
+                strength = MathF.Min(strength, MathUtils.Remap(time, fadeInStart, fadeInEnd));
+            }
+
+            if (time > fadeOutStart && fadeOutEnd > fadeOutStart)
+            {
+                strength = MathF.Min(strength, MathUtils.Remap(time, fadeOutEnd, fadeOutStart));
+            }
+
+            return strength;
+        }
+    }
+}

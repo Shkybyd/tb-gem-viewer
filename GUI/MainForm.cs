@@ -1,0 +1,1457 @@
+//#define SCREENSHOT_MODE // Uncomment to hide version, keep title bar static, set an exact window size
+
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using GUI.Controls;
+using GUI.Forms;
+using GUI.Types.Exporter;
+using GUI.Types.GLViewers;
+using GUI.Types.PackageViewer;
+using GUI.Utils;
+using OpenTK.Windowing.Desktop;
+using ValvePak;
+using ValveResourceFormat.IO;
+using ValveResourceFormat.TextureDecoders;
+using Windows.Win32;
+using Windows.Win32.Foundation;
+using Windows.Win32.UI.Controls;
+using Windows.Win32.UI.Shell;
+using Windows.Win32.UI.WindowsAndMessaging;
+using IViewer = GUI.Types.Viewers.IViewer;
+using ResourceViewMode = GUI.Types.Viewers.ResourceViewMode;
+
+namespace GUI
+{
+    partial class MainForm : Form
+    {
+        private readonly string[] Args;
+        internal ExplorerControl? explorerControl;
+
+        private SearchForm? searchForm;
+
+        internal MainTabs Tabs => mainTabs;
+
+#pragma warning disable CA2213 // Disposed in OnFormClosing
+        private Ipc.IpcWindow? ipcWindow;
+        private IDisposable? automationServer;
+#pragma warning restore CA2213
+        private uint TaskbarButtonCreatedMessage;
+        private ITaskbarList3? Taskbar;
+
+        static MainForm()
+        {
+            GLFWProvider.SetErrorCallback((errorCode, description) =>
+            {
+                throw new OpenTK.Windowing.GraphicsLibraryFramework.GLFWException(description, errorCode);
+            });
+            GLFWProvider.CheckForMainThread = false;
+            GLFWProvider.EnsureInitialized();
+        }
+
+        public MainForm(string[] args)
+        {
+            Args = args;
+
+            Settings.Load();
+            Themer.InitializeTheme();
+            InitializeComponent();
+            LoadIcons();
+
+            mainTabs.ConfirmClose = ConfirmCloseTab;
+
+            // Let the explorer start scanning games before the window even spawns
+            if (args.Length == 0 && (Settings.IsFirstStartup || Settings.Config.OpenExplorerOnStart != 0))
+            {
+                EnsureExplorerControl();
+            }
+
+            Themer.ApplyTheme(this);
+
+            if (Types.GLViewers.GLGemViewer.Enabled)
+            {
+                // The gem showcase is a single full window view, without the viewer around it
+                Text = Types.GLViewers.GLGemViewer.WindowTitle;
+                menuStrip.Visible = false;
+                mainFormBottomPanel.Visible = false;
+                mainTabs.HideTabHeader = true;
+                controlsBoxPanel.ShowDiscordButton = false;
+
+                // Launched from a shortcut set to start minimized or from a hidden console, it still opens on screen
+                Shown += (_, _) => WindowState = FormWindowState.Maximized;
+            }
+
+#if !SCREENSHOT_MODE
+            // Filling the screen rather than maximizing, because a maximized form is shown with
+            // SW_SHOWMAXIMIZED, which activates it whatever ShowWithoutActivation says
+            if (Automation.Automation.IsEnabled)
+            {
+                StartPosition = FormStartPosition.Manual;
+                Bounds = Screen.PrimaryScreen?.WorkingArea ?? Bounds;
+            }
+            else if (Types.GLViewers.GLGemViewer.Enabled)
+            {
+                // The showcase always opens full window, whatever the viewer last saved
+                StartPosition = FormStartPosition.CenterScreen;
+                Size = new System.Drawing.Size(1600, 900);
+                WindowState = FormWindowState.Maximized;
+            }
+            else if (Settings.Config.WindowWidth > 0 && Settings.Config.WindowHeight > 0)
+            {
+                StartPosition = FormStartPosition.Manual;
+
+                if ((FormWindowState)Settings.Config.WindowState == FormWindowState.Maximized)
+                {
+                    WindowState = FormWindowState.Maximized;
+                }
+            }
+#endif
+
+            mainTabs.ImageList = AppIcons.ImageList;
+            mainTabs.SelectedIndexChanged += OnMainSelectedTabChanged;
+            mainTabs.BackColor = Themer.CurrentThemeColors.App;
+            mainTabs.SelectTabColor = Themer.CurrentThemeColors.AppMiddle;
+            mainTabs.SelectedForeColor = Themer.CurrentThemeColors.Contrast;
+            mainTabs.ForeColor = Themer.CurrentThemeColors.ContrastSoft;
+            mainTabs.HoverColor = Themer.CurrentThemeColors.HoverAccent;
+            mainTabs.AccentColor = Themer.CurrentThemeColors.Accent;
+            mainTabs.SelectionLine = false;
+            mainTabs.EndEllipsis = true;
+            mainTabs.TabTopRadius = 8;
+
+            // Display version
+            {
+                var version = Program.ProductVersion;
+                var versionPlus = version.IndexOf('+', StringComparison.InvariantCulture);
+                string versionDisplay;
+
+                if (versionPlus > 1)
+                {
+                    // If version ends with ".0", display part of the commit hash, otherwise the zero is replaced with CI build number
+                    if (version[versionPlus - 2] == '.' && version[versionPlus - 1] == '0')
+                    {
+                        versionPlus = Math.Min(versionPlus + 8, version.Length);
+                    }
+
+                    versionDisplay = string.Concat("v", version.AsSpan(0, versionPlus));
+                }
+                else
+                {
+                    versionDisplay = string.Concat("v", version);
+
+                    if (!Program.IsReleaseBuild)
+                    {
+                        versionDisplay += "-dev";
+                    }
+                }
+
+#if DEBUG
+                versionDisplay += " (DEBUG)";
+#endif
+
+                mainFormBottomPanel.SetVersionText(versionDisplay);
+            }
+
+            CheckForUpdatesIfNecessary();
+
+            HardwareAcceleratedTextureDecoder.Decoder = new GLTextureDecoder(VrfGuiContext.Logger);
+            RenderLoopThread.Initialize(this);
+
+#if DEBUG
+            if (args.Length > 0 && args[0] == "validate_shaders")
+            {
+                ValidateShaders();
+                Environment.Exit(0);
+                return;
+            }
+#else
+            fileToolStripMenuItem.DropDownItems.Remove(validateShadersToolStripMenuItem);
+#endif
+
+            // Force refresh title due to OpenFile calls above, SelectedIndexChanged is not called in the same tick
+            OnMainSelectedTabChanged(null, EventArgs.Empty);
+        }
+
+        private void LoadIcons()
+        {
+            AppIcons.Load(this.AdjustForDPI(24));
+
+            mainLogo.Image = Themer.SvgToBitmap(AppIcons.ExtensionSVGS["Logo"], mainLogo.Width, mainLogo.Height);
+        }
+
+        public void OpenCommandLineArgFiles(string[] args)
+        {
+            foreach (var arg in args)
+            {
+                try
+                {
+                    OpenCommandLineArgFile(arg);
+                }
+                catch (MissingFileException e)
+                {
+                    Log.Error(nameof(MainForm), e.Message);
+                    mainTabs.OpenTab("Console");
+                }
+            }
+
+            OnMainSelectedTabChanged(null, EventArgs.Empty);
+        }
+
+        /// <summary>A file named on the command line, or a package on the way to it, that was not found.</summary>
+#pragma warning disable CA1032 // Implement standard exception constructors
+        private sealed class MissingFileException(string message) : FileNotFoundException(message);
+#pragma warning restore CA1032
+
+        /// <summary>Opens a path or a vpk: link as given on the command line in a new tab, and returns the tab.</summary>
+        /// <exception cref="FileNotFoundException">The file, the Steam app it is in, or a package on the way to it was not found.</exception>
+        internal TabPage OpenCommandLineArgFile(string file)
+        {
+            List<string> packagePaths = [];
+            var innerFile = file;
+
+            if (VpkLink.IsVpkLink(file))
+            {
+                (packagePaths, innerFile) = VpkLink.Parse(file);
+
+                if (packagePaths.Count == 0)
+                {
+                    Log.Error(nameof(MainForm), $"For vpk: protocol to work, specify a file path inside of the package, for example: \"vpk:C:/path/pak01_dir.vpk:inner/file.vmdl_c\"");
+                    file = innerFile;
+                }
+            }
+
+            if (packagePaths.Count > 0)
+            {
+                file = packagePaths[0];
+            }
+
+            // Paths can be relative to a Steam app, such as "steam:730/game/csgo/pak01_dir.vpk"
+            if (!GameFolderLocator.TryResolveSteamAppPath(file, out file, out var steamAppPathError))
+            {
+                throw new MissingFileException(steamAppPathError);
+            }
+
+            if (packagePaths.Count == 0)
+            {
+                if (!File.Exists(file))
+                {
+                    throw new MissingFileException($"File '{file}' does not exist.");
+                }
+
+                return OpenFile(Path.GetFullPath(file));
+            }
+
+            if (!File.Exists(file))
+            {
+                var dirFile = PackageFileNames.GetDirectoryFile(file);
+
+                if (!File.Exists(dirFile))
+                {
+                    throw new MissingFileException($"File '{file}' does not exist.");
+                }
+
+                file = dirFile;
+            }
+
+            file = Path.GetFullPath(file);
+            Log.Info(nameof(MainForm), $"Opening {VrfGuiContext.GetDisplayPath(file)}");
+
+            VrfGuiContext? packageContext = null;
+
+            try
+            {
+                var package = Package.Open(file);
+                try
+                {
+                    packageContext = new VrfGuiContext(file, null)
+                    {
+                        CurrentPackage = package
+                    };
+                    package = null;
+                }
+                finally
+                {
+                    package?.Dispose();
+                }
+
+                for (var depth = 1; depth < packagePaths.Count; depth++)
+                {
+                    var nestedPath = packagePaths[depth];
+                    var nestedEntry = packageContext.CurrentPackage!.FindEntry(nestedPath)
+                        ?? throw new MissingFileException($"File '{nestedPath}' does not exist in package '{packageContext.FileName}'.");
+
+                    var nestedPackage = NestedPackage.Open(packageContext.CurrentPackage!, nestedEntry);
+                    try
+                    {
+                        packageContext = new VrfGuiContext(nestedEntry.GetFullPath(), packageContext)
+                        {
+                            CurrentPackage = nestedPackage
+                        };
+                        nestedPackage = null;
+                    }
+                    finally
+                    {
+                        nestedPackage?.Dispose();
+                    }
+                }
+
+                var packageFile = packageContext.CurrentPackage!.FindEntry(innerFile)
+                    ?? packageContext.CurrentPackage.FindEntry(innerFile + GameFileLoader.CompiledFileSuffix)
+                    ?? throw new MissingFileException($"File '{innerFile}' does not exist in package '{packageContext.FileName}'.");
+
+                innerFile = packageFile.GetFullPath();
+
+                Log.Info(nameof(MainForm), $"Opening {innerFile}");
+
+                var fileContext = new VrfGuiContext(innerFile, packageContext);
+
+                try
+                {
+                    var tab = OpenFile(fileContext, packageFile);
+                    fileContext = null;
+                    return tab;
+                }
+                finally
+                {
+                    fileContext?.Dispose();
+                }
+            }
+            finally
+            {
+                // Contexts still referenced by an opened tab are only marked here and dispose when the tab closes
+                for (var context = packageContext; context != null; context = context.ParentGuiContext)
+                {
+                    context.Dispose();
+                }
+            }
+        }
+
+        /// <summary>Automation renders and captures without focus, so it does not take the foreground.</summary>
+        protected override bool ShowWithoutActivation => Automation.Automation.IsEnabled;
+
+        private void OnTaskbarButtonCreated()
+        {
+            if (Taskbar == null)
+            {
+                Taskbar = (ITaskbarList3)new TaskbarList();
+                Taskbar.HrInit();
+            }
+
+            if (Automation.Automation.IsEnabled)
+            {
+                SetTaskbarOverlay(AppIcons.Icons["McpBadge"], "MCP");
+                return;
+            }
+
+            UpdateTaskbarOverlay();
+        }
+
+        /// <summary>Badges the taskbar button with the game the selected tab was loaded from.</summary>
+        private void UpdateTaskbarOverlay()
+        {
+            if (Taskbar == null || Automation.Automation.IsEnabled)
+            {
+                return;
+            }
+
+            // The loader also finds the game of workshop items, and files opened from a package use the game of the package
+            if (mainTabs.SelectedTab?.Tag is ExportData { VrfGuiContext.GameInfo: { SteamAppId: not 0 } gameInfo }
+                && AppIcons.GameIcons.TryGetValue(gameInfo.SteamAppId, out var imageIndex))
+            {
+                SetTaskbarOverlay(imageIndex, gameInfo.Name);
+            }
+            else
+            {
+                SetTaskbarOverlay(default(HICON), null);
+            }
+        }
+
+        /// <summary>Badges the taskbar button with an icon from <see cref="AppIcons.ImageList"/>.</summary>
+        private void SetTaskbarOverlay(int imageIndex, string? description)
+        {
+            var icon = PInvoke.ImageList_GetIcon(new HIMAGELIST(AppIcons.ImageList.Handle), imageIndex, IMAGE_LIST_DRAW_STYLE.ILD_TRANSPARENT);
+
+            try
+            {
+                SetTaskbarOverlay(icon, description);
+            }
+            finally
+            {
+                PInvoke.DestroyIcon(icon);
+            }
+        }
+
+        /// <summary>The taskbar keeps its own copy of the icon, so the caller can free it right after.</summary>
+        private unsafe void SetTaskbarOverlay(HICON icon, string? description)
+        {
+            fixed (char* descriptionPtr = description)
+            {
+                Taskbar!.SetOverlayIcon((HWND)Handle, icon, descriptionPtr);
+            }
+        }
+
+        /// <summary>Finds the icon in <see cref="AppIcons.ImageList"/> of the Steam game that ships a VPK.</summary>
+        private static bool TryGetVpkGameIcon(string fileName, out int imageIndex)
+        {
+            imageIndex = -1;
+
+            return Path.GetExtension(fileName.AsSpan()).Equals(".vpk", StringComparison.OrdinalIgnoreCase)
+                && GameFolderLocator.FindSteamGameContainingPath(fileName, InstalledSteamGames.Games) is { } game
+                && AppIcons.GameIcons.TryGetValue(game.AppID, out imageIndex);
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+
+            TaskbarButtonCreatedMessage = PInvoke.RegisterWindowMessage("TaskbarButtonCreated");
+
+            var consoleTab = new ConsoleTab();
+            Log.SetConsoleTab(consoleTab);
+            var consoleTabPage = consoleTab.CreateTab();
+            consoleTabPage.ImageIndex = AppIcons.Icons["Log"];
+            mainTabs.TabPages.Add(consoleTabPage);
+            consoleTab.InitializeFont();
+
+#if SCREENSHOT_MODE
+            mainFormBottomPanel.Visible = false;
+            SetBounds(x: 100, y: 100, width: 480 + 6, height: 480 + 3); // Tweak size as needed
+            unsafe
+            {
+                var preference = Windows.Win32.Graphics.Dwm.DWM_WINDOW_CORNER_PREFERENCE.DWMWCP_DONOTROUND;
+                PInvoke.DwmSetWindowAttribute((Windows.Win32.Foundation.HWND)Handle,
+                    Windows.Win32.Graphics.Dwm.DWMWINDOWATTRIBUTE.DWMWA_WINDOW_CORNER_PREFERENCE,
+                    &preference,
+                    sizeof(Windows.Win32.Graphics.Dwm.DWM_WINDOW_CORNER_PREFERENCE));
+            }
+#else
+            if (StartPosition == FormStartPosition.Manual && !Automation.Automation.IsEnabled)
+            {
+                var maximized = WindowState == FormWindowState.Maximized;
+                var placement = new WINDOWPLACEMENT
+                {
+                    length = (uint)Marshal.SizeOf<WINDOWPLACEMENT>(),
+                    showCmd = maximized ? SHOW_WINDOW_CMD.SW_SHOWMAXIMIZED : SHOW_WINDOW_CMD.SW_SHOWNORMAL,
+                    rcNormalPosition = new Windows.Win32.Foundation.RECT
+                    {
+                        left = Settings.Config.WindowLeft,
+                        top = Settings.Config.WindowTop,
+                        right = Settings.Config.WindowLeft + Settings.Config.WindowWidth,
+                        bottom = Settings.Config.WindowTop + Settings.Config.WindowHeight,
+                    },
+                };
+
+                PInvoke.SetWindowPlacement((Windows.Win32.Foundation.HWND)Handle, placement);
+            }
+#endif
+
+            automationServer = Automation.Automation.Start();
+
+            NativeWindowFactory.WarmUpInBackground();
+
+            // Automation opens what it is told to and nothing else. The explorer would focus its filter box
+            // on load, which activates the window, and without the IPC window files the user opens go to
+            // another instance.
+            if (Automation.Automation.IsEnabled)
+            {
+                UpdateWindowTitle(null);
+                SetAutomationBorderColor();
+
+                if (Args.Length > 0)
+                {
+                    OpenCommandLineArgFiles(Args);
+                }
+
+                return;
+            }
+
+            // The showcase opens the arcana only, without the welcome page or taking files from other launches
+            if (Types.GLViewers.GLGemViewer.Enabled)
+            {
+                OpenCommandLineArgFiles(Args);
+                return;
+            }
+
+            if (Settings.IsFirstStartup)
+            {
+                OpenWelcome();
+            }
+            else if (Args.Length > 0)
+            {
+                OpenCommandLineArgFiles(Args);
+            }
+            else if (Settings.Config.OpenExplorerOnStart != 0)
+            {
+                OpenExplorer();
+            }
+
+            ipcWindow = new(args => BeginInvoke(() =>
+            {
+                OpenCommandLineArgFiles(args);
+
+                if (WindowState == FormWindowState.Minimized)
+                {
+                    WindowState = FormWindowState.Normal;
+                }
+
+                Activate();
+            }));
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (!ConfirmCloseApp())
+            {
+                e.Cancel = true;
+                return;
+            }
+
+#if !SCREENSHOT_MODE
+            var placement = new WINDOWPLACEMENT
+            {
+                length = (uint)Marshal.SizeOf<WINDOWPLACEMENT>(),
+            };
+
+            if (PInvoke.GetWindowPlacement((Windows.Win32.Foundation.HWND)Handle, ref placement))
+            {
+                Settings.Config.WindowLeft = placement.rcNormalPosition.left;
+                Settings.Config.WindowTop = placement.rcNormalPosition.top;
+                Settings.Config.WindowWidth = placement.rcNormalPosition.right - placement.rcNormalPosition.left;
+                Settings.Config.WindowHeight = placement.rcNormalPosition.bottom - placement.rcNormalPosition.top;
+
+                var minimizedFromMaximized = placement.showCmd == SHOW_WINDOW_CMD.SW_SHOWMINIMIZED && placement.flags.HasFlag(WINDOWPLACEMENT_FLAGS.WPF_RESTORETOMAXIMIZED);
+                var isMaximized = placement.showCmd == SHOW_WINDOW_CMD.SW_SHOWMAXIMIZED || minimizedFromMaximized;
+                Settings.Config.WindowState = (int)(isMaximized ? FormWindowState.Maximized : FormWindowState.Normal);
+            }
+#endif
+
+            ipcWindow?.Dispose();
+            automationServer?.Dispose();
+
+            Settings.Save();
+            base.OnFormClosing(e);
+        }
+
+        private void MainForm_Load(object sender, EventArgs e)
+        {
+            // so we can bind keys to actions properly
+            KeyPreview = true;
+
+            InitializeSystemMenu();
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            //if the user presses CTRL + W, and there is a tab open, close the active tab
+            if (keyData == (Keys.Control | Keys.W) && mainTabs.SelectedTab != null)
+            {
+                mainTabs.CloseTab(mainTabs.SelectedTab);
+            }
+
+            //if the user presses CTRL + Q, close all open tabs
+            if (keyData == (Keys.Control | Keys.Q))
+            {
+                CloseAllTabs();
+            }
+
+            //if the user presses CTRL + E, close all tabs to the right of the active tab
+            if (keyData == (Keys.Control | Keys.E) && mainTabs.SelectedTab != null)
+            {
+                CloseTabsToRight(mainTabs.SelectedTab);
+            }
+
+            if (keyData == (Keys.Control | Keys.R) || keyData == Keys.F5)
+            {
+                CloseAndReOpenActiveTab();
+            }
+
+            if (keyData == (Keys.Control | Keys.S) && mainTabs.SelectedTab is { } selectedTab && PackageViewer.FromTab(selectedTab) is { IsEditingPackage: true } editor)
+            {
+                if (editor.HasUnsavedChanges || editor.FileOnDisk == null)
+                {
+                    OnSaveVPKToDiskToolStripMenuItem_Click(this, EventArgs.Empty);
+                }
+
+                return true;
+            }
+
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        private void OnMainSelectedTabChanged(object? sender, EventArgs e)
+        {
+            UpdateWindowTitle(mainTabs.SelectedTab?.ToolTipText);
+            UpdateBottomPanelKeybindings();
+            UpdateTaskbarOverlay();
+        }
+
+        /// <summary>Replaces the logo in the title bar, for an app that brands the viewer as its own.</summary>
+        internal void SetTitleBarLogo(Image image) => mainLogo.Image = image;
+
+        private void UpdateWindowTitle(string? toolTipText)
+        {
+            if (Types.GLViewers.GLGemViewer.Enabled)
+            {
+                Text = Types.GLViewers.GLGemViewer.WindowTitle;
+                return;
+            }
+
+            var title = string.IsNullOrEmpty(toolTipText)
+                ? "Source 2 Viewer"
+                : $"Source 2 Viewer - {toolTipText}";
+
+            Text = Automation.Automation.WindowTitlePrefix + title;
+        }
+
+        /// <summary>
+        /// Resets the window title to the selected tab. Called when a package preview is cleared (e.g. a folder is
+        /// shown) so the title stops reflecting the file that was being previewed.
+        /// </summary>
+        public void ResetPreviewTitle() => UpdateWindowTitle(mainTabs.SelectedTab?.ToolTipText);
+
+        private void UpdateBottomPanelKeybindings()
+        {
+            var viewerType = KeybindingRegistry.GetViewerTypeFromTab(mainTabs.SelectedTab);
+            var keybindings = KeybindingRegistry.GetKeybindingsForViewer(viewerType);
+            mainFormBottomPanel.UpdateKeybindings(keybindings);
+        }
+
+        /// <summary>
+        /// Shows the keybindings for a previewed viewer
+        /// </summary>
+        public void ShowPreviewKeybindings(TabPage previewTab)
+        {
+            var keybindings = KeybindingRegistry.GetKeybindingsForViewer(KeybindingRegistry.GetViewerTypeFromTab(previewTab));
+            mainFormBottomPanel.UpdateKeybindings(keybindings);
+        }
+
+        /// <summary>
+        /// Shows the keybindings of the selected tab.
+        /// </summary>
+        public void ShowSelectedTabKeybindings() => UpdateBottomPanelKeybindings();
+
+        /// <summary>Reopens the active tab from its file, returning the new tab, or null when nothing was reopened.</summary>
+        internal TabPage? CloseAndReOpenActiveTab()
+        {
+            var tab = mainTabs.SelectedTab;
+            if (tab is null || tab.Tag is not ExportData exportData)
+            {
+                return null;
+            }
+
+            if (exportData.PackageEntry is { } packageEntry && exportData.VrfGuiContext.ParentGuiContext is { } packageContext)
+            {
+                var fileContext = new VrfGuiContext(packageEntry.GetFullPath(), packageContext);
+                TabPage reopened;
+
+                try
+                {
+                    reopened = OpenFile(fileContext, packageEntry);
+                    fileContext = null;
+                }
+                finally
+                {
+                    fileContext?.Dispose();
+                }
+
+                mainTabs.CloseTab(tab);
+                return reopened;
+            }
+
+            var (newFileContext, newPackageEntry) = exportData.VrfGuiContext.FindFileWithContext(exportData.VrfGuiContext.FileName);
+
+            if (newFileContext == null)
+            {
+                return null;
+            }
+
+            var newTab = OpenFile(newFileContext, newPackageEntry);
+            mainTabs.CloseTab(tab);
+            return newTab;
+        }
+
+        private void CloseAllTabs()
+        {
+            mainTabs.SelectedIndex = 0;
+
+            CloseTabs(mainTabs.TabPages.Cast<TabPage>().Skip(1));
+        }
+
+        private void CloseOtherTabs(TabPage basePage)
+        {
+            CloseTabs(mainTabs.TabPages.Cast<TabPage>().Skip(1).Where(tab => tab != basePage));
+        }
+
+        private void CloseTabsToLeft(TabPage basePage)
+        {
+            CloseTabs(mainTabs.TabPages.Cast<TabPage>().Take(mainTabs.GetTabIndex(basePage)).Skip(1));
+        }
+
+        private void CloseTabsToRight(TabPage basePage)
+        {
+            CloseTabs(mainTabs.TabPages.Cast<TabPage>().Skip(mainTabs.GetTabIndex(basePage) + 1));
+        }
+
+        /// <summary>
+        /// Closes the tabs from the last one, skipping tabs that closing an earlier one already closed.
+        /// Stops at the first tab whose closing is cancelled.
+        /// </summary>
+        private void CloseTabs(IEnumerable<TabPage> tabs)
+        {
+            foreach (var tab in tabs.Reverse().ToList())
+            {
+                if (!mainTabs.CloseTab(tab))
+                {
+                    break;
+                }
+            }
+        }
+
+        private void OnTabClick(object sender, MouseEventArgs e)
+        {
+            //Work out what tab we're interacting with
+            if (sender is not TabControl tabControl)
+            {
+                return;
+            }
+
+            var tabs = tabControl.TabPages;
+
+            var tabIndex = 0;
+            TabPage? thisTab = null;
+
+            for (; tabIndex < tabs.Count; tabIndex++)
+            {
+                if (tabControl.GetTabRect(tabIndex).Contains(e.Location))
+                {
+                    thisTab = tabs[tabIndex];
+                    break;
+                }
+            }
+
+            if (thisTab == null)
+            {
+                return;
+            }
+
+            if (e.Button == MouseButtons.Middle)
+            {
+                mainTabs.CloseTab(thisTab);
+            }
+            else if (e.Button == MouseButtons.Right)
+            {
+                var tabName = thisTab.Text;
+
+                //Can't close tabs to the left/right if there aren't any!
+                closeToolStripMenuItemsToLeft.Visible = tabIndex > 1;
+                closeToolStripMenuItemsToRight.Visible = tabIndex != mainTabs.TabPages.Count - 1;
+
+                //For UX purposes, hide the option to close the console also (this is disabled later in code too)
+                closeToolStripMenuItem.Visible = tabIndex != 0;
+                closeOtherTabsToolStripMenuItem.Visible = tabIndex != 0 && mainTabs.TabPages.Count > 2;
+
+                //Only tabs that got a sound player (world and model viewers) have anything to mute
+                var sceneViewer = GLBaseControl.FindHostedIn(thisTab) as GLSceneViewer;
+                muteTabToolStripMenuItem.Visible = sceneViewer?.HasSoundPlayer == true;
+                muteTabToolStripMenuItem.Text = sceneViewer?.Muted == true ? "&Unmute tab" : "&Mute tab";
+
+                var canExport = thisTab.Tag is ExportData exportData;
+                toolStripSeparator5.Visible = canExport || tabIndex == 0;
+                copyTabUrlToolStripMenuItem.Visible = canExport;
+                exportAsIsToolStripMenuItem.Visible = canExport;
+                decompileExportToolStripMenuItem.Visible = canExport;
+
+                clearConsoleToolStripMenuItem.Visible = tabIndex == 0;
+
+                //Show context menu at the mouse position
+                tabContextMenuStrip.Tag = e.Location;
+                tabContextMenuStrip.Show((Control)sender, e.Location);
+            }
+        }
+
+        private void OnAboutItemClick(object sender, EventArgs e)
+        {
+            ShowAbout();
+        }
+
+        private void OnSettingsItemClick(object sender, EventArgs e)
+        {
+            foreach (TabPage tabPage in mainTabs.TabPages)
+            {
+                if (tabPage.Text == "Settings")
+                {
+                    mainTabs.SelectTab(tabPage);
+                    return;
+                }
+            }
+
+            var seettingsTab = new ThemedTabPage("Settings")
+            {
+                ToolTipText = "Settings",
+                ImageIndex = AppIcons.Icons["Settings"],
+            };
+
+            try
+            {
+                seettingsTab.Controls.Add(new SettingsControl
+                {
+                    Dock = DockStyle.Fill,
+                });
+                mainTabs.TabPages.Insert(1, seettingsTab);
+                mainTabs.SelectTab(seettingsTab);
+                seettingsTab = null;
+            }
+            finally
+            {
+                seettingsTab?.Dispose();
+            }
+        }
+
+        private void OpenToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            var files = AppFileDialogs.OpenFiles(null, "Valve Resource Format (*.*_c, *.vpk)|*.*_c;*.vpk;*.vcs|All files (*.*)|*.*");
+
+            if (files == null)
+            {
+                return;
+            }
+
+            OpenFiles(files);
+        }
+
+        public TabPage OpenFile(string fileName)
+        {
+            var tab = OpenFileAndTrackRecent(fileName);
+            Settings.Save();
+            return tab;
+        }
+
+        private void OpenFiles(IReadOnlyCollection<string> fileNames)
+        {
+            if (fileNames.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var fileName in fileNames)
+            {
+                OpenFileAndTrackRecent(fileName);
+            }
+
+            Settings.Save();
+        }
+
+        private TabPage OpenFileAndTrackRecent(string fileName)
+        {
+            if (PackageFileNames.TryGetArchiveChunkDirectoryFile(fileName, out var fixedPackage))
+            {
+                Log.Warn(nameof(MainForm), $"You opened \"{Path.GetFileName(fileName)}\" but there is \"{Path.GetFileName(fixedPackage)}\"");
+                fileName = fixedPackage;
+            }
+
+            var vrfGuiContext = new VrfGuiContext(fileName, null, loadSearchPaths: false);
+
+            Log.Info(nameof(MainForm), $"Opening {vrfGuiContext.DisplayPath}");
+
+            var tab = OpenFile(vrfGuiContext, null, loadSearchPaths: true);
+
+            Settings.TrackRecentFile(fileName);
+
+            return tab;
+        }
+
+        public TabPage OpenFile(VrfGuiContext vrfGuiContext, PackageEntry? file, TreeViewWithSearchResults? packageTreeView = null, bool withoutViewer = false, bool loadSearchPaths = false)
+        {
+            var isPreview = packageTreeView != null;
+
+            var viewMode = (isPreview, withoutViewer) switch
+            {
+                (true, _) => ResourceViewMode.ViewerOnly,
+                (_, true) => ResourceViewMode.ResourceBlocksOnly,
+                (_, _) => ResourceViewMode.Default,
+            };
+
+            var tabExportData = new ExportData
+            {
+                PackageEntry = file,
+                VrfGuiContext = vrfGuiContext,
+            };
+
+            var tab = CreateFileTab(vrfGuiContext, tabExportData, isPreview);
+
+            if (isPreview)
+            {
+                // The preview tab is not in mainTabs, so update the window title to the previewed file ourselves.
+                UpdateWindowTitle(tab.ToolTipText);
+            }
+
+            // For a preview of the same type as the one already shown, keep that view frozen while the new file loads
+            // and show no loading panel; the new viewer is swapped in once ready. Otherwise show the loading panel.
+            var keepFrozen = isPreview && packageTreeView!.IsSamePreviewType(file?.TypeName);
+
+            var previewToken = packageTreeView?.PreviewToken ?? CancellationToken.None;
+
+            LoadingFile? loadingFile = null;
+
+            if (!keepFrozen)
+            {
+#pragma warning disable CA2000 // Ownership is transferred to the tab, which disposes it
+                loadingFile = new LoadingFile(vrfGuiContext.FileName);
+#pragma warning restore CA2000
+                tab.Controls.Add(loadingFile);
+
+                vrfGuiContext.LoadingProgress = new Progress<string>(loadingFile.SetStatus);
+
+                if (isPreview)
+                {
+                    // Show the loading panel in the preview area right away (replacing the blank page).
+                    Debug.Assert(packageTreeView != null);
+
+                    if (!packageTreeView.ReplaceListViewWithControl(tab, file?.TypeName))
+                    {
+                        tabExportData.SetLoaded(null);
+                        return tab;
+                    }
+                }
+            }
+
+            IViewer? createdViewer = null;
+            Exception? createError = null;
+
+            var taskLoad = Task.Run(() =>
+            {
+                if (loadSearchPaths)
+                {
+                    vrfGuiContext.LoadSearchPaths();
+                }
+
+                return Types.Viewers.ViewerFactory.CreateAndLoadAsync(vrfGuiContext, file, viewMode);
+            });
+
+            vrfGuiContext.DisposeAfter(taskLoad.ContinueWith(static _ => { }, TaskScheduler.Default));
+
+            taskLoad.ContinueWith(t =>
+            {
+                vrfGuiContext.GLPostLoadAction = null;
+
+                t.Exception?.Flatten().Handle(ex =>
+                {
+                    ShowLoadException(tab, vrfGuiContext.DisplayPath, ex);
+
+                    return false;
+                });
+            },
+            TaskContinuationOptions.OnlyOnFaulted);
+
+            var task = taskLoad.ContinueWith(t =>
+            {
+                BeginInvoke(() =>
+                {
+                    Cursor.Current = Cursors.WaitCursor;
+
+                    try
+                    {
+                        createdViewer = CreateViewerInTab(tab, vrfGuiContext.DisplayPath, t.Result, out createError);
+                    }
+                    finally
+                    {
+                        Cursor.Current = Cursors.Default;
+                    }
+                });
+            },
+            TaskContinuationOptions.OnlyOnRanToCompletion);
+
+            task.ContinueWith(t =>
+            {
+                vrfGuiContext.GLPostLoadAction = null;
+
+                t.Exception?.Flatten().Handle(ex =>
+                {
+                    try
+                    {
+                        ShowLoadException(tab, vrfGuiContext.DisplayPath, ex);
+
+                        return false;
+                    }
+                    catch (Exception e)
+                    {
+                        ErrorReport.ShowError(e);
+
+                        return true;
+                    }
+                });
+            },
+            TaskContinuationOptions.OnlyOnFaulted);
+
+            task.ContinueWith(t =>
+            {
+                BeginInvoke(() =>
+                {
+                    vrfGuiContext.LoadingProgress = null;
+
+                    // A faulted load cancels this continuation's antecedent, so the reason is on
+                    // the load task itself.
+                    var loadError = taskLoad.Exception?.Flatten().InnerException ?? createError;
+
+                    if (previewToken.IsCancellationRequested)
+                    {
+                        // A frozen preview tab was never parented, so it has to be disposed here.
+                        tab.Dispose();
+                    }
+
+                    if (tab.IsDisposed)
+                    {
+                        loadingFile?.Dispose();
+                    }
+                    else if (keepFrozen)
+                    {
+                        // Same-type preview: swap the frozen previous view for the newly loaded viewer.
+                        Debug.Assert(packageTreeView != null);
+
+                        if (!packageTreeView.ReplaceListViewWithControl(tab, file?.TypeName))
+                        {
+                            tabExportData.SetLoaded(loadError);
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        // The tab is already shown; disposing the loading panel reveals the viewer behind it.
+                        loadingFile?.Dispose();
+                    }
+
+                    // Revealing the viewer does not reliably deliver a paint to the underlying GL control, so tell
+                    // the viewer to redraw now that it is visible.
+                    createdViewer?.NotifyVisible();
+
+                    // The game is only known once the search paths are loaded
+                    UpdateTaskbarOverlay();
+
+                    tabExportData.SetLoaded(loadError);
+                });
+            });
+
+            return tab;
+        }
+
+        private ThemedTabPage CreateFileTab(VrfGuiContext vrfGuiContext, ExportData tabExportData, bool isPreview)
+        {
+            var tabTemp = new ThemedTabPage(Path.GetFileName(vrfGuiContext.FileName))
+            {
+                ToolTipText = vrfGuiContext.FileName,
+                Tag = tabExportData,
+            };
+            var tab = tabTemp;
+            tab.Disposed += OnTabDisposed;
+
+            void OnTabDisposed(object? sender, EventArgs e)
+            {
+                tab.Disposed -= OnTabDisposed;
+
+                var oldTag = tab.Tag;
+                tab.Tag = null;
+
+                if (oldTag is ExportData exportData)
+                {
+                    // Contents first: disposing them cancels loading and waits for it, and the context
+                    // disposes the resources that loading is still reading until it does
+                    exportData.DisposableContents?.Dispose();
+                    exportData.VrfGuiContext.Dispose();
+                }
+            }
+
+            try
+            {
+                tab.ToolTipText = vrfGuiContext.OpenedFromPath;
+
+                var extension = Path.GetExtension(vrfGuiContext.FileName.AsSpan());
+
+                if (TryGetVpkGameIcon(vrfGuiContext.FileName, out var imageIndexGame))
+                {
+                    tab.ImageIndex = imageIndexGame;
+                }
+
+                if (tab.ImageIndex < 0)
+                {
+                    if (extension.Length > 0)
+                    {
+                        extension = extension[1..];
+                    }
+
+                    tab.ImageIndex = AppIcons.GetImageIndexForExtension(extension);
+                }
+
+                if (!isPreview)
+                {
+                    mainTabs.TabPages.Insert(mainTabs.SelectedIndex + 1, tab);
+                    mainTabs.SelectTab(tab);
+                }
+
+                tabTemp = null;
+            }
+            finally
+            {
+                tabTemp?.Dispose();
+            }
+
+            return tab;
+        }
+
+        private void ShowLoadException(TabPage tab, string displayPath, Exception exception)
+        {
+            BeginInvoke(() =>
+            {
+                if (tab.IsDisposed)
+                {
+                    return;
+                }
+
+                var control = CodeTextBox.CreateFromException(exception, displayPath);
+
+                tab.Controls.Add(control);
+            });
+        }
+
+        /// <summary>Hands the loaded viewer to the tab and creates its controls, returning the viewer when it is ready to show.</summary>
+        private IViewer? CreateViewerInTab(TabPage tab, string displayPath, IViewer viewer, out Exception? createError)
+        {
+            createError = null;
+
+            if (tab.IsDisposed)
+            {
+                viewer.Dispose();
+                return null; // closed tab before it loaded
+            }
+
+            if (tab.Tag is ExportData exportData)
+            {
+                exportData.DisposableContents = viewer;
+            }
+            else
+            {
+                Debug.Assert(false);
+            }
+
+            try
+            {
+                viewer.Create(tab);
+            }
+            catch (Exception) when (tab.IsDisposed)
+            {
+                return null;
+            }
+            catch (Exception ex)
+            {
+                createError = ex;
+
+                var control = CodeTextBox.CreateFromException(ex, displayPath);
+
+                tab.Controls.Add(control);
+
+                // Controls the viewer added before throwing would otherwise cover the error
+                control.BringToFront();
+                return null;
+            }
+
+            if (tab.IsDisposed)
+            {
+                return null;
+            }
+
+            if (mainTabs.SelectedTab == tab)
+            {
+                UpdateBottomPanelKeybindings();
+            }
+
+            return viewer;
+        }
+
+        private void MainForm_DragDrop(object sender, DragEventArgs e)
+        {
+            if (e.Data?.GetData(DataFormats.FileDrop) is string[] paths)
+            {
+                OpenFiles(paths);
+                return;
+            }
+
+            var text = e.Data?.GetData("ObjectData") as string ?? e.Data?.GetData(typeof(string)) as string
+                ?? e.Data?.GetData(DataFormats.UnicodeText) as string;
+            var files = GetDroppedFiles(text).ToList();
+            OpenFiles(files.Where(file => file.Entry == null).Select(file => file.Path).ToList());
+
+            foreach (var file in files)
+            {
+                if (file.Entry is { } entry)
+                {
+                    OpenDroppedPackageFile(file.PackageContext, entry);
+                }
+            }
+        }
+
+        private void OpenDroppedPackageFile(VrfGuiContext? packageContext, PackageEntry entry)
+        {
+            var context = new VrfGuiContext(entry.GetFullPath(), packageContext);
+            try
+            {
+                OpenFile(context, entry);
+                context = null;
+            }
+            finally
+            {
+                context?.Dispose();
+            }
+        }
+
+        private void MainForm_DragEnter(object sender, DragEventArgs e)
+        {
+            e.Effect = DragDropEffects.None;
+
+            if (e.Data?.GetData(DataFormats.FileDrop) is string[] paths)
+            {
+                if (paths.Any(File.Exists))
+                {
+                    e.Effect = e.AllowedEffect & DragDropEffects.Move;
+                }
+
+                return;
+            }
+
+            // Dropping files from apps that provide a path string (e.g. VS Code, Source 2 asset browser).
+            var text = e.Data?.GetData("ObjectData") as string ?? e.Data?.GetData(typeof(string)) as string
+                ?? e.Data?.GetData(DataFormats.UnicodeText) as string;
+            if (GetDroppedFiles(text).Any())
+            {
+                e.Effect = (e.AllowedEffect & DragDropEffects.Copy) != 0
+                    ? DragDropEffects.Copy
+                    : e.AllowedEffect & DragDropEffects.Move;
+            }
+        }
+
+        private IEnumerable<(string Path, VrfGuiContext? PackageContext, PackageEntry? Entry)> GetDroppedFiles(string? text)
+        {
+            var packageContext = mainTabs.SelectedTab is { } tab ? PackageViewer.FromTab(tab)?.GuiContext : null;
+
+            using var reader = new StringReader(text ?? string.Empty);
+            while (reader.ReadLine() is { } path)
+            {
+                if (Path.IsPathRooted(path) && File.Exists(path))
+                {
+                    yield return (path, null, null);
+                }
+
+                // If it's a relative path then check if we have an open and active package to use as root.
+                else if (!string.IsNullOrWhiteSpace(path) && packageContext?.CurrentPackage is { } package)
+                {
+                    var entry = package.FindEntry(path) ?? package.FindEntry(path + GameFileLoader.CompiledFileSuffix);
+                    if (entry != null)
+                    {
+                        yield return (path, packageContext, entry);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Handles find/search functionality for the selected tab.
+        /// </summary>
+        /// <param name="sender">Object which raised event.</param>
+        /// <param name="e">Event data.</param>
+        private void FindToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (mainTabs.SelectedTab == null)
+            {
+                return;
+            }
+
+            var codeTextBox = FindCodeTextBoxInControl(mainTabs.SelectedTab);
+            if (codeTextBox != null)
+            {
+                codeTextBox.ShowFindDialog();
+                return;
+            }
+
+            var package = mainTabs.SelectedTab.Controls.OfType<TreeViewWithSearchResults>().FirstOrDefault();
+            if (package != null)
+            {
+                var selected = package.mainTreeView.SelectedNode as BetterTreeNode;
+                ShowPackageSearch(package, selected?.PkgNode ?? (selected?.Parent as BetterTreeNode)?.PkgNode, onlyInFolder: false);
+                return;
+            }
+
+            mainTabs.SelectedTab.Controls.OfType<ExplorerControl>().FirstOrDefault()?.FocusFilter();
+        }
+
+        private void ShowPackageSearch(TreeViewWithSearchResults package, VirtualPackageNode? folder, bool onlyInFolder)
+        {
+            if (package.mainTreeView.VrfGuiContext?.CurrentPackage is not { } currentPackage)
+            {
+                return;
+            }
+
+            searchForm ??= new();
+            searchForm.SetSearchableUserDataKeys(package.GetSearchDataKeysAsync());
+            searchForm.SetPackage(currentPackage, folder?.Parent != null ? folder : null, onlyInFolder);
+
+            if (searchForm.ShowDialog() == DialogResult.OK)
+            {
+                package.SearchAndFillResults(searchForm.Request);
+            }
+        }
+
+        private static CodeTextBox? FindCodeTextBoxInControl(Control container)
+        {
+            if (container is CodeTextBox codeTextBox)
+            {
+                return codeTextBox;
+            }
+
+            if (container is TabControl tabControl && tabControl.SelectedTab != null)
+            {
+                return FindCodeTextBoxInControl(tabControl.SelectedTab);
+            }
+
+            foreach (Control child in container.Controls)
+            {
+                var found = FindCodeTextBoxInControl(child);
+                if (found != null)
+                {
+                    return found;
+                }
+            }
+
+            return null;
+        }
+
+        private void OpenExplorer_Click(object sender, EventArgs e) => OpenExplorer();
+
+        private ExplorerControl EnsureExplorerControl()
+        {
+            explorerControl ??= new ExplorerControl { Dock = DockStyle.Fill };
+            return explorerControl;
+        }
+
+        private void OpenExplorer()
+        {
+            if (mainTabs.OpenTab("Explorer"))
+            {
+                return;
+            }
+
+            var explorerTab = new ThemedTabPage("Explorer")
+            {
+                ToolTipText = "Explorer",
+                ImageIndex = AppIcons.Icons["Explorer"],
+            };
+
+            try
+            {
+                explorerTab.Controls.Add(EnsureExplorerControl());
+                mainTabs.TabPages.Insert(1, explorerTab);
+                mainTabs.SelectTab(explorerTab);
+                explorerTab = null;
+            }
+            finally
+            {
+                explorerTab?.Dispose();
+            }
+        }
+
+        private void OpenWelcome()
+        {
+            if (mainTabs.OpenTab("Welcome"))
+            {
+                return;
+            }
+
+            var welcomeTab = new ThemedTabPage("Welcome")
+            {
+                ToolTipText = "Welcome",
+                ImageIndex = AppIcons.Icons["WelcomeScreen"],
+            };
+
+            try
+            {
+                welcomeTab.Controls.Add(new WelcomeControl(EnsureExplorerControl())
+                {
+                    Dock = DockStyle.Fill
+                });
+                mainTabs.TabPages.Add(welcomeTab);
+                mainTabs.SelectTab(welcomeTab);
+                welcomeTab = null;
+            }
+            finally
+            {
+                welcomeTab?.Dispose();
+            }
+        }
+
+        private void ClearConsoleToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            Log.ClearConsole();
+        }
+
+        protected override void OnTextChanged(EventArgs e)
+        {
+            base.OnTextChanged(e);
+
+            mainFormBottomPanel.Text = Text;
+        }
+
+        private async void CheckForUpdatesIfNecessary()
+        {
+            await UpdateChecker.CheckForUpdatesIfNecessary().ConfigureAwait(true);
+
+            mainFormBottomPanel.RefreshUpdateState();
+        }
+
+        public void ShowAbout()
+        {
+            mainFormBottomPanel.ShowAboutDialog();
+        }
+
+        public void ShowUpdateAfterError()
+        {
+            mainFormBottomPanel.ShowUpdateAfterError();
+        }
+
+#if DEBUG
+        private static void ValidateShaders()
+        {
+            using var progressDialog = new GenericProgressForm
+            {
+                Text = "Compiling shaders…"
+            };
+            progressDialog.OnProcess = _ =>
+            {
+                var window = NativeWindowFactory.Create(new()
+                {
+                    APIVersion = ValveResourceFormat.Renderer.GLEnvironment.RequiredVersion,
+                    Flags = GLBaseControl.Flags | OpenTK.Windowing.Common.ContextFlags.Offscreen,
+                    StartVisible = false,
+                    Title = "Source 2 Viewer Shader Validator"
+                });
+
+                try
+                {
+                    window.MakeCurrent();
+
+                    ValveResourceFormat.Renderer.Shaders.ShaderLoader.ValidateShaders(new Progress<string>(progressDialog.SetProgress), VrfGuiContext.Logger);
+                }
+                finally
+                {
+                    NativeWindowFactory.Destroy(window);
+                }
+
+                return Task.CompletedTask;
+            };
+            progressDialog.ShowDialog();
+        }
+#endif
+
+    }
+}

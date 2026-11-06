@@ -1,0 +1,56 @@
+using System.Diagnostics;
+using System.Runtime.ExceptionServices;
+using ValveResourceFormat.ResourceTypes.ModelAnimation2;
+
+namespace GUI.Utils
+{
+    /// <summary>
+    /// Shows failed <see cref="Debug.Assert(bool)"/> calls in the error dialog before
+    /// fail-fasting the process when no debugger is attached.
+    /// </summary>
+    internal sealed class AssertTraceListener : DefaultTraceListener
+    {
+        internal sealed class AssertFailedException : Exception
+        {
+            public AssertFailedException() { }
+            public AssertFailedException(string message) : base(message) { }
+            public AssertFailedException(string message, Exception innerException) : base(message, innerException) { }
+        }
+
+        public override void Fail(string? message, string? detailMessage)
+        {
+            if (Debugger.IsAttached)
+            {
+                Debugger.Break();
+                return;
+            }
+
+            var text = string.IsNullOrEmpty(message) ? "Assertion failed" : message;
+
+            if (!string.IsNullOrEmpty(detailMessage))
+            {
+                text += Environment.NewLine + detailMessage;
+            }
+
+            var exception = new AssertFailedException(text);
+
+            // Asserts fire mid update, while the graph that tripped them can still describe itself
+            if (AnimationGraph.DescribeUpdatingGraph() is { } graphState)
+            {
+                exception.Data[AnimationGraph.ExceptionDataKey] = graphState;
+            }
+            ExceptionDispatchInfo.SetRemoteStackTrace(exception, new StackTrace(fNeedFileInfo: true).ToString());
+
+            try
+            {
+                ErrorReport.ShowError(exception);
+            }
+            catch
+            {
+                // UI may not be available yet; fail fast regardless
+            }
+
+            Environment.FailFast(text, exception);
+        }
+    }
+}

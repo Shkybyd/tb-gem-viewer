@@ -1,0 +1,52 @@
+"ResourceEditInfo"
+{
+	"InputDependencies"
+	{
+		"0"
+		{
+			"ContentRelativeFilename"	"soundevents/soundevents_manifest.vrman"
+			"ContentSearchPath"	"dota"
+			"FileCRC"	"1501683164"
+			"Optional"	"0"
+			"FileExists"	"1"
+			"IsGameFile"	"0"
+		}
+	}
+	"AdditionalInputDependencies"
+	{
+	}
+	"ArgumentDependencies"
+	{
+		"0"
+		{
+			"ParameterName"	"___OverrideInputData___"
+			"ParameterType"	"BinaryBlobArg"
+			"Fingerprint"	"0"
+			"FingerprintDefault"	"0"
+		}
+	}
+	"SpecialDependencies"
+	{
+		"0"
+		{
+			"String"	"Manifest Compiler Version"
+			"CompilerIdentifier"	"CompileResourceManifest"
+			"Fingerprint"	"2"
+			"UserData"	"0"
+		}
+	}
+	"AdditionalRelatedFiles"
+	{
+	}
+	"ChildResourceList"
+	{
+	}
+	"SearchableUserData"
+	{
+		"0"
+		{
+			"Key"	"IsChildResource"
+			"Value"	"0"
+		}
+	}
+}

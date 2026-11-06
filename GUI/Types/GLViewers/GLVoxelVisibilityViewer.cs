@@ -1,0 +1,27 @@
+using GUI.Utils;
+using ValveResourceFormat.Blocks;
+using ValveResourceFormat.Renderer;
+using ValveResourceFormat.Renderer.SceneNodes;
+
+namespace GUI.Types.GLViewers
+{
+    class GLVoxelVisibilityViewer : GLSceneViewer
+    {
+        private readonly IWorldVisibility voxelVisibility;
+
+        public GLVoxelVisibilityViewer(VrfGuiContext vrfGuiContext, RendererContext rendererContext, IWorldVisibility voxelVisibility)
+            : base(vrfGuiContext, rendererContext)
+        {
+            this.voxelVisibility = voxelVisibility;
+        }
+
+        protected override void LoadScene()
+        {
+            var sceneNode = new VisibilitySceneNode(Scene, voxelVisibility)
+            {
+                Layers = [WorldLayer.VisibilityClusters],
+            };
+            Scene.Add(sceneNode, false);
+        }
+    }
+}

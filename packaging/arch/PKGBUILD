@@ -1,0 +1,42 @@
+# Maintainer: Shkybyd
+pkgname=tb-gem-viewer
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Preview the Terrorblade arcana with any prismatic gem, rendered from your own Dota 2 install"
+arch=('x86_64')
+url="https://github.com/Shkybyd/tb-gem-viewer"
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'libglvnd' 'libx11' 'libxrandr' 'libxinerama' 'libxcursor' 'libxi')
+makedepends=('dotnet-sdk>=10' 'git')
+optdepends=('wayland: native Wayland windows'
+            'libxkbcommon: keyboard input on Wayland'
+            'steam: Dota 2 has to be installed for the viewer to read its files')
+options=('!strip' '!debug')
+source=("$pkgname::git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname"
+  export DOTNET_CLI_TELEMETRY_OPTOUT=1
+  export DOTNET_NOLOGO=1
+  dotnet publish TBGemViewer/TBGemViewer.csproj \
+    --configuration Release \
+    --runtime linux-x64 \
+    --self-contained \
+    -p:PublishSingleFile=false \
+    -p:PublishReadyToRun=false \
+    --output "$srcdir/publish"
+}
+
+package() {
+  install -d "$pkgdir/opt/$pkgname"
+  cp -a "$srcdir/publish/." "$pkgdir/opt/$pkgname/"
+  chmod 755 "$pkgdir/opt/$pkgname/TBGemViewer"
+
+  install -d "$pkgdir/usr/bin"
+  ln -s "/opt/$pkgname/TBGemViewer" "$pkgdir/usr/bin/$pkgname"
+
+  install -Dm644 "$srcdir/$pkgname/packaging/arch/$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
+  install -Dm644 "$srcdir/$pkgname/Misc/Icons/source2viewer.png" "$pkgdir/usr/share/pixmaps/$pkgname.png"
+  install -Dm644 "$srcdir/$pkgname/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

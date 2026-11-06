@@ -1,0 +1,50 @@
+"ResourceEditInfo"
+{
+	"InputDependencies"
+	{
+	}
+	"AdditionalInputDependencies"
+	{
+	}
+	"ArgumentDependencies"
+	{
+		"0"
+		{
+			"ParameterName"	"___OverrideInputData___"
+			"ParameterType"	"BinaryBlobArg"
+			"Fingerprint"	"1023186713"
+			"FingerprintDefault"	"0"
+		}
+		"1"
+		{
+			"ParameterName"	"ModelBoneFlagsListReference"
+			"ParameterType"	"CustomArg"
+			"Fingerprint"	"4294967295"
+			"FingerprintDefault"	"0"
+		}
+	}
+	"SpecialDependencies"
+	{
+		"0"
+		{
+			"String"	"Animation Group Compiler Version"
+			"CompilerIdentifier"	"CompileAnimGroup"
+			"Fingerprint"	"33"
+			"UserData"	"0"
+		}
+	}
+	"AdditionalRelatedFiles"
+	{
+	}
+	"ChildResourceList"
+	{
+	}
+	"SearchableUserData"
+	{
+		"0"
+		{
+			"Key"	"IsChildResource"
+			"Value"	"1"
+		}
+	}
+}

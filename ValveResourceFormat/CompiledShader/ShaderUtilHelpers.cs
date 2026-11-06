@@ -1,0 +1,613 @@
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using ValveResourceFormat.Serialization.VfxEval;
+
+namespace ValveResourceFormat.CompiledShader
+{
+    /// <summary>
+    /// Provides utility helper methods for shader processing and manipulation.
+    /// </summary>
+    public static class ShaderUtilHelpers
+    {
+        /// <summary>
+        /// Gets the name of an enum value, decomposing combined flags values, or the plain number when it has no name.
+        /// </summary>
+        public static string GetEnumName(Type enumSource, int value)
+        {
+            if (enumSource.GetEnumName(value) is string name)
+            {
+                return name;
+            }
+
+            if (enumSource.IsDefined(typeof(FlagsAttribute), inherit: false))
+            {
+                // a value whose bits do not fully decompose into members renders as a plain number
+                var flags = Enum.ToObject(enumSource, value).ToString()!;
+
+                if (!char.IsAsciiDigit(flags[0]) && flags[0] != '-')
+                {
+                    return flags.Replace(", ", "|", StringComparison.Ordinal);
+                }
+            }
+
+            return value.ToString(CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>
+        /// Parses a VCS filename to extract shader information.
+        /// </summary>
+        /// <param name="filenamepath">The VCS file path to parse.</param>
+        /// <returns>A tuple containing the shader name, program type, platform type, and shader model type.</returns>
+        public static (string ShaderName, VcsProgramType ProgramType, VcsPlatformType PlatformType, VcsShaderModelType ShaderModelType)
+            ComputeVCSFileName(string filenamepath)
+        {
+            var fileTokens = Path.GetFileNameWithoutExtension(filenamepath).Split("_");
+            if (fileTokens.Length < 4)
+            {
+                throw new ShaderParserException($"File name convention unknown or not supported {filenamepath}");
+            }
+
+            var vcsProgramType = ComputeVcsProgramType(fileTokens[^1].ToLowerInvariant());
+
+            var vcsPlatformType = fileTokens[^3].ToLowerInvariant() switch
+            {
+                "pc" => VcsPlatformType.PC,
+                "pcgl" => VcsPlatformType.PCGL,
+                "gles" => VcsPlatformType.MOBILE_GLES,
+                "vulkan" => VcsPlatformType.VULKAN,
+                _ => VcsPlatformType.Undetermined
+            };
+
+            var shaderNameCutoff = fileTokens.Length - 3;
+
+            if (vcsPlatformType == VcsPlatformType.VULKAN)
+            {
+                vcsPlatformType = fileTokens[^4].ToLowerInvariant() switch
+                {
+                    "android" => VcsPlatformType.ANDROID_VULKAN,
+                    "ios" => VcsPlatformType.IOS_VULKAN,
+                    _ => VcsPlatformType.VULKAN
+                };
+            }
+
+            if (vcsPlatformType == VcsPlatformType.MOBILE_GLES || vcsPlatformType == VcsPlatformType.ANDROID_VULKAN ||
+                vcsPlatformType == VcsPlatformType.IOS_VULKAN)
+            {
+                shaderNameCutoff--;
+            }
+
+            var vcsShaderModelType = fileTokens[^2].ToLowerInvariant() switch
+            {
+                "20" => VcsShaderModelType._20,
+                "2b" => VcsShaderModelType._2b,
+                "30" => VcsShaderModelType._30,
+                "31" => VcsShaderModelType._31,
+                "40" => VcsShaderModelType._40,
+                "41" => VcsShaderModelType._41,
+                "50" => VcsShaderModelType._50,
+                "60" => VcsShaderModelType._60,
+                _ => VcsShaderModelType.Undetermined
+            };
+
+            if (vcsProgramType == VcsProgramType.Undetermined ||
+                vcsPlatformType == VcsPlatformType.Undetermined ||
+                vcsShaderModelType == VcsShaderModelType.Undetermined)
+            {
+                throw new ShaderParserException($"File type unknown or not supported {filenamepath}");
+            }
+            else
+            {
+                return (string.Join("_", fileTokens[..shaderNameCutoff]), vcsProgramType, vcsPlatformType, vcsShaderModelType);
+            }
+        }
+
+        /// <summary>
+        /// Constructs a VCS filename from shader components.
+        /// </summary>
+        /// <param name="shaderName">The shader name.</param>
+        /// <param name="programType">The program type.</param>
+        /// <param name="platformType">The platform type.</param>
+        /// <param name="shaderModelType">The shader model type.</param>
+        /// <returns>The constructed VCS filename.</returns>
+        public static string ComputeVCSFileName(string shaderName,
+            VcsProgramType programType, VcsPlatformType platformType, VcsShaderModelType shaderModelType)
+        {
+            var shaderModelTypeString = shaderModelType switch
+            {
+                VcsShaderModelType._20 => "20",
+                VcsShaderModelType._2b => "2b",
+                VcsShaderModelType._30 => "30",
+                VcsShaderModelType._31 => "31",
+                VcsShaderModelType._40 => "40",
+                VcsShaderModelType._41 => "41",
+                VcsShaderModelType._50 => "50",
+                VcsShaderModelType._60 => "60",
+                _ => throw new ShaderParserException($"Unknown VCS shader model type {shaderModelType}")
+            };
+
+            return string.Join('_', Path.GetFileNameWithoutExtension(shaderName),
+                platformType.ToString().ToLowerInvariant(), shaderModelTypeString, ComputeVcsProgramType(programType)) + ".vcs";
+        }
+
+        /// <summary>
+        /// Converts a program type abbreviation string to a <see cref="VcsProgramType"/> enum value.
+        /// </summary>
+        /// <param name="abbrev">The program type abbreviation (e.g., "vs", "ps", "features").</param>
+        /// <returns>The corresponding <see cref="VcsProgramType"/> enum value.</returns>
+        public static VcsProgramType ComputeVcsProgramType(string abbrev)
+        {
+            // When adding new types make sure to add a small shader file to the tests folder
+            return abbrev switch
+            {
+                "features" => VcsProgramType.Features,
+                "vs" => VcsProgramType.VertexShader,
+                "ps" => VcsProgramType.PixelShader,
+                "psrs" => VcsProgramType.PixelShaderRenderState,
+                "gs" => VcsProgramType.GeometryShader,
+                "cs" => VcsProgramType.ComputeShader,
+                "hs" => VcsProgramType.HullShader,
+                "ds" => VcsProgramType.DomainShader,
+                "rtx" => VcsProgramType.RaytracingShader,
+                "ms" => VcsProgramType.MeshShader,
+                _ => VcsProgramType.Undetermined
+            };
+        }
+
+        /// <summary>
+        /// Converts a <see cref="VcsProgramType"/> enum value to its abbreviation string.
+        /// </summary>
+        /// <param name="type">The <see cref="VcsProgramType"/> enum value.</param>
+        /// <returns>The program type abbreviation (e.g., "vs", "ps", "features").</returns>
+        public static string ComputeVcsProgramType(VcsProgramType type)
+        {
+            // When adding new types make sure to add a small shader file to the tests folder
+            return type switch
+            {
+                VcsProgramType.Features => "features",
+                VcsProgramType.VertexShader => "vs",
+                VcsProgramType.PixelShader => "ps",
+                VcsProgramType.PixelShaderRenderState => "psrs",
+                VcsProgramType.GeometryShader => "gs",
+                VcsProgramType.ComputeShader => "cs",
+                VcsProgramType.HullShader => "hs",
+                VcsProgramType.DomainShader => "ds",
+                VcsProgramType.RaytracingShader => "rtx",
+                VcsProgramType.MeshShader => "ms",
+                _ => throw new ShaderParserException($"Unknown VCS program type {type}")
+            };
+        }
+
+        /// <summary>
+        /// Shortens a shader parameter name for display purposes.
+        /// </summary>
+        /// <param name="shaderParam">The full shader parameter name.</param>
+        /// <returns>The shortened parameter name.</returns>
+        public static string ShortenShaderParam(string shaderParam)
+        {
+            if (shaderParam.Length <= 4)
+            {
+                return shaderParam;
+            }
+            var splitName = shaderParam[2..].Split("_");
+            var newName = "";
+            if (splitName[0] == "MODE")
+            {
+                if (splitName.Length == 2)
+                {
+                    return splitName[1].Length > 3 ? $"M_{splitName[1][0..3]}" : $"M_{splitName[1]}";
+                }
+                newName = "M_";
+                for (var i = 1; i < splitName.Length; i++)
+                {
+                    newName += splitName[i][0..1];
+                }
+                return newName;
+            }
+            if (splitName.Length > 2)
+            {
+                for (var i = 0; i < splitName.Length && i < 5; i++)
+                {
+                    newName += splitName[i][..1];
+                }
+                return newName;
+            }
+            if (splitName.Length == 1)
+            {
+                return splitName[0].Length > 4 ? splitName[0][..4] : splitName[0];
+            }
+            newName = splitName[0].Length > 3 ? splitName[0][0..3] : splitName[0];
+            return $"{newName}_{splitName[1][0..1]}";
+        }
+
+        /// <summary>
+        /// Formats the enabled combos of a configuration state, for example <c>S_MODE_DEPTH, S_DETAIL=2</c>.
+        /// </summary>
+        /// <param name="combos">The static or dynamic combos of a program.</param>
+        /// <param name="state">The configuration state, one value per combo.</param>
+        /// <returns>The combos with a non-zero value, or an empty string when there are none.</returns>
+        public static string FormatComboState(VfxCombo[] combos, int[] state)
+        {
+            var parts = new List<string>();
+
+            for (var i = 0; i < state.Length; i++)
+            {
+                if (state[i] == 0)
+                {
+                    continue;
+                }
+
+                parts.Add(state[i] == 1 ? combos[i].Name : $"{combos[i].Name}={state[i].ToString(CultureInfo.InvariantCulture)}");
+            }
+
+            return string.Join(", ", parts);
+        }
+
+        /// <summary>
+        /// Combines an integer array into a comma-separated string.
+        /// </summary>
+        /// <param name="values">The integer array to combine.</param>
+        /// <param name="includeParenth">Whether to include parentheses around the result.</param>
+        /// <returns>A string representation of the integer array.</returns>
+        public static string CombineIntArray(int[] values, bool includeParenth = false)
+        {
+            if (values.Length == 0)
+            {
+                return $"_";
+            }
+
+            var builder = new StringBuilder();
+            foreach (var i in values)
+            {
+                builder.Append(i.ToString(CultureInfo.InvariantCulture)).Append(',');
+            }
+            builder.Length--;
+            var valueString = builder.ToString();
+            return includeParenth ? $"({valueString})" : $"{valueString}";
+        }
+
+        /// <summary>
+        /// Combines an integer array into a space-separated, padded string.
+        /// </summary>
+        /// <param name="values">The integer array to combine.</param>
+        /// <param name="padding">The padding width for each value.</param>
+        /// <returns>A padded string representation of the integer array.</returns>
+        public static string CombineIntsSpaceSep(int[] values, int padding = 5)
+        {
+            if (values.Length == 0)
+            {
+                return $"_".PadLeft(padding);
+            }
+
+            var builder = new StringBuilder();
+            foreach (var v in values)
+            {
+                var text = v != 0 ? v.ToString(CultureInfo.InvariantCulture) : "_";
+                builder.Append(text.PadLeft(padding));
+            }
+            return builder.ToString();
+        }
+
+        /// <summary>
+        /// Converts an integer array to a string array, with optional nulled value replacement.
+        /// </summary>
+        /// <param name="ints">The integer array to convert.</param>
+        /// <param name="nulledValue">The value to treat as null and replace with underscore.</param>
+        /// <returns>An array of string representations.</returns>
+        public static string[] IntArrayToStrings(int[] ints, int nulledValue = int.MaxValue)
+        {
+            var stringTokens = new string[ints.Length];
+            for (var i = 0; i < ints.Length; i++)
+            {
+                stringTokens[i] = ints[i] == nulledValue ? "_" : $"{ints[i]}";
+            }
+            return stringTokens;
+        }
+
+        /// <summary>
+        /// Combines a string array into a space-separated, padded string.
+        /// </summary>
+        /// <param name="strings">The string array to combine.</param>
+        /// <param name="padding">The padding width for each string.</param>
+        /// <returns>A padded string representation of the string array.</returns>
+        public static string CombineStringsSpaceSep(string[] strings, int padding = 5)
+        {
+            var builder = new StringBuilder();
+            foreach (var s in strings)
+            {
+                builder.Append(s.PadLeft(padding));
+            }
+            return builder.ToString();
+        }
+
+        /// <summary>
+        /// Combines a string array into a comma-separated string.
+        /// </summary>
+        /// <param name="strings">The string array to combine.</param>
+        /// <param name="includeParenth">Whether to include parentheses around the result.</param>
+        /// <returns>A string representation of the string array.</returns>
+        public static string CombineStringArray(string[] strings, bool includeParenth = false)
+        {
+            if (strings.Length == 0)
+            {
+                return $"_";
+            }
+
+            var combinedString = string.Join(", ", strings);
+            return includeParenth ? $"({combinedString})" : $"{combinedString}";
+        }
+
+        /// <summary>
+        /// Combines a string array with line breaks at a specified length.
+        /// </summary>
+        /// <param name="strings">The string array to combine.</param>
+        /// <param name="breakLen">The maximum line length before breaking to a new line.</param>
+        /// <returns>An array of strings broken at the specified length.</returns>
+        public static string[] CombineValuesBreakString(string[] strings, int breakLen)
+        {
+            List<string> stringCollection = [];
+            if (strings.Length == 0)
+            {
+                stringCollection.Add("");
+                return [.. stringCollection];
+            }
+            var line = strings[0] + ", ";
+            for (var i = 1; i < strings.Length; i++)
+            {
+                if (line.Length + strings[i].Length + 1 < breakLen)
+                {
+                    line += strings[i] + ", ";
+                }
+                else
+                {
+                    stringCollection.Add(line[0..^2]);
+                    line = strings[i] + ", ";
+                }
+            }
+            if (line.Length > 0)
+            {
+                stringCollection.Add(line[0..^2]);
+            }
+            return [.. stringCollection];
+        }
+
+        /// <summary>
+        /// Converts a byte span to a hexadecimal string representation.
+        /// </summary>
+        /// <param name="bytes">The byte data to convert.</param>
+        /// <param name="breakLen">The number of bytes per line (-1 for no breaks).</param>
+        /// <returns>A hexadecimal string representation of the byte data.</returns>
+        public static string BytesToString(ReadOnlySpan<byte> bytes, int breakLen = 32)
+        {
+            if (bytes.Length == 0)
+            {
+                return "";
+            }
+            if (breakLen == -1)
+            {
+                breakLen = int.MaxValue;
+            }
+            var count = 0;
+            var builder = new StringBuilder(bytes.Length * 3);
+            for (var i = 0; i < bytes.Length; i++)
+            {
+                builder.Append(bytes[i].ToString("X02", CultureInfo.InvariantCulture)).Append(' ');
+                if (++count % breakLen == 0)
+                {
+                    builder.Append('\n');
+                }
+            }
+            return builder.ToString().Trim();
+        }
+
+        /// <summary>
+        /// Parses a dynamic expression from bytecode.
+        /// </summary>
+        /// <param name="bytecode">The dynamic expression bytecode.</param>
+        /// <returns>The parsed expression string.</returns>
+        public static string ParseDynamicExpression(byte[] bytecode)
+        {
+            return new VfxEval(bytecode, omitReturnStatement: true).DynamicExpressionResult.Replace("UNKNOWN", "VAR", StringComparison.Ordinal);
+        }
+
+        // This must be in sync with VfxVariableType without gaps
+        private static readonly string[] VfxVariableTypeToString = [
+            "void",
+            "float",
+            "float2",
+            "float3",
+            "float4",
+            "int",
+            "int2",
+            "int3",
+            "int4",
+            "bool",
+            "bool2",
+            "bool3",
+            "bool4",
+            "Sampler1D",
+            "Sampler2D",
+            "Sampler3D",
+            "SamplerCube",
+            "float3x3",
+            "float4x3",
+            "float4x4",
+            "struct",
+            "cbuffer",
+            "SamplerCube[]",
+            "Sampler2D[]",
+            "buffer",
+            "Sampler1D[]",
+            "Sampler3D[]",
+            "StructuredBuffer",
+            "ByteAddressBuffer",
+            "RWBuffer<float4>",
+            "RWTexture1D<float4>",
+            "RWTexture1D<float4>[]",
+            "RWTexture2D<float4>",
+            "RWTexture2D<float4>[]",
+            "RWTexture3D<float4>",
+            "RWStructuredBuffer",
+            "RWByteAddressBuffer",
+            "AppendStructuredBuffer",
+            "ConsumeStructuredBuffer",
+            "RWStructuredBufferWithCounter",
+            "ExternalDescriptorSet",
+            "string",
+            "SamplerStateIndex",
+            "Texture2DIndex",
+            "Texture3DIndex",
+            "TextureCubeIndex",
+            "Texture2DArrayIndex",
+            "TextureCubeArrayIndex",
+        ];
+
+        /// <summary>
+        /// Converts a <see cref="VfxVariableType"/> enum value to its string representation.
+        /// </summary>
+        /// <param name="type">The VFX variable type.</param>
+        /// <returns>The string representation of the variable type.</returns>
+        public static string GetVfxVariableTypeString(VfxVariableType type)
+        {
+            var t = (int)type;
+            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(t, VfxVariableTypeToString.Length, nameof(type));
+
+            return VfxVariableTypeToString[t];
+        }
+
+        internal static bool IsSpirvCrossAvailable()
+        {
+            // https://github.com/amerkoleci/Vortice.Vulkan/issues/66
+            var isLinuxArm64 = RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && RuntimeInformation.ProcessArchitecture == Architecture.Arm64;
+            return !isLinuxArm64;
+        }
+
+        internal class OutputFormatterTabulatedData(IndentedTextWriter OutputWriter)
+        {
+            public void Write(string text)
+            {
+                OutputWriter.Write(text);
+            }
+
+            public void WriteLine(string text)
+            {
+                OutputWriter.WriteLine(text);
+            }
+
+            public void BreakLine()
+            {
+                OutputWriter.WriteLine();
+            }
+
+            private List<string> headerValues = [];
+            private List<List<string>> tabulatedValues = [];
+            private List<int> columnWidths = [];
+
+            public void DefineHeaders(string[] headers)
+            {
+                headerValues = [];
+                tabulatedValues = [];
+                columnWidths = [];
+                foreach (var s in headers)
+                {
+                    headerValues.Add(s);
+                    columnWidths.Add(s.Length);
+                }
+                tabulatedValues.Add(headerValues);
+            }
+            public void AddTabulatedRow(string[] rowMembers)
+            {
+                if (headerValues.Count != rowMembers.Length)
+                {
+                    throw new ShaderParserException("wrong number of columns");
+                }
+                List<string> newRow = [];
+                List<List<string>> additionalRows = [];
+                for (var i = 0; i < rowMembers.Length; i++)
+                {
+                    var firstLine = rowMembers[i];
+                    if (firstLine.Contains('\n', StringComparison.Ordinal))
+                    {
+                        var multipleLines = firstLine.Split("\n");
+                        AddExtraLines(additionalRows, multipleLines, i);
+                        firstLine = multipleLines[0];
+                    }
+
+                    newRow.Add(firstLine);
+                    if (firstLine.Length > columnWidths[i])
+                    {
+                        columnWidths[i] = firstLine.Length;
+                    }
+                }
+                tabulatedValues.Add(newRow);
+                foreach (var additionalRow in additionalRows)
+                {
+                    tabulatedValues.Add(additionalRow);
+                }
+            }
+            private void AddExtraLines(List<List<string>> additionalRows, string[] multipleLines, int ind)
+            {
+                for (var i = 1; i < multipleLines.Length; i++)
+                {
+                    if (additionalRows.Count < i)
+                    {
+                        additionalRows.Add(EmptyRow());
+                    }
+                    additionalRows[i - 1][ind] = multipleLines[i];
+
+                    if (multipleLines[i].Length > columnWidths[ind])
+                    {
+                        columnWidths[ind] = multipleLines[i].Length;
+                    }
+                }
+            }
+            private List<string> EmptyRow()
+            {
+                List<string> newRow = [];
+                for (var i = 0; i < headerValues.Count; i++)
+                {
+                    newRow.Add("");
+                }
+                return newRow;
+            }
+
+            public List<string> BuildTabulatedRows(int spacing = 2, bool reverse = false)
+            {
+                List<string> tabbedRows = [];
+                if (tabulatedValues.Count == 1 && tabulatedValues[0].Count == 0)
+                {
+                    return tabbedRows;
+                }
+                var tabbedRow = new StringBuilder();
+                foreach (var rowTokens in tabulatedValues)
+                {
+                    tabbedRow.Clear();
+                    for (var i = 0; i < rowTokens.Count; i++)
+                    {
+                        var pad = columnWidths[i] + spacing;
+                        tabbedRow.Append(rowTokens[i].PadRight(pad));
+                    }
+                    if (tabbedRow.Length > 0)
+                    {
+                        tabbedRows.Add(tabbedRow.ToString(0, tabbedRow.Length - spacing));
+                    }
+                }
+                if (reverse)
+                {
+                    tabbedRows.Reverse();
+                }
+                return tabbedRows;
+            }
+
+            public void PrintTabulatedValues(int spacing = 2)
+            {
+                var tabbedRows = BuildTabulatedRows(spacing);
+                foreach (var row in tabbedRows)
+                {
+                    WriteLine(row);
+                }
+            }
+        }
+    }
+}

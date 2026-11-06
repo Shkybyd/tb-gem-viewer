@@ -1,0 +1,36 @@
+namespace ValveResourceFormat.Particles.Operators
+{
+    /// <summary>
+    /// Copies the position of a control point into a vector particle attribute each frame.
+    /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particles/C_OP_SetCPtoVector">C_OP_SetCPtoVector</seealso>
+    class SetCPtoVector : ParticleFunctionOperator
+    {
+        private readonly int inputCpNumber;
+        private readonly ParticleField fieldOutput = ParticleField.Position;
+
+        public SetCPtoVector(ParticleDefinitionParser parse) : base(parse)
+        {
+            inputCpNumber = parse.Int32("m_nCPInput", inputCpNumber);
+            fieldOutput = parse.ParticleField("m_nFieldOutput", fieldOutput);
+        }
+
+        public override void AddControlPointDefaults(ControlPointDefaults defaults)
+        {
+            defaults.AddField(inputCpNumber, fieldOutput);
+        }
+
+        /// <inheritdoc/>
+        public override ulong StoredFields => fieldOutput.Mask();
+
+        public override void Operate(ParticleCollection particles, float frameTime, ParticleSystemState particleSystemState, float strength)
+        {
+            var value = particleSystemState.GetControlPoint(inputCpNumber).Position;
+
+            if (ParticleBuffer.IsVector(fieldOutput))
+            {
+                particles.Current.Vectors(fieldOutput).Fill(value);
+            }
+        }
+    }
+}

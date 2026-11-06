@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TB Gem Viewer
+GenericName=Prismatic gem preview
+Comment=Preview the Terrorblade arcana with any prismatic gem
+Comment[ru]=Просмотр арканы Террорблейда с любым призматическим самоцветом
+Exec=tb-gem-viewer
+Icon=tb-gem-viewer
+Terminal=false
+Categories=Graphics;Viewer;Game;

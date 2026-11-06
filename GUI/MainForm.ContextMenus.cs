@@ -1,0 +1,499 @@
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using GUI.Controls;
+using GUI.Forms;
+using GUI.Types.Exporter;
+using GUI.Types.GLViewers;
+using GUI.Types.PackageViewer;
+using GUI.Utils;
+using ValvePak;
+using ValveResourceFormat.IO;
+
+namespace GUI
+{
+    partial class MainForm
+    {
+        public void ShowVpkContextMenu(Control control, Point position, bool isRootNode, bool isFolderNode, bool deletedFilesRecovered, bool canEdit)
+        {
+            copyFileNameToolStripMenuItem.Visible = !isRootNode;
+            openWithDefaultAppToolStripMenuItem.Visible = !isRootNode && !isFolderNode;
+            openWithoutViewerToolStripMenuItem.Visible = !isRootNode && !isFolderNode;
+            viewAssetInfoToolStripMenuItem.Visible = !isRootNode && !isFolderNode;
+            searchInFolderToolStripMenuItem.Visible = isFolderNode && !isRootNode;
+
+            verifyPackageContentsToolStripMenuItem.Visible = isRootNode;
+            recoverDeletedToolStripMenuItem.Visible = isRootNode && !deletedFilesRecovered;
+            editThisVpkToolStripMenuItem.Visible = isRootNode && canEdit;
+
+            vpkContextMenu.Show(control, position);
+        }
+
+        private static TabPage FetchToolstripTabContext(object sender)
+        {
+            if (sender is not ToolStripMenuItem { Owner: ContextMenuStrip { SourceControl: ThemedTabControl tabControl } contextMenu })
+            {
+                throw new InvalidDataException("Invalid context menu structure");
+            }
+
+            var tabs = tabControl.TabPages;
+
+            if (contextMenu.Tag is not Point location)
+            {
+                throw new InvalidDataException("Context menu tag is not a Point");
+            }
+
+            return tabs.Cast<TabPage>().Where((t, i) => tabControl.GetDisplayTabRect(i).Contains(location)).First();
+        }
+
+        private void CloseToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            mainTabs.CloseTab(FetchToolstripTabContext(sender));
+        }
+
+        private void CloseOtherTabsToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            CloseOtherTabs(FetchToolstripTabContext(sender));
+        }
+
+        private void CloseToolStripMenuItemsToLeft_Click(object sender, EventArgs e)
+        {
+            CloseTabsToLeft(FetchToolstripTabContext(sender));
+        }
+
+        private void CloseToolStripMenuItemsToRight_Click(object sender, EventArgs e)
+        {
+            CloseTabsToRight(FetchToolstripTabContext(sender));
+        }
+
+        private void CloseToolStripMenuItems_Click(object sender, EventArgs e)
+        {
+            CloseAllTabs();
+        }
+
+        private void MuteTabToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (GLBaseControl.FindHostedIn(FetchToolstripTabContext(sender)) is GLSceneViewer viewer)
+            {
+                viewer.Muted = !viewer.Muted;
+            }
+        }
+
+        private void CopyTabUrlToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (FetchToolstripTabContext(sender).Tag is ExportData exportData)
+            {
+                AppClipboard.SetText(exportData.VrfGuiContext.DisplayPath);
+            }
+        }
+
+        private void SearchInFolderToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (GetSelectedItems(sender).Items is [{ PkgNode: { } folder }]
+                && mainTabs.SelectedTab?.Controls.OfType<TreeViewWithSearchResults>().FirstOrDefault() is { } package)
+            {
+                ShowPackageSearch(package, folder, onlyInFolder: true);
+            }
+        }
+
+        private void CopyFileNameToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            CopyFileName(sender, wantsFullPath: false);
+        }
+
+        private void CopyFileNameOnDiskToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            CopyFileName(sender, wantsFullPath: true);
+        }
+
+        /// <summary>
+        /// Gets the files and folders selected in the tree or list view that a context menu was opened on.
+        /// </summary>
+        private static (VrfGuiContext? Context, List<IBetterBaseItem> Items) GetSelectedItems(object sender)
+        {
+            if (sender is not ToolStripMenuItem { Owner: ContextMenuStrip { SourceControl: var control } })
+            {
+                return (null, []);
+            }
+
+            if (control is BetterTreeView treeView)
+            {
+                return (treeView.VrfGuiContext, treeView.SelectedNode is IBetterBaseItem selectedNode ? [selectedNode] : []);
+            }
+
+            if (control is BetterListView listView)
+            {
+                return (listView.VrfGuiContext, [.. listView.GetSelectedVirtualItems().OfType<IBetterBaseItem>()]);
+            }
+
+            throw new InvalidDataException("Unknown state");
+        }
+
+        private static void CopyFileName(object sender, bool wantsFullPath)
+        {
+            var (context, selectedNodes) = GetSelectedItems(sender);
+
+            if (context == null)
+            {
+                return;
+            }
+
+            var packageLink = wantsFullPath ? context.GetVpkLink() : null;
+            var sb = new StringBuilder();
+
+            foreach (var selectedNode in selectedNodes)
+            {
+                if (sb.Length > 0)
+                {
+                    sb.AppendLine();
+                }
+
+                if (packageLink != null)
+                {
+                    sb.Append(packageLink);
+                }
+
+                if (!selectedNode.IsFolder)
+                {
+                    if (wantsFullPath)
+                    {
+                        sb.Append(':');
+                    }
+
+                    var packageEntry = selectedNode.PackageEntry;
+                    if (packageEntry != null)
+                    {
+                        var entryPath = packageEntry.GetFullPath();
+                        sb.Append(wantsFullPath ? VpkLink.EscapePath(entryPath) : entryPath);
+                    }
+                }
+                else
+                {
+                    var stack = new Stack<string>();
+                    var node = selectedNode.PkgNode;
+
+                    if (node == null)
+                    {
+                        continue;
+                    }
+
+                    if (wantsFullPath && node.Parent != null)
+                    {
+                        sb.Append(':');
+                    }
+
+                    do
+                    {
+                        if (node.Parent == null)
+                        {
+                            break;
+                        }
+
+                        stack.Push(node.Name);
+                        node = node.Parent;
+                    }
+                    while (node != null);
+
+                    while (stack.TryPop(out var name))
+                    {
+                        sb.Append(wantsFullPath ? VpkLink.EscapePath(name) : name);
+                        sb.Append(Package.DirectorySeparatorChar);
+                    }
+                }
+            }
+
+            if (sb.Length > 0)
+            {
+                AppClipboard.SetText(sb.ToString());
+            }
+        }
+
+        private void OpenWithoutViewerToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            var (guiContext, selectedNode) = GetSingleSelectedNode(sender);
+            if (guiContext == null || selectedNode?.PackageEntry == null)
+            {
+                return;
+            }
+
+            var newContext = new VrfGuiContext(selectedNode.PackageEntry.GetFullPath(), guiContext);
+            OpenFile(newContext, selectedNode.PackageEntry, null, withoutViewer: true);
+        }
+
+        private async void OpenWithDefaultAppToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (sender is not ToolStripMenuItem { Owner: ContextMenuStrip { SourceControl: var control } })
+            {
+                return;
+            }
+
+            VrfGuiContext? context;
+            List<PackageEntry> selectedFiles;
+
+            if (control is BetterTreeView treeView)
+            {
+                context = treeView.VrfGuiContext;
+
+                if (treeView.SelectedNode is not IBetterBaseItem treeNode)
+                {
+                    return;
+                }
+
+                if (treeNode.IsFolder)
+                {
+                    return;
+                }
+
+                if (treeNode.PackageEntry == null)
+                {
+                    return;
+                }
+
+                selectedFiles = [treeNode.PackageEntry];
+            }
+            else if (control is BetterListView listView)
+            {
+                context = listView.VrfGuiContext;
+                selectedFiles = [];
+
+                foreach (var item in listView.GetSelectedVirtualItems())
+                {
+                    if (item is not IBetterBaseItem selectedNode)
+                    {
+                        continue;
+                    }
+
+                    if (selectedNode.IsFolder)
+                    {
+                        return;
+                    }
+
+                    if (selectedNode.PackageEntry != null)
+                    {
+                        selectedFiles.Add(selectedNode.PackageEntry);
+                    }
+                }
+            }
+            else
+            {
+                throw new InvalidDataException("Unknown state");
+            }
+
+            if (context == null)
+            {
+                return;
+            }
+
+            if (selectedFiles.Count > 5 && !await AppMessageDialogs.ConfirmAsync(
+                $"You are trying to open {selectedFiles.Count} files in the default app for each of these files, are you sure you want to continue?",
+                "Trying to open many files in the default app",
+                buttons: ConfirmButtons.YesNo
+            ).ConfigureAwait(true))
+            {
+                return;
+            }
+
+            foreach (var file in selectedFiles)
+            {
+                if (context.CurrentPackage == null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    context.CurrentPackage.ReadEntry(file, out var output, validateCrc: file.CRC32 > 0);
+
+                    var tempPath = $"{Path.GetTempPath()}Source 2 Viewer - {Path.GetFileName(context.CurrentPackage.FileName)} - {file.GetFileName()}";
+                    using (var stream = new FileStream(tempPath, FileMode.Create))
+                    {
+                        stream.Write(output, 0, output.Length);
+                    }
+
+                    Process.Start(new ProcessStartInfo(tempPath) { UseShellExecute = true });
+                }
+                catch (Exception ex)
+                {
+                    ErrorReport.ShowError(ex, file.GetFullPath());
+                }
+            }
+        }
+
+        private void OnViewAssetInfoToolStripMenuItemClick(object sender, EventArgs e)
+        {
+            var (guiContext, selectedNode) = GetSingleSelectedNode(sender);
+            if (guiContext == null || selectedNode == null || selectedNode.IsFolder || selectedNode.PackageEntry == null)
+            {
+                return;
+            }
+
+            Cursor.Current = Cursors.WaitCursor;
+
+            try
+            {
+                var tab = Types.Viewers.SingleAssetInfo.Create(guiContext, selectedNode.PackageEntry);
+
+                if (tab != null)
+                {
+                    tab.ImageIndex = AppIcons.Icons["Info"];
+                    mainTabs.TabPages.Add(tab);
+                    mainTabs.SelectTab(tab);
+                }
+            }
+            catch (Exception ex)
+            {
+                ErrorReport.ShowError(ex, selectedNode.PackageEntry.GetFullPath());
+            }
+            finally
+            {
+                Cursor.Current = Cursors.Default;
+            }
+        }
+
+        private static (VrfGuiContext?, IBetterBaseItem?) GetSingleSelectedNode(object sender)
+        {
+            if (sender is not ToolStripMenuItem { Owner: ContextMenuStrip { SourceControl: var control } })
+            {
+                throw new InvalidDataException("Invalid context menu structure");
+            }
+
+            VrfGuiContext? guiContext;
+            IBetterBaseItem? selectedNode;
+
+            if (control is BetterTreeView treeView)
+            {
+                guiContext = treeView.VrfGuiContext;
+                selectedNode = treeView.SelectedNode as IBetterBaseItem;
+            }
+            else if (control is BetterListView listView)
+            {
+                guiContext = listView.VrfGuiContext;
+                var selectedItems = listView.GetSelectedVirtualItems();
+                selectedNode = selectedItems.Count > 0 ? selectedItems[0] as IBetterBaseItem : null;
+            }
+            else
+            {
+                throw new InvalidDataException("Unknown state");
+            }
+
+            return (guiContext, selectedNode);
+        }
+
+        private async void DecompileToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            await ExtractFiles(sender, true).ConfigureAwait(true);
+        }
+
+        private async void ExtractToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            await ExtractFiles(sender, false).ConfigureAwait(true);
+        }
+
+        private static async Task ExtractFiles(object sender, bool decompile)
+        {
+            if (sender is not ToolStripMenuItem { Owner: ContextMenuStrip { SourceControl: var owner } })
+            {
+                throw new InvalidDataException("Invalid context menu structure");
+            }
+
+            // Clicking context menu item in left side of the package view
+            if (owner is BetterTreeView tree)
+            {
+                if (tree.SelectedNode is IBetterBaseItem treeNode && tree.VrfGuiContext != null)
+                {
+                    await ExportFile.ExtractFilesFromTreeNode(treeNode, tree.VrfGuiContext, decompile).ConfigureAwait(true);
+                }
+            }
+            // Clicking context menu item in right side of the package view
+            else if (owner is BetterListView listView)
+            {
+                if (listView.VrfGuiContext == null)
+                {
+                    return;
+                }
+
+                var selectedItems = listView.GetSelectedVirtualItems();
+
+                if (selectedItems.Count > 1)
+                {
+                    // We're selecting multiple files
+                    ExportFile.ExtractFilesFromListViewNodes(selectedItems, listView.VrfGuiContext, decompile);
+                }
+                else if (selectedItems.Count == 1)
+                {
+                    await ExportFile.ExtractFilesFromTreeNode((IBetterBaseItem)selectedItems[0], listView.VrfGuiContext, decompile).ConfigureAwait(true);
+                }
+            }
+            // Clicking context menu item when right clicking a tab
+            else if (owner is TabControl)
+            {
+                var tabPage = FetchToolstripTabContext(sender);
+
+                if (tabPage.Tag is not ExportData exportData)
+                {
+                    throw new InvalidDataException("There is no export data for this tab");
+                }
+
+                if (exportData.PackageEntry != null)
+                {
+                    await ExportFile.ExtractFileFromPackageEntry(exportData.PackageEntry, exportData.VrfGuiContext, decompile).ConfigureAwait(true);
+                }
+                else
+                {
+                    var fileStream = File.Open(exportData.VrfGuiContext.FileName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+
+                    try
+                    {
+                        await ExportFile.ExtractFileFromStream(Path.GetFileName(exportData.VrfGuiContext.FileName), fileStream, exportData.VrfGuiContext, decompile, exportData.VrfGuiContext.DisplayPath).ConfigureAwait(true);
+                        fileStream = null; // ExtractFileFromStream should dispose it when done, not `using` here in case there's some threading
+                    }
+                    finally
+                    {
+                        if (fileStream != null)
+                        {
+                            await fileStream.DisposeAsync().ConfigureAwait(true);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                throw new InvalidDataException("Unknown state");
+            }
+        }
+
+        private void RecoverDeletedToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (mainTabs.SelectedTab?.Controls[nameof(TreeViewWithSearchResults)] is TreeViewWithSearchResults treeView)
+            {
+                treeView.RecoverDeletedFiles();
+            }
+        }
+
+        private void VerifyPackageContentsToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (mainTabs.SelectedTab?.Controls[nameof(TreeViewWithSearchResults)] is TreeViewWithSearchResults treeView)
+            {
+                treeView.VerifyPackageContents();
+            }
+        }
+
+        private async void RegisterVpkFileAssociationToolStripMenuItem_Click(object sender, EventArgs e) => await SettingsControl.RegisterFileAssociationAsync().ConfigureAwait(true);
+
+        private void OnOpenWelcomeScreenToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            OpenWelcome();
+        }
+
+        private void OnValidateShadersToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+#if DEBUG
+            ValidateShaders();
+#endif
+        }
+    }
+}
